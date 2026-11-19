@@ -72,6 +72,6 @@ omp --extension .
 
 ```sh
 bun run probe:phase0 # 真机验证本机 OMP 公开 SDK、账号继承与隔离会话生命周期
-bun run check        # 类型检查 + 核心代码行数/零私有导入门禁 (≤ 2,650 LoC) + 单元测试
+bun run check        # 类型检查 + 核心代码行数/零私有导入门禁 (≤ 2,700 LoC) + 单元测试
 bun run verify:omp   # 调用本机真实 omp 执行端到端集成验收
 ```

@@ -11,6 +11,7 @@ import {
   discoverRoles, parseRoleYaml, resetRoleOverride, saveRoleSpec, serializeRoleYaml,
 } from "../../src/role-loader.ts";
 import { createOmpRoleSessionRunner } from "../../src/orchestrator.ts";
+import { parseOverlayKey } from "../../src/role-studio.ts";
 import { TurnTracker } from "../../src/session-tracker.ts";
 import { EnhanceStore } from "../../src/store.ts";
 import ompEnhance from "../../src/entry.ts";
@@ -433,26 +434,29 @@ describe("Role Studio & zero-extra-slash-command integration", () => {
     // Drive split-pane custom overlay: Down (from dev -> ml-engineer -> qa) + Enter -> 1-step switch to qa!
     const renderedSnapshots: string[][] = [];
     const customScripts: string[][] = [
-      ["\x1b[B", "\x1b[B", "\r"], // Overlay call 1: move down twice to qa, press Enter to activate!
-      ["e"],                      // Overlay call 2: press 'e' on qa to open editor
-      [" ", "\r"],                // Tool checkbox custom overlay: toggle 1st tool ('bash'), press Enter to save
-      ["h"],                      // Return to split-pane overlay: press 'h' to handoff to qa!
+      ["\x1b[1;1:1B", "\x1b[1;1:1B", "\x1b[13;1:1u"], // Kitty Down×2 + Kitty Enter -> 1-step switch to qa!
+      ["\x1b[101;1:1u", "\x1b[101;1:3u"],             // Kitty 'e' press + release -> open editor on qa
+      ["\x1b[32;1:1u", "\x1b[13;1:1u"],               // Kitty Space + Kitty Enter in tool checkbox overlay
+      ["\x1b[27;1:1u"],                               // Kitty Esc exits split-pane /role cleanly!
+      ["h"],                                          // Next /role: press 'h' to handoff to qa!
     ];
     const selectScripts: Array<string | undefined> = [
       "Allowed tools: [read, grep, glob, find, lsp, edit, write, bash, task, wait]",
-      undefined, // exit role editor back to split-pane overlay
+      "← Back", // exit role editor back to split-pane overlay
     ];
+    const captureFlags: boolean[] = [];
 
     const ctx = {
       cwd,
       hasUI: true,
       ui: {
         async custom(factory: any) {
-          const keys = customScripts.shift() ?? ["\x1b"];
+          const keys = customScripts.shift() ?? ["\x1b[27u"];
           let resolved: unknown;
           const comp = factory({ requestRender() {} }, { fg: (_c: string, s: string) => s, bold: (s: string) => s }, {}, (res: unknown) => {
             resolved = res;
           });
+          captureFlags.push(Boolean(comp.capturesInput?.("\x1b[27u")));
           renderedSnapshots.push(comp.render(100));
           for (const key of keys) comp.handleInput(key);
           return resolved;
@@ -464,16 +468,33 @@ describe("Role Studio & zero-extra-slash-command integration", () => {
       },
     };
 
-    // 1st /role: Down, Down, Enter -> instant switch to qa!
+    // Verify Kitty CSI-u parser directly (including key-release filtering, Esc, arrows, e, n, Space, Ctrl+C)
+    expect(parseOverlayKey("\x1b[27u")).toBe("escape");
+    expect(parseOverlayKey("\x1b[27;1:1u")).toBe("escape");
+    expect(parseOverlayKey("\x1b[27;1:3u")).toBeNull();
+    expect(parseOverlayKey("\x1b[99;5u")).toBe("escape");
+    expect(parseOverlayKey("\x1b[101;1:1u")).toBe("e");
+    expect(parseOverlayKey("\x1b[110;1:1u")).toBe("n");
+    expect(parseOverlayKey("\x1b[32;1:1u")).toBe("space");
+    expect(parseOverlayKey("\x1b[13;1:1u")).toBe("enter");
+    expect(parseOverlayKey("\x1b[1;1:1B")).toBe("down");
+    expect(parseOverlayKey("\x1b[1;1:1C")).toBe("right");
+
+    // 1st /role: Kitty Down, Down, Enter -> instant switch to qa!
     await commands.get("role")!.handler("", ctx);
     expect(activeRoleSwitched).toBe("enhance:qa");
     expect(renderedSnapshots[0]!.some((line) => line.includes("OMP Enhance · Roles"))).toBe(true);
-    expect(renderedSnapshots[0]!.some((line) => line.includes("Enter switch session"))).toBe(true);
+    expect(renderedSnapshots[0]!.some((line) => line.includes("+ 新建角色"))).toBe(true);
+    expect(renderedSnapshots[0]!.some((line) => line.includes("✎ 修改角色"))).toBe(true);
 
-    // 2nd /role: 'e' -> Space-toggle tool in custom checkbox overlay -> Esc editor -> 'h' handoff!
+    // 2nd /role: Kitty 'e' -> Kitty Space-toggle tool -> Back -> Kitty Esc exits cleanly!
     await commands.get("role")!.handler("", ctx);
     const savedQaPath = path.join(globalDir, "qa.yaml");
     expect(existsSync(savedQaPath)).toBe(true);
+    expect(captureFlags.every(Boolean)).toBe(true);
+
+    // 3rd /role: 'h' handoff!
+    await commands.get("role")!.handler("", ctx);
     expect(workingMessages).toContain("stage:qa → read");
     expect(workingMessages.at(-1)).toBeUndefined();
   });
