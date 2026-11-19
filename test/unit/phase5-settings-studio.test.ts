@@ -254,9 +254,9 @@ describe("Role Studio & zero-extra-slash-command integration", () => {
 
     ompEnhance(pi, { globalRolesDir: globalDir, builtinRolesDir, pluginLockPath: lockPath });
 
-    // Strict slash-command economy: NO /enhance-settings command added!
+    // Strict slash-command economy: zero built-in conflicts and NO /enhance-settings command!
     expect([...commands.keys()].sort()).toEqual([
-      "enhance-handoff", "enhance-status", "flow", "handoff", "role",
+      "enhance-handoff", "enhance-status", "flow", "role",
     ]);
 
     // Scripted UI responses for:
@@ -428,7 +428,7 @@ describe("Role Studio & zero-extra-slash-command integration", () => {
     const roleComp = commands.get("role")!.getArgumentCompletions!;
     expect(roleComp("q").map((c) => c.value)).toEqual(["qa"]);
     expect(roleComp("edit rev").map((c) => c.value)).toEqual(["edit reviewer"]);
-    const handoffComp = commands.get("handoff")!.getArgumentCompletions!;
+    const handoffComp = commands.get("enhance-handoff")!.getArgumentCompletions!;
     expect(handoffComp("").some((c) => c.value === "supervisor")).toBe(false);
     expect(handoffComp("rev").map((c) => c.value)).toEqual(["reviewer"]);
     const flowComp = commands.get("flow")!.getArgumentCompletions!;

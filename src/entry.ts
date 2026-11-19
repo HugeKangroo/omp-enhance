@@ -590,7 +590,6 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
   const handoffCompletions = (prefix: string) =>
     prefix.includes(" ") ? [] : completeRoleIds(prefix).filter((c) => c.value !== "supervisor");
   pi.registerCommand("enhance-handoff", { description: handoffDescription, getArgumentCompletions: handoffCompletions, handler: handoffHandler });
-  pi.registerCommand("handoff", { description: handoffDescription, getArgumentCompletions: handoffCompletions, handler: handoffHandler });
 
   pi.registerCommand("flow", {
     description: "Open split-pane Flow Room & Action Inspector (/flow), or start, steer, inspect, and cancel multi-role Flows.",

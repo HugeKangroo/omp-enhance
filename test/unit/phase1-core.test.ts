@@ -156,9 +156,17 @@ describe("EnhanceStore", () => {
   });
 
   test("persists artifacts, handoffs, and jobs", () => {
-    const store = new EnhanceStore(path.join(tempDir(), "state.sqlite"));
+    const storePath = path.join(tempDir(), ".omp-enhance", "state.sqlite");
+    const store = new EnhanceStore(storePath);
     try {
+      // Lazy DB initialization: read-only queries never create .omp-enhance/state.sqlite on disk!
+      expect(store.getActiveMandate()).toBeNull();
+      expect(store.listJobs()).toEqual([]);
+      expect(store.getLatestHandoff()).toBeNull();
+      expect(Bun.file(storePath).size).toBe(0);
+
       const mandate = store.upsertMandate({ goal: "Persistence" });
+      expect(Bun.file(storePath).size).toBeGreaterThan(0);
       store.recordArtifacts(mandate.id, [
         { path: "src/app.ts", sha256: "aaa", byteSize: 12, role: "changed" },
         { path: "test/app.test.ts", sha256: "bbb", byteSize: 34, role: "test" },
@@ -381,9 +389,15 @@ describe("TurnTracker", () => {
       ...qa,
       permissions: { ...qa.permissions, tools: [...(qa.permissions.tools ?? []), "apply_patch"] },
     };
+    const general = roles.get("general")!;
     const reviewer = roles.get("reviewer")!;
     const tracker = new TurnTracker();
     tracker.resetTurn(cwd);
+
+    // Unrestricted general role permits out-of-workspace edits (e.g. ~/.omp/agent/managed-skills/.../SKILL.md)
+    expect(tracker.checkToolCallAllowed(cwd, general, {
+      toolName: "edit", input: { path: "../../../.omp/agent/managed-skills/colab-dev/SKILL.md" },
+    })).toEqual({ block: false });
 
     for (const toolName of ["edit", "write"] as const) {
       expect(tracker.checkToolCallAllowed(cwd, qa, { toolName, input: { path: "src/app.ts" } }))

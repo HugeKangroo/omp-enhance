@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type {
   ArtifactRecord, BackgroundJob, EpistemicItem, EpistemicKind, EpistemicStatus,
@@ -109,51 +109,50 @@ const toJob = (r: JobRow): BackgroundJob => ({
 });
 
 export class EnhanceStore {
-  private readonly db: Database;
+  private db: Database | null = null;
 
-  constructor(readonly dbPath: string) {
-    mkdirSync(path.dirname(dbPath), { recursive: true });
-    this.db = new Database(dbPath);
+  constructor(readonly dbPath: string) {}
+
+  private conn(create: boolean): Database | null {
+    if (this.db) return this.db;
+    if (!create && !existsSync(this.dbPath)) return null;
+    mkdirSync(path.dirname(this.dbPath), { recursive: true });
+    this.db = new Database(this.dbPath);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
     this.db.exec(SCHEMA);
+    return this.db;
   }
 
-  close(): void {
-    this.db.close();
-  }
+  close(): void { this.db?.close(); this.db = null; }
 
   upsertMandate(input: { id?: string; goal: string; constraints?: string[]; acceptance?: string[]; status?: Mandate["status"] }): Mandate {
-    const existing = input.id ? this.getMandate(input.id) : null;
-    const ts = now();
+    const db = this.conn(true)!, existing = input.id ? this.getMandate(input.id) : null, ts = now();
     if (!existing) {
-      const id = input.id ?? randomUUID();
-      const status = input.status ?? "active";
-      if (status === "active") {
-        this.db.query("UPDATE mandates SET status = 'archived', updated_at = ? WHERE status = 'active'").run(ts);
-      }
-      this.db.query(`INSERT INTO mandates (id, rev, goal, constraints, acceptance, status, created_at, updated_at)
+      const id = input.id ?? randomUUID(), status = input.status ?? "active";
+      if (status === "active") db.query("UPDATE mandates SET status = 'archived', updated_at = ? WHERE status = 'active'").run(ts);
+      db.query(`INSERT INTO mandates (id, rev, goal, constraints, acceptance, status, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(id, 1, input.goal, JSON.stringify(input.constraints ?? []), JSON.stringify(input.acceptance ?? []), status, ts, ts);
       return this.getMandate(id)!;
     }
-    const constraints = input.constraints ?? existing.constraints;
-    const acceptance = input.acceptance ?? existing.acceptance;
+    const constraints = input.constraints ?? existing.constraints, acceptance = input.acceptance ?? existing.acceptance;
     const status = input.status ?? existing.status;
     const changed = input.goal !== existing.goal || JSON.stringify(constraints) !== JSON.stringify(existing.constraints)
       || JSON.stringify(acceptance) !== JSON.stringify(existing.acceptance);
-    const rev = changed ? existing.rev + 1 : existing.rev;
-    const updatedAt = now();
-    this.db.query("UPDATE mandates SET rev = ?, goal = ?, constraints = ?, acceptance = ?, status = ?, updated_at = ? WHERE id = ?")
+    const rev = changed ? existing.rev + 1 : existing.rev, updatedAt = now();
+    db.query("UPDATE mandates SET rev = ?, goal = ?, constraints = ?, acceptance = ?, status = ?, updated_at = ? WHERE id = ?")
       .run(rev, input.goal, JSON.stringify(constraints), JSON.stringify(acceptance), status, updatedAt, existing.id);
     return { ...existing, rev, goal: input.goal, constraints, acceptance, status, updatedAt };
   }
 
   getActiveMandate(): Mandate | null {
-    const row = this.db.query("SELECT * FROM mandates WHERE status = 'active' ORDER BY updated_at DESC, rowid DESC LIMIT 1").get() as MandateRow | null;
+    const db = this.conn(false);
+    const row = db ? db.query("SELECT * FROM mandates WHERE status = 'active' ORDER BY updated_at DESC, rowid DESC LIMIT 1").get() as MandateRow | null : null;
     return row ? toMandate(row) : null;
   }
 
   getMandate(id: string): Mandate | null {
-    const row = this.db.query("SELECT * FROM mandates WHERE id = ?").get(id) as MandateRow | null;
+    const db = this.conn(false);
+    const row = db ? db.query("SELECT * FROM mandates WHERE id = ?").get(id) as MandateRow | null : null;
     return row ? toMandate(row) : null;
   }
 
@@ -162,52 +161,49 @@ export class EnhanceStore {
     verificationPlan?: string | null; status?: EpistemicStatus;
   }): EpistemicItem {
     const evidenceRef = input.evidenceRef?.trim() || null;
-    if (input.kind === "fact" && !evidenceRef) {
-      throw new Error("Epistemic item of kind 'fact' requires a non-empty evidenceRef.");
-    }
+    if (input.kind === "fact" && !evidenceRef) throw new Error("Epistemic item of kind 'fact' requires a non-empty evidenceRef.");
     const item: EpistemicItem = {
       id: randomUUID(), mandateId: input.mandateId, kind: input.kind, statement: input.statement,
       evidenceRef, verificationPlan: input.verificationPlan?.trim() || null, status: input.status ?? "open", createdAt: now(),
     };
-    this.db.query(`INSERT INTO epistemic_items
+    this.conn(true)!.query(`INSERT INTO epistemic_items
       (id, mandate_id, kind, statement, evidence_ref, verification_plan, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(item.id, item.mandateId, item.kind, item.statement, item.evidenceRef, item.verificationPlan, item.status, item.createdAt);
     return item;
   }
 
   updateEpistemicStatus(id: string, status: EpistemicStatus, evidenceRef?: string | null): EpistemicItem {
-    const row = this.db.query("SELECT * FROM epistemic_items WHERE id = ?").get(id) as EpistemicRow | null;
+    const db = this.conn(false);
+    const row = db ? db.query("SELECT * FROM epistemic_items WHERE id = ?").get(id) as EpistemicRow | null : null;
     if (!row) throw new Error(`Epistemic item "${id}" not found.`);
     const nextEvidence = evidenceRef === undefined ? row.evidence_ref : evidenceRef?.trim() || null;
-    if (row.kind === "fact" && !nextEvidence) {
-      throw new Error("Epistemic item of kind 'fact' requires a non-empty evidenceRef.");
-    }
-    this.db.query("UPDATE epistemic_items SET status = ?, evidence_ref = ? WHERE id = ?").run(status, nextEvidence, id);
+    if (row.kind === "fact" && !nextEvidence) throw new Error("Epistemic item of kind 'fact' requires a non-empty evidenceRef.");
+    db!.query("UPDATE epistemic_items SET status = ?, evidence_ref = ? WHERE id = ?").run(status, nextEvidence, id);
     return { ...toEpistemicItem(row), status, evidenceRef: nextEvidence };
   }
 
   listEpistemicItems(mandateId: string): EpistemicItem[] {
-    const rows = this.db.query("SELECT * FROM epistemic_items WHERE mandate_id = ? ORDER BY created_at ASC, rowid ASC")
-      .all(mandateId) as EpistemicRow[];
-    return rows.map(toEpistemicItem);
+    const db = this.conn(false);
+    if (!db) return [];
+    return (db.query("SELECT * FROM epistemic_items WHERE mandate_id = ? ORDER BY created_at ASC, rowid ASC").all(mandateId) as EpistemicRow[]).map(toEpistemicItem);
   }
 
   recordArtifacts(mandateId: string, artifacts: readonly ArtifactRecord[]): void {
-    const statement = this.db.query(`INSERT OR IGNORE INTO artifacts
+    if (artifacts.length === 0) return;
+    const statement = this.conn(true)!.query(`INSERT OR IGNORE INTO artifacts
       (mandate_id, path, sha256, byte_size, role, created_at) VALUES (?, ?, ?, ?, ?, ?)`);
     const ts = now();
-    for (const artifact of artifacts) {
-      statement.run(mandateId, artifact.path, artifact.sha256, artifact.byteSize, artifact.role, ts);
-    }
+    for (const artifact of artifacts) statement.run(mandateId, artifact.path, artifact.sha256, artifact.byteSize, artifact.role, ts);
   }
 
   listArtifacts(mandateId: string): ArtifactRecord[] {
-    return this.db.query("SELECT path, sha256, byte_size, role FROM artifacts WHERE mandate_id = ? ORDER BY path ASC, rowid ASC")
-      .all(mandateId).map((row) => toArtifact(row as ArtifactRow));
+    const db = this.conn(false);
+    return db ? db.query("SELECT path, sha256, byte_size, role FROM artifacts WHERE mandate_id = ? ORDER BY path ASC, rowid ASC")
+      .all(mandateId).map((row) => toArtifact(row as ArtifactRow)) : [];
   }
 
   saveHandoff(envelope: HandoffEnvelope): void {
-    this.db.query(`INSERT OR REPLACE INTO handoffs (id, mandate_id, mandate_rev, parent_handoff_id, from_role,
+    this.conn(true)!.query(`INSERT OR REPLACE INTO handoffs (id, mandate_id, mandate_rev, parent_handoff_id, from_role,
       to_target, verdict, summary, artifacts, verified_facts, open_risks, feedback_for_upstream, observed_usage, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       envelope.id, envelope.mandateId, envelope.mandateRev, envelope.parentHandoffId, envelope.fromRole,
@@ -218,24 +214,28 @@ export class EnhanceStore {
   }
 
   getHandoff(id: string): HandoffEnvelope | null {
-    const row = this.db.query("SELECT * FROM handoffs WHERE id = ?").get(id) as HandoffRow | null;
+    const db = this.conn(false);
+    const row = db ? db.query("SELECT * FROM handoffs WHERE id = ?").get(id) as HandoffRow | null : null;
     return row ? toHandoff(row) : null;
   }
 
   getLatestHandoff(mandateId?: string): HandoffEnvelope | null {
-    const row = this.db.query(`SELECT * FROM handoffs WHERE (? IS NULL OR mandate_id = ?)
-      ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(mandateId ?? null, mandateId ?? null) as HandoffRow | null;
+    const db = this.conn(false);
+    const row = db ? db.query(`SELECT * FROM handoffs WHERE (? IS NULL OR mandate_id = ?)
+      ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(mandateId ?? null, mandateId ?? null) as HandoffRow | null : null;
     return row ? toHandoff(row) : null;
   }
 
   listHandoffs(mandateId?: string, limit?: number): HandoffEnvelope[] {
-    const rows = this.db.query(`SELECT * FROM handoffs WHERE (? IS NULL OR mandate_id = ?)
+    const db = this.conn(false);
+    if (!db) return [];
+    const rows = db.query(`SELECT * FROM handoffs WHERE (? IS NULL OR mandate_id = ?)
       ORDER BY created_at DESC, rowid DESC LIMIT COALESCE(?, -1)`).all(mandateId ?? null, mandateId ?? null, limit ?? null) as HandoffRow[];
     return rows.map(toHandoff);
   }
 
   saveJob(job: BackgroundJob): void {
-    this.db.query(`INSERT OR REPLACE INTO jobs (job_id, mandate_id, hypothesis_id, command, cwd, pid, pgid,
+    this.conn(true)!.query(`INSERT OR REPLACE INTO jobs (job_id, mandate_id, hypothesis_id, command, cwd, pid, pgid,
       log_path, exit_file_path, status, exit_code, started_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       job.jobId, job.mandateId, job.hypothesisId, job.command, job.cwd, job.pid, job.pgid,
       job.logPath, job.exitFilePath, job.status, job.exitCode, job.startedAt, job.endedAt,
@@ -243,12 +243,14 @@ export class EnhanceStore {
   }
 
   getJob(jobId: string): BackgroundJob | null {
-    const row = this.db.query("SELECT * FROM jobs WHERE job_id = ?").get(jobId) as JobRow | null;
+    const db = this.conn(false);
+    const row = db ? db.query("SELECT * FROM jobs WHERE job_id = ?").get(jobId) as JobRow | null : null;
     return row ? toJob(row) : null;
   }
 
   listJobs(status?: JobStatus): BackgroundJob[] {
-    return this.db.query("SELECT * FROM jobs WHERE (? IS NULL OR status = ?) ORDER BY started_at DESC, rowid DESC")
-      .all(status ?? null, status ?? null).map((row) => toJob(row as JobRow));
+    const db = this.conn(false);
+    return db ? db.query("SELECT * FROM jobs WHERE (? IS NULL OR status = ?) ORDER BY started_at DESC, rowid DESC")
+      .all(status ?? null, status ?? null).map((row) => toJob(row as JobRow)) : [];
   }
 }

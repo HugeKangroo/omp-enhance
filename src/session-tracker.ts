@@ -87,8 +87,8 @@ export class TurnTracker {
     if (allowedTools && !allowedTools.includes(event.toolName) && !isCompanionTool(event.toolName)) {
       return { block: true, reason: `Role "${role.id}" does not permit tool "${event.toolName}".` };
     }
+    const hasBoundary = role.permissions.writable !== undefined || (role.permissions.protected?.length ?? 0) > 0;
     if (event.toolName === "task") {
-      const hasBoundary = role.permissions.writable !== undefined || (role.permissions.protected?.length ?? 0) > 0;
       if (hasBoundary) {
         const forbidden = extractTaskSubagents(event.input).find((agent) => !READONLY_SUBAGENT_SET.has(agent));
         if (forbidden) {
@@ -100,7 +100,7 @@ export class TurnTracker {
       }
       return { block: false };
     }
-    if (!WRITE_TOOLS[event.toolName]) return { block: false };
+    if (!WRITE_TOOLS[event.toolName] || !hasBoundary) return { block: false };
     const writable = role.permissions.writable;
     if (writable?.length === 0) {
       return { block: true, reason: `Role "${role.id}" is read-only; write operations are not permitted.` };
