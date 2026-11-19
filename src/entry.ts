@@ -5,7 +5,9 @@ import type {
   EnhanceSettings, EpistemicKind, EpistemicStatus, HandoffVerdict, Mandate, RoleSpec, VerifiedFact,
 } from "./types.ts";
 import { EnhanceStore } from "./store.ts";
-import { discoverRoles, renderConditioningBlock, scaffoldRoleFile } from "./role-loader.ts";
+import {
+  cloneRoleSpec, deleteCustomRole, discoverRoles, hasBuiltinRole, renderConditioningBlock, scaffoldRoleFile,
+} from "./role-loader.ts";
 import { resolveRoleActiveTools, TurnTracker } from "./session-tracker.ts";
 import { createAndVerifyHandoff } from "./handoff.ts";
 import {
@@ -466,19 +468,27 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
   };
 
   pi.registerCommand("role", {
-    description: "Open split-pane Role Studio, or switch, edit, create, list, show, and disable YAML roles.",
+    description: "Open split-pane Role Studio, or switch, copy, delete, edit, create, list, show, and disable YAML roles.",
     getArgumentCompletions: (prefix: string) => {
-      if (/^(?:show|edit)\s+/i.test(prefix)) {
-        const head = prefix.match(/^(?:show|edit)\s+/i)![0];
-        return completeRoleIds(prefix.slice(head.length)).map((c) => ({ ...c, value: `${head}${c.value}` }));
+      if (/^(?:show|edit|copy)\s+/i.test(prefix)) {
+        const head = prefix.match(/^(?:show|edit|copy)\s+/i)![0];
+        const rest = prefix.slice(head.length);
+        if (rest.includes(" ")) return [];
+        return completeRoleIds(rest).map((c) => ({ ...c, value: `${head}${c.value}` }));
       }
-      return completeRoleIds(prefix, ["off", "list", "studio", "edit ", "show ", "create "]);
+      if (/^delete\s+/i.test(prefix)) {
+        const head = prefix.match(/^delete\s+/i)![0];
+        return completeRoleIds(prefix.slice(head.length))
+          .filter((c) => !hasBuiltinRole(c.value, options.builtinRolesDir))
+          .map((c) => ({ ...c, value: `${head}${c.value}` }));
+      }
+      return completeRoleIds(prefix, ["off", "list", "studio", "edit ", "copy ", "delete ", "show ", "create "]);
     },
     handler: async (args: string, ctx: any) => {
       const ws = getWorkspace(ctx);
       refreshRoles(ws);
       const studioDeps = (): RoleStudioDeps => ({
-        cwd: ws.cwd, globalRolesDir: globalRolesDir(options), pi, ctx,
+        cwd: ws.cwd, globalRolesDir: globalRolesDir(options), builtinRolesDir: options.builtinRolesDir, pi, ctx,
         getRoles: () => ws.roles, refreshRoles: () => refreshRoles(ws),
         getSettings: () => ws.settings,
         getActiveRoleId: () => ws.activeRoleId, activateRole: (id) => applyActiveRole(ws, id, ctx),
@@ -524,6 +534,42 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
         });
         refreshRoles(ws);
         emitMessage(ctx, `Created role "${created.role.id}" [${created.source}] at ${created.filePath}`);
+        return;
+      }
+      if (head === "copy") {
+        const tokens = trimmed.slice(4).trim().split(/\s+/).filter(Boolean);
+        const positional = tokens.filter((token) => !token.startsWith("--"));
+        const [srcId, newId, ...descParts] = positional;
+        if (!srcId || !newId) return emitMessage(ctx, "Usage: /role copy <sourceId> <newId> [--project] [description]");
+        const srcRole = ws.roles.get(srcId);
+        if (!srcRole) return emitMessage(ctx, `Unknown source role "${srcId}".`);
+        try {
+          const targetDir = tokens.includes("--project") ? path.join(ws.cwd, ".omp", "roles") : globalRolesDir(options);
+          const cloned = cloneRoleSpec({ sourceRole: srcRole, newId, description: descParts.join(" "), targetDir });
+          refreshRoles(ws);
+          emitMessage(ctx, `Copied "${srcId}" to "${cloned.role.id}" [${cloned.source}] at ${cloned.filePath}`);
+        } catch (err) {
+          emitMessage(ctx, err instanceof Error ? err.message : String(err));
+        }
+        return;
+      }
+      if (head === "delete") {
+        const delId = trimmed.slice(6).trim();
+        if (!delId) return emitMessage(ctx, "Usage: /role delete <customRoleId>");
+        try {
+          deleteCustomRole({
+            id: delId, cwd: ws.cwd, globalRolesDir: globalRolesDir(options), builtinRolesDir: options.builtinRolesDir,
+          });
+          refreshRoles(ws);
+          if (ws.activeRoleId === delId) {
+            const fallback = ws.settings.defaultRole && ws.roles.has(ws.settings.defaultRole)
+              ? ws.settings.defaultRole : (ws.roles.has("general") ? "general" : null);
+            await applyActiveRole(ws, fallback, ctx);
+          }
+          emitMessage(ctx, `Deleted custom role "${delId}".`);
+        } catch (err) {
+          emitMessage(ctx, err instanceof Error ? err.message : String(err));
+        }
         return;
       }
       if (head === "off") {

@@ -181,6 +181,11 @@ export function saveRoleSpec(
   return validated;
 }
 
+export function hasBuiltinRole(id: string, builtinRolesDir?: string): boolean {
+  const dir = builtinRolesDir ?? path.resolve(import.meta.dir, "..", "roles");
+  return ["yaml", "yml"].some((ext) => existsSync(path.join(dir, `${id}.${ext}`)));
+}
+
 export function resetRoleOverride(input: { id: string; targetDir: string }): boolean {
   let removed = false;
   for (const ext of ["yaml", "yml"]) {
@@ -191,6 +196,58 @@ export function resetRoleOverride(input: { id: string; targetDir: string }): boo
     }
   }
   return removed;
+}
+
+export function cloneRoleSpec(input: {
+  sourceRole: RoleSpec; newId: string; description?: string; targetDir: string; overwrite?: boolean;
+}): { filePath: string; role: RoleSpec; source: RoleSource } {
+  if (!ROLE_ID.test(input.newId)) throw new Error(`Invalid role id "${input.newId}"`);
+  const filePath = path.join(input.targetDir, `${input.newId}.yaml`);
+  if ((existsSync(filePath) || existsSync(path.join(input.targetDir, `${input.newId}.yml`))) && !input.overwrite) {
+    throw new Error(`Role file already exists: ${filePath}`);
+  }
+  const desc = input.description?.trim() ?? input.sourceRole.description;
+  const saved = saveRoleSpec({
+    id: input.newId,
+    name: input.description?.trim() || `${input.sourceRole.name} (copy)`,
+    description: desc,
+    ...(input.sourceRole.model ? { model: input.sourceRole.model } : {}),
+    ...(input.sourceRole.thinking ? { thinking: input.sourceRole.thinking } : {}),
+    stance: input.sourceRole.stance,
+    method: [...input.sourceRole.method],
+    permissions: {
+      ...(input.sourceRole.permissions.tools ? { tools: [...input.sourceRole.permissions.tools] } : {}),
+      ...(input.sourceRole.permissions.writable ? { writable: [...input.sourceRole.permissions.writable] } : {}),
+      ...(input.sourceRole.permissions.protected ? { protected: [...input.sourceRole.permissions.protected] } : {}),
+    },
+    exit: {
+      requireToolEvidence: input.sourceRole.exit.requireToolEvidence,
+      criteria: [...input.sourceRole.exit.criteria],
+    },
+  }, input.targetDir);
+  return { filePath: saved.filePath, role: saved, source: saved.source };
+}
+
+export function deleteCustomRole(input: {
+  id: string; cwd: string; globalRolesDir?: string; builtinRolesDir?: string;
+}): string[] {
+  if (hasBuiltinRole(input.id, input.builtinRolesDir)) {
+    throw new Error(`Built-in role "${input.id}" cannot be deleted.`);
+  }
+  const globalDir = input.globalRolesDir ?? path.join(homedir(), ".omp", "enhance", "roles");
+  const projectDir = path.join(input.cwd, ".omp", "roles");
+  const deleted: string[] = [];
+  for (const dir of [projectDir, globalDir]) {
+    for (const ext of ["yaml", "yml"]) {
+      const candidate = path.join(dir, `${input.id}.${ext}`);
+      if (existsSync(candidate)) {
+        rmSync(candidate, { force: true });
+        deleted.push(candidate);
+      }
+    }
+  }
+  if (deleted.length === 0) throw new Error(`Custom role "${input.id}" not found.`);
+  return deleted;
 }
 
 export function scaffoldRoleFile(input: {

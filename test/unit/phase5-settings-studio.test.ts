@@ -498,4 +498,106 @@ describe("Role Studio & zero-extra-slash-command integration", () => {
     expect(workingMessages).toContain("stage:qa → read");
     expect(workingMessages.at(-1)).toBeUndefined();
   });
+
+  test("supports copying roles and deleting custom roles while protecting all 6 built-in roles", async () => {
+    const root = tempDir();
+    const cwd = path.join(root, "workspace");
+    const globalDir = path.join(root, "global-roles");
+    const lockPath = path.join(root, "lock.json");
+    mkdirSync(cwd, { recursive: true });
+
+    const commands = new Map<string, {
+      handler: (args: string, ctx: any) => Promise<void>;
+      getArgumentCompletions?: (prefix: string) => Array<{ value: string }>;
+    }>();
+    const messages: string[] = [];
+    const warnings: string[] = [];
+    let statusBadge = null as string | null;
+
+    const pi = {
+      cwd,
+      on() {},
+      registerTool() {},
+      registerCommand(name: string, spec: any) { commands.set(name, spec); },
+      sendMessage(msg: { content: string }) { messages.push(msg.content); },
+      getAllTools: () => [{ name: "read" }, { name: "grep" }, { name: "task" }],
+      async setActiveTools() {},
+      getThinkingLevel: () => "off",
+      pi: { settings: {} },
+    };
+
+    ompEnhance(pi, { globalRolesDir: globalDir, builtinRolesDir, pluginLockPath: lockPath });
+    const roleCmd = commands.get("role")!;
+
+    const cliCtx = {
+      cwd,
+      hasUI: false,
+      ui: {
+        notify() {},
+        setStatus(_k: string, badge?: string) { statusBadge = badge ?? null; },
+      },
+    };
+
+    // 1) Built-in roles cannot be deleted via CLI
+    await roleCmd.handler("delete general", cliCtx);
+    expect(messages.at(-1)).toContain('Built-in role "general" cannot be deleted');
+    await roleCmd.handler("delete reviewer", cliCtx);
+    expect(messages.at(-1)).toContain('Built-in role "reviewer" cannot be deleted');
+
+    // 2) Copy built-in reviewer -> sql-reviewer (--project), preserving permissions & read-only bounds
+    await roleCmd.handler("copy reviewer sql-reviewer --project SQL security auditor", cliCtx);
+    const sqlPath = path.join(cwd, ".omp", "roles", "sql-reviewer.yaml");
+    expect(existsSync(sqlPath)).toBe(true);
+    const cloned = parseRoleYaml(readFileSync(sqlPath, "utf8"), "project", sqlPath);
+    expect(cloned.description).toBe("SQL security auditor");
+    expect(cloned.permissions.writable).toEqual([]);
+    expect(cloned.permissions.protected).toEqual(["**"]);
+    expect(cloned.exit.requireToolEvidence).toBe(true);
+
+    // 3) Tab completion for `/role delete ` lists custom `sql-reviewer` and omits all built-in roles
+    const delCompletions = roleCmd.getArgumentCompletions!("delete ").map((c) => c.value);
+    expect(delCompletions).toEqual(["delete sql-reviewer"]);
+
+    // 4) Switch session to sql-reviewer, then test TUI 'd' on built-in (blocked with warning) and 'd' on custom (deleted + fallback to general)
+    await roleCmd.handler("sql-reviewer", cliCtx);
+    expect(statusBadge).toBe("enhance:sql-reviewer");
+
+    // Sorted roles: [dev, general, ml-engineer, qa, reviewer, sql-reviewer, supervisor]
+    // Initial cursor is on active role sql-reviewer (index 5):
+    // First press Up to reviewer (index 4) and press 'd' -> warns built-in protected, stays in loop -> Esc
+    // Second /role: cursor starts on sql-reviewer (index 5), press 'd' -> deletes sql-reviewer & falls back to general -> Esc
+    const customQueue: string[][] = [
+      ["\x1b[A", "d"],
+      ["\x1b[27u"],
+      ["d"],
+      ["\x1b[27u"],
+    ];
+    const uiCtx = {
+      cwd,
+      hasUI: true,
+      ui: {
+        async custom(factory: any) {
+          const keys = customQueue.shift() ?? ["\x1b[27u"];
+          let resolved: unknown;
+          const comp = factory({ requestRender() {} }, { fg: (_c: string, s: string) => s, bold: (s: string) => s }, {}, (r: unknown) => {
+            resolved = r;
+          });
+          comp.render(100);
+          for (const k of keys) comp.handleInput(k);
+          return resolved;
+        },
+        async confirm() { return true; },
+        notify(text: string, level?: string) { if (level === "warning") warnings.push(text); },
+        setStatus(_k: string, badge?: string) { statusBadge = badge ?? null; },
+      },
+    };
+
+    await roleCmd.handler("", uiCtx);
+    expect(warnings.some((w) => w.includes("内置默认角色") && w.includes("reviewer"))).toBe(true);
+    expect(existsSync(sqlPath)).toBe(true);
+
+    await roleCmd.handler("", uiCtx);
+    expect(existsSync(sqlPath)).toBe(false);
+    expect(statusBadge).toBe("enhance:general");
+  });
 });

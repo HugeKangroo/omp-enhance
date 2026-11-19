@@ -49,7 +49,9 @@ omp --extension .
 | 命令 | 说明 |
 | --- | --- |
 | `/settings` → `Plugins` → `omp-enhance` | 在 OMP 系统默认设置面板中配置插件参数（`defaultRole`、`supervisorModel`、`supervisorEnabled`、`flowMaxRepairRounds` 等） |
-| `/role` 或 `/role studio` | 打开**单屏左右分栏 Role 面板**（左选角色、右看完整权限与方法论预览；`Enter` 一键切换当前会话角色，`h` 一键向该角色发起独立阶段交接，`e` 编辑配置（`Space` 原地勾选工具），`n` 新建，`o` 关闭；支持 `Tab` 补全） |
+| `/role` 或 `/role studio` | 打开**单屏左右分栏 Role 面板**（`Enter` 切换会话角色，`e/→` 修改配置，`c` 基于当前角色拷贝新角色，`d` 删除自定义角色（6 个内置默认角色受保护不可删），`h` 独立阶段交接，`n` 新建，`Esc` 退出） |
+| `/role copy <src> <newId> [--project]` | 以现有内置或自定义角色为模板一键拷贝生成新角色 YAML |
+| `/role delete <customId>` | 删除自定义角色（内置默认角色受保护不可删除；若删除当前激活角色会自动回退至默认基态 `general`） |
 | `/role edit <id>` | 在交互式 TUI 中直接打开指定角色的配置页（内置角色修改时自动 Copy-on-Write 保存至覆盖目录，支持一键恢复默认） |
 | `/role list` | 文本列出当前激活角色及所有可用角色（显示来源与绑定模型） |
 | `/role <id>` / `/role off` | 切换主会话当前激活角色（若角色绑定了专属模型/推理档位会同步切换），或暂时关闭角色条件化注入 |
@@ -72,6 +74,6 @@ omp --extension .
 
 ```sh
 bun run probe:phase0 # 真机验证本机 OMP 公开 SDK、账号继承与隔离会话生命周期
-bun run check        # 类型检查 + 核心代码行数/零私有导入门禁 (≤ 2,700 LoC) + 单元测试
+bun run check        # 类型检查 + 核心代码行数/零私有导入门禁 (≤ 2,900 LoC) + 单元测试
 bun run verify:omp   # 调用本机真实 omp 执行端到端集成验收
 ```
