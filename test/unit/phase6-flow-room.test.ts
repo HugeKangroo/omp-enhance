@@ -405,4 +405,105 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
     capturedComp.handleInput("\x1b[27;1:1u"); // closes overlay!
     await overlayPromise;
   });
+
+  test("applies defaultRole on session_start, steers @role mid-flow, queues followUp when foreground streams, and keeps /role ANSI-safe", async () => {
+    let releaseRun = null as (() => void) | null;
+    const activeToolSets: string[][] = [];
+    const sentCalls: Array<{ msg: any; opts: any }> = [];
+
+    const cwd = makeTempDir("audit-ws");
+    const globalDir = makeTempDir("audit-global");
+    const lockPath = path.join(cwd, "omp-plugins.lock.json");
+    // Configure defaultRole = "reviewer" (restricted read-only tools!)
+    writeText(lockPath, JSON.stringify({ settings: { "omp-enhance": { defaultRole: "reviewer", flowRoutingMode: "auto" } } }));
+
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const commands = new Map<string, any>();
+    const pi = {
+      cwd,
+      on(ev: string, fn: (...args: any[]) => any) {
+        const list = handlers.get(ev) ?? []; list.push(fn); handlers.set(ev, list);
+      },
+      registerTool() {},
+      registerCommand(name: string, spec: any) { commands.set(name, spec); },
+      registerMessageRenderer() {},
+      sendMessage(msg: any, opts: any) { sentCalls.push({ msg, opts }); },
+      getAllTools: () => [{ name: "read" }, { name: "grep" }, { name: "write" }, { name: "edit" }, { name: "bash" }],
+      async setActiveTools(names: string[]) { activeToolSets.push(names); },
+      pi: { settings: {} },
+    };
+
+    const runner: RoleSessionRunner = {
+      async runRoleTurn(stepCtx) {
+        await new Promise<void>((resolve) => { releaseRun = resolve; });
+        const call: ObservedToolCall = {
+          toolCallId: "r1", toolName: "read", isError: false,
+          touchedPaths: [], timestamp: new Date().toISOString(), summary: "read README.md",
+        };
+        const env = createAndVerifyHandoff({
+          store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
+          parentHandoffId: null, toTarget: "user", verdict: "ready", summary: "ok", observedCalls: [call],
+        });
+        return { envelope: env, observedCalls: [call], assistantText: "ok", usage: null };
+      },
+    };
+
+    ompEnhance(pi, { globalRolesDir: globalDir, builtinRolesDir, pluginLockPath: lockPath, runnerFactory: () => runner });
+
+    // 1) session_start immediately applies defaultRole="reviewer" tool restrictions (no write/edit)!
+    await handlers.get("session_start")![0]!({}, { cwd, ui: { setStatus() {} } });
+    expect(activeToolSets.length).toBe(1);
+    expect(activeToolSets[0]).toContain("read");
+    expect(activeToolSets[0]).not.toContain("write");
+    expect(activeToolSets[0]).not.toContain("edit");
+
+    // 2) While flow is running, @dev <msg> rewrites to /flow steer [@dev] <msg> instead of colliding!
+    // Also simulate foreground agent streaming (isIdle() === false) so summary card queues as followUp!
+    const ctx = {
+      cwd, hasUI: true,
+      isIdle: () => false,
+      ui: {
+        setWidget() {}, setStatus() {}, notify() {},
+        async custom(factory: any) {
+          const ansiTheme = {
+            fg: (_c: string, s: string) => `\x1b[38;2;80;160;255m${s}\x1b[39m`,
+            bold: (s: string) => `\x1b[1m${s}\x1b[22m`,
+          };
+          await new Promise<void>((resolve) => {
+            const comp = factory({ requestRender() {} }, ansiTheme, null, () => resolve());
+            const lines: string[] = comp.render(64);
+            for (const line of lines) {
+              expect(Bun.stringWidth(line)).toBe(64);
+              // Every ESC[1m or ESC[38;2...m must have its closing reset intact (never sliced mid-ANSI!)
+              const opens = (line.match(/\x1b\[38;2;/g) ?? []).length;
+              const closes = (line.match(/\x1b\[39m/g) ?? []).length;
+              expect(opens).toBe(closes);
+            }
+            comp.handleInput("\x1b[27;1:1u");
+          });
+        },
+      },
+    };
+
+    // Check /role ANSI safety & exact border width at narrow 64 cols
+    await commands.get("role")!.handler("", ctx);
+
+    await commands.get("flow")!.handler("dev 实现缓存层", ctx);
+    for (let i = 0; i < 20 && !releaseRun; i++) await Bun.sleep(5);
+
+    const inputFn = handlers.get("input")![0]!;
+    expect(inputFn({ text: "@dev 记得加 LRU 上限" }, ctx)).toEqual({
+      text: "/flow steer [@dev] 记得加 LRU 上限",
+    });
+
+    releaseRun!();
+    for (let i = 0; i < 30 && sentCalls.length === 0; i++) await Bun.sleep(10);
+    expect(sentCalls[0]?.msg.customType).toBe("omp-enhance-room");
+    expect(sentCalls[0]?.opts).toEqual({ triggerTurn: false, deliverAs: "followUp" });
+
+    // Once flow finishes, @qa <task> returns to launching a new 1-role flow!
+    expect(inputFn({ text: "@qa 验证 LRU 淘汰" }, ctx)).toEqual({
+      text: "/flow qa 验证 LRU 淘汰",
+    });
+  });
 });

@@ -129,7 +129,8 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
       appendFileSync(outPath, text.endsWith("\n") ? text : `${text}\n`, "utf8");
     }
     try {
-      if (typeof pi.sendMessage === "function") pi.sendMessage({ customType: "omp-enhance", content: text, display: true }, { triggerTurn: false });
+      const sendOpts = { triggerTurn: false, ...(ctx?.isIdle?.() === false ? { deliverAs: "followUp" } : {}) };
+      if (typeof pi.sendMessage === "function") pi.sendMessage({ customType: "omp-enhance", content: text, display: true }, sendOpts);
       else ctx?.ui?.notify?.(text, "info");
     } catch {}
   }
@@ -184,13 +185,17 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
     if (match && getWorkspace(ctx).roles.has(match[1]!)) return { text: text.replace(/^\/handoff/, "/enhance-handoff") };
     const atMatch = /^@([a-zA-Z0-9][a-zA-Z0-9_-]*)\s+([\s\S]+)$/.exec(text.trim());
     if (atMatch) {
-      const ws = getWorkspace(ctx), roleId = atMatch[1]!, task = atMatch[2]!.trim();
-      if (roleId !== "supervisor" && task && ws.roles.has(roleId)) return { text: `/flow ${roleId} ${task.replace(/\s+/g, " ")}` };
+      const ws = getWorkspace(ctx), roleId = atMatch[1]!, task = atMatch[2]!.trim().replace(/\s+/g, " ");
+      if (roleId !== "supervisor" && task && ws.roles.has(roleId)) {
+        return { text: ws.room.isRunning() ? `/flow steer [@${roleId}] ${task}` : `/flow ${roleId} ${task}` };
+      }
     }
     return undefined;
   });
 
-  pi.on("session_start", (_event: any, ctx: any) => { const ws = getWorkspace(ctx); refreshRoles(ws); syncStatusBar(ws, ctx); });
+  pi.on("session_start", async (_event: any, ctx: any) => {
+    const ws = getWorkspace(ctx); refreshRoles(ws); await applyActiveRole(ws, ws.activeRoleId, ctx);
+  });
   pi.on("session_shutdown", () => { for (const ws of workspaces.values()) { ws.room.dispose(); ws.store.close(); } workspaces.clear(); });
 
   pi.on("before_agent_start", (event: any, ctx: any) => {

@@ -7,6 +7,7 @@ import {
 } from "./role-loader.ts";
 import { COMPANION_TOOL_NAMES, READONLY_SUBAGENTS } from "./session-tracker.ts";
 import { DEFAULT_ENHANCE_SETTINGS } from "./settings.ts";
+import { padLeftCell as padCell } from "./flow-room.ts";
 
 export interface RoleStudioDeps {
   cwd: string; globalRolesDir: string; builtinRolesDir?: string; pi: any; ctx: any;
@@ -59,13 +60,6 @@ export function parseOverlayKey(data: string, kb?: any): string | null {
   if (/^\x1b\[(?:1;\d+(?::[12])?)?C$/.test(data) || data === "\x1bOC") return "right";
   if (/^\x1b\[(?:1;\d+(?::[12])?)?D$/.test(data) || data === "\x1bOD") return "left";
   return data.length === 1 && data >= "!" && data <= "~" ? data : null;
-}
-
-function padCell(text: string, width: number): string {
-  if (width <= 0) return "";
-  let out = text;
-  while (Bun.stringWidth(out) > width && out.length > 0) out = `${out.slice(0, Math.max(0, out.length - 2))}…`;
-  return out + " ".repeat(Math.max(0, width - Bun.stringWidth(out)));
 }
 
 function stripRoleDraft(role: RoleSpec): Omit<RoleSpec, "source" | "filePath" | "contentSha256"> {
@@ -150,7 +144,7 @@ async function pickRoleTools(role: RoleSpec, deps: RoleStudioDeps): Promise<stri
         },
         render(width: number): string[] {
           const inner = Math.max(24, width - 4);
-          const lines = [fg("border", `╭─ ${padCell(`工具权限 · ${role.id} (已勾选 ${selected.size}/${hostTools.length})`, inner)} ─╮`)];
+          const lines = [fg("border", `╭─ ${padCell(`工具权限 · ${role.id} (已勾选 ${selected.size}/${hostTools.length})`, inner - 2)} ─╮`)];
           for (let i = 0; i < hostTools.length; i++) {
             const name = hostTools[i]!, on = selected.has(name), cur = i === cursor;
             const row = `${cur ? "▸" : " "} [${on ? "✓" : " "}] ${name}`;
@@ -198,13 +192,18 @@ export async function openCreateRoleWizard(
   if (!modeChoice) return null;
   const model = await pickRoleModel("inherit", deps);
   if (model === null) return null;
-  const created = scaffoldRoleFile({
-    id, description: String(rawDesc).trim() || id, targetDir: targetDirFor(deps, scope),
-    readOnly: modeChoice.startsWith("readonly"), model,
-  });
-  deps.refreshRoles();
-  ui.notify?.(`Created role "${created.role.id}" [${created.source}]`, "info");
-  return created.role.id;
+  try {
+    const created = scaffoldRoleFile({
+      id, description: String(rawDesc).trim() || id, targetDir: targetDirFor(deps, scope),
+      readOnly: modeChoice.startsWith("readonly"), model,
+    });
+    deps.refreshRoles();
+    ui.notify?.(`Created role "${created.role.id}" [${created.source}]`, "info");
+    return created.role.id;
+  } catch (err) {
+    ui.notify?.(err instanceof Error ? err.message : String(err), "warning");
+    return null;
+  }
 }
 
 export async function openCloneRoleWizard(
@@ -415,35 +414,40 @@ export async function openRoleStudioHome(deps: RoleStudioDeps): Promise<void> {
             const inner = Math.max(44, width - 4);
             const leftW = Math.min(26, Math.max(20, Math.floor(inner * 0.32))), rightW = Math.max(18, inner - leftW - 3);
             const cur = entries[cursor]!;
-            let rightLines: string[];
+            let rightRows: Array<{ text: string; style?: "head" | "accent" }>;
             if (cur.kind === "role") {
               const sel = cur.role, builtin = hasBuiltinRole(sel.id, deps.builtinRolesDir);
               const effModel = sel.id === "supervisor" && sel.source === "builtin"
                 ? `${settings.supervisorModel} (via /settings)` : (sel.model ?? "inherit (session model)");
               const subRule = sel.permissions.writable !== undefined || (sel.permissions.protected?.length ?? 0) > 0
                 ? `read-only (${READONLY_SUBAGENTS.join(", ")})` : "all OMP subagents";
-              rightLines = [
-                bold(`${sel.id} — ${sel.name} [${sel.source}${builtin ? " · 内置保护" : " · 自定义"}]`),
-                sel.description || "(no description)",
-                `Model: ${effModel} · Thinking: ${sel.thinking ?? "inherit"}`,
-                `Tools: ${sel.permissions.tools ? (sel.permissions.tools.join(", ") || "none") : "unrestricted"}`,
-                `Subagents: ${subRule}`,
-                `Writable: ${sel.permissions.writable ? (sel.permissions.writable.join(", ") || "read-only []") : "*"} · Protected: ${sel.permissions.protected?.join(", ") || "none"}`,
-                `Stance: ${sel.stance.trim().replace(/\s+/g, " ")}`,
-                ...sel.method.slice(0, 2).map((m, idx) => `${idx + 1}. ${m}`),
-                fg("accent", `操作: Enter 切换 · e/→ 修改 · c 拷贝${builtin ? "" : " · d 删除"} · h 交接`),
+              rightRows = [
+                { text: `${sel.id} — ${sel.name} [${sel.source}${builtin ? " · 内置保护" : " · 自定义"}]`, style: "head" },
+                { text: sel.description || "(no description)" },
+                { text: `Model: ${effModel} · Thinking: ${sel.thinking ?? "inherit"}` },
+                { text: `Tools: ${sel.permissions.tools ? (sel.permissions.tools.join(", ") || "none") : "unrestricted"}` },
+                { text: `Subagents: ${subRule}` },
+                { text: `Writable: ${sel.permissions.writable ? (sel.permissions.writable.join(", ") || "read-only []") : "*"} · Protected: ${sel.permissions.protected?.join(", ") || "none"}` },
+                { text: `Stance: ${sel.stance.trim().replace(/\s+/g, " ")}` },
+                ...sel.method.slice(0, 2).map((m, idx) => ({ text: `${idx + 1}. ${m}` })),
+                { text: `操作: Enter 切换 · e/→ 修改 · c 拷贝${builtin ? "" : " · d 删除"} · h 交接`, style: "accent" },
               ];
             } else {
-              rightLines = [bold(cur.label), "", cur.detail, "", fg("accent", "按 Enter 执行此操作，或按 Esc 退出。")];
+              rightRows = [
+                { text: cur.label, style: "head" }, { text: "" }, { text: cur.detail }, { text: "" },
+                { text: "按 Enter 执行此操作，或按 Esc 退出。", style: "accent" },
+              ];
             }
-            const rowCount = Math.max(entries.length, rightLines.length);
-            const out = [fg("border", `╭─ ${padCell(`OMP Enhance · Roles  [当前: ${activeId ?? "off"}]`, inner)} ─╮`)];
+            const rowCount = Math.max(entries.length, rightRows.length);
+            const out = [fg("border", `╭─ ${padCell(`OMP Enhance · Roles  [当前: ${activeId ?? "off"}]`, inner - 2)} ─╮`)];
             for (let i = 0; i < rowCount; i++) {
-              const item = entries[i];
+              const item = entries[i], rRow = rightRows[i];
               const leftRaw = item ? `${i === cursor ? "▸" : " "}${item.label}` : "";
               const leftCell = i === cursor ? fg("accent", bold(padCell(leftRaw, leftW)))
                 : (item?.kind === "role" && activeId === item.role.id ? fg("success", padCell(leftRaw, leftW)) : padCell(leftRaw, leftW));
-              const rightCell = i === 0 ? fg("accent", padCell(rightLines[i] ?? "", rightW)) : padCell(rightLines[i] ?? "", rightW);
+              const rPadded = padCell(rRow?.text ?? "", rightW);
+              const rightCell = rRow?.style === "head" ? fg("accent", bold(rPadded))
+                : (rRow?.style === "accent" ? fg("accent", rPadded) : rPadded);
               out.push(`${fg("border", "│")} ${leftCell} ${fg("border", "│")} ${rightCell} ${fg("border", "│")}`);
             }
             out.push(fg("border", `├─${"─".repeat(inner)}─┤`));

@@ -243,10 +243,11 @@ export class FlowRoomManager {
   private sendCard(snap: FlowRoomSnapshot, summary: string, ctx?: any): void {
     if (!ctx?.hasUI || typeof this.pi?.sendMessage !== "function") return;
     try {
+      const opts = { triggerTurn: false, ...(ctx?.isIdle?.() === false ? { deliverAs: "followUp" } : {}) };
       this.pi.sendMessage({
         customType: "omp-enhance-room", display: true, details: snap,
         content: `[Flow ${snap.roleChain.join(" → ")} · ${snap.status}] ${summary}`,
-      }, { triggerTurn: false });
+      }, opts);
     } catch {}
   }
 
@@ -469,10 +470,11 @@ export async function openFlowRoomOverlay(deps: FlowRoomOverlayDeps): Promise<vo
         if (ev.kind === "scroll_down") { rightScroll += 3; tui?.requestRender?.(); return; }
         if (ev.kind === "backspace") { draft = Array.from(draft).slice(0, -1).join(""); tui?.requestRender?.(); return; }
         if (ev.kind === "text") { draft += ev.text; tui?.requestRender?.(); return; }
+        const onErr = (err: unknown) => { statusNote = `✕ ${err instanceof Error ? err.message : String(err)}`; tui?.requestRender?.(); };
         if (ev.kind === "cancel_flow") {
           void deps.room.cancelActiveFlow(deps.ctx).then((ok) => {
             statusNote = ok ? "⏹ 已发送中止指令" : "当前无运行中的 Flow"; tui?.requestRender?.();
-          });
+          }, onErr);
           return;
         }
         if (ev.kind === "enter") {
@@ -482,10 +484,10 @@ export async function openFlowRoomOverlay(deps: FlowRoomOverlayDeps): Promise<vo
           if (deps.room.isRunning()) {
             void deps.room.postUserSteer(msg, deps.ctx).then((r) => {
               statusNote = r.delivered ? "✓ 已实时插话至当前 Agent" : "✓ 已记录留言"; tui?.requestRender?.();
-            });
+            }, onErr);
           } else if (deps.onFollowUp) {
-            statusNote = "▶ 已发起新一轮协作"; void deps.onFollowUp(msg).then(() => tui?.requestRender?.());
-          } else void deps.room.postUserSteer(msg, deps.ctx).then(() => tui?.requestRender?.());
+            statusNote = "▶ 已发起新一轮协作"; void deps.onFollowUp(msg).then(() => tui?.requestRender?.(), onErr);
+          } else void deps.room.postUserSteer(msg, deps.ctx).then(() => tui?.requestRender?.(), onErr);
           tui?.requestRender?.();
         }
       },
