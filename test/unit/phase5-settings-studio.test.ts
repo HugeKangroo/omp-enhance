@@ -62,6 +62,7 @@ describe("native OMP plugin settings loader", () => {
       supervisorThinking: "off",
       supervisorInitialDelaySec: 5,
       flowMaxRepairRounds: 10,
+      flowRoutingMode: "ask",
     });
 
     writeText(path.join(cwd, ".omp", "plugin-overrides.json"), JSON.stringify({
@@ -72,6 +73,7 @@ describe("native OMP plugin settings loader", () => {
           supervisorThinking: "low",
           supervisorInitialDelaySec: 9999,
           flowMaxRepairRounds: -4,
+          flowRoutingMode: "auto",
         },
       },
     }));
@@ -83,6 +85,7 @@ describe("native OMP plugin settings loader", () => {
       supervisorThinking: "low",
       supervisorInitialDelaySec: 600,
       flowMaxRepairRounds: 0,
+      flowRoutingMode: "auto",
     });
 
     writeText(path.join(cwd, ".omp", "enhance.yaml"), [

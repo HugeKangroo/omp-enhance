@@ -25,6 +25,12 @@
    - 周期性消费增量脉搏（新增日志 / 新增工具调用 / 静默时长），只输出 `continue`、`steer` 或 `abort` 三种裁决，并按 `nextCheckSec` 自适应拉长巡检间隔。
    - 快速任务在初始延迟（默认 30 秒）内结束时不产生任何监督模型调用；监督模型自身报错时 **fail-open**，绝不误杀健康任务。
    - `abort` 仅由明确异常证据触发（数值 `NaN`/`Inf`、等待交互输入死锁、重复同错原地打转等），并立即终止后台作业进程组或中止角色子会话。
+7. **双流协同架构 + 左右对称群聊卡片与 `/flow` 动作检查器（B + C 形态）**
+   - **前台沟通流 + 后台执行流非阻塞并发**：多角色 Flow 在后台异步推进，主对话框始终解锁可随时追问或插话；支持在 `/settings → Plugins → omp-enhance` 切换 `flowRoutingMode`（默认 `ask` 询问确认、`auto` 自动派发、`manual` 仅手动 `/flow` 触发）。
+   - **左右对称群聊视觉语言**：各角色与 `supervisor` 发言居左（`▶ [dev → @qa]`），你的发言与中途插话居右（`... ◀ 你`）。
+   - **形态 B（主窗口实时悬停条 + 永久纪要卡片）**：后台执行期间在输入框上方显示紧凑实时群聊条；结束后自动折叠归档为群聊纪要卡片，按 `Ctrl+O` 一键展开每个 Agent 具体执行的工具时间线与产物快照。
+   - **形态 C（`/flow` 双栏群聊与 Agent 动作检查器）**：不带参数输入 `/flow`（或 `/flow hub`）打开全屏左右分栏面板——左栏 `↑/↓` 浏览左右群聊气泡，右栏实时检视当前选中 Agent 的模型、耗时、有序工具轨迹（`1. ✓ read ...`）、产物 `sha256` 与插话记录；底部输入框直接打字回车即可向正在运行的 Agent 实时 `steer` 插话，`Ctrl+X` 一键中止。
+   - **`@<roleId> <任务>` 直呼特定角色**：在主对话框直接输入 `@qa 跑一下鉴权边界测试` 即可免命令拉起单角色隔离执行并汇报。
 
 ---
 
@@ -48,7 +54,7 @@ omp --extension .
 
 | 命令 | 说明 |
 | --- | --- |
-| `/settings` → `Plugins` → `omp-enhance` | 在 OMP 系统默认设置面板中配置插件参数（`defaultRole`、`supervisorModel`、`supervisorEnabled`、`flowMaxRepairRounds` 等） |
+| `/settings` → `Plugins` → `omp-enhance` | 在 OMP 系统默认设置面板中配置插件参数（`defaultRole`、`flowRoutingMode`、`supervisorModel`、`supervisorEnabled`、`flowMaxRepairRounds` 等） |
 | `/role` 或 `/role studio` | 打开**单屏左右分栏 Role 面板**（`Enter` 切换会话角色，`e/→` 修改配置，`c` 基于当前角色拷贝新角色，`d` 删除自定义角色（6 个内置默认角色受保护不可删），`h` 独立阶段交接，`n` 新建，`Esc` 退出） |
 | `/role copy <src> <newId> [--project]` | 以现有内置或自定义角色为模板一键拷贝生成新角色 YAML |
 | `/role delete <customId>` | 删除自定义角色（内置默认角色受保护不可删除；若删除当前激活角色会自动回退至默认基态 `general`） |
@@ -58,14 +64,17 @@ omp --extension .
 | `/role show <id>` | 查看指定角色的完整 YAML 规范、专属模型、读写保护边界与文件路径 |
 | `/role create <id> [--project] <描述>` | CLI 快速生成规范 YAML 角色文件（默认存入 `~/.omp/enhance/roles/`） |
 | `/handoff [role]` | 将当前成果转手给独立隔离的阶段角色（如 `/handoff qa`；不带参数敲 `/handoff` 会直接弹出目标角色选择器，支持 `Tab` 补全，执行时底部实时显示正在运行的阶段与工具；`-p` 模式下请用 `/enhance-handoff <role>`） |
-| `/flow <r1,r2,...> [任务说明]` | 按角色序列（如 `/flow dev,qa,reviewer`，支持逗号后 `Tab` 补全）执行马尔可夫隔离接力与自动打回返修 |
-| `/enhance-status` | 本地只读查看当前角色、当前生效插件设置、有效 `Mandate`、认知黑板计数、最近交接链与后台作业 |
+| `/flow` 或 `/flow hub` | 打开**双栏群聊与 Agent 动作检查器面板**（左栏左右对称群聊流，右栏检视每个 Agent 的工具动作轨迹与产物，底部输入框回车实时 `steer` 插话，`Ctrl+X` 中止，`Esc` 关闭） |
+| `/flow <r1,r2,...> [任务说明]` | 后台非阻塞启动马尔可夫隔离角色链与自动打回返修（如 `/flow dev,qa,reviewer`），主窗口显示实时悬停条并在完成后归档为可 `Ctrl+O` 展开的群聊卡片 |
+| `/flow steer <内容>` / `/flow cancel` / `/flow status` | 从命令行直接向正在运行的后台 Flow 实时插话纠偏、中止执行或查看快照 |
+| `@<roleId> <任务>` | 在主输入框直接点名某个角色（如 `@qa 验证并发边界`）执行独立隔离阶段并汇报 |
+| `/enhance-status` | 本地只读查看当前角色、当前生效插件设置、Flow 房间状态、有效 `Mandate`、认知黑板计数、最近交接链与后台作业 |
 
 ### 模型可调用工具
 
 - `enhance_mandate`：建立/更新原始需求契约（目标、硬约束、验收条件）及读写认知黑板（`fact` 强制绑定真实证据引用、`hypothesis`、`inquiry`、`decision`）。
 - `enhance_handoff`：收束本轮工作生成标准 `HandoffEnvelope`（自动计算变更文件 `sha256` 并核验真实工具调用证据），可选直接委托下一角色。
-- `enhance_flow`：按角色序列触发多角色协同与自动返修回路。
+- `enhance_flow`：双流协同控制工具，支持 `action: "start" | "status" | "steer" | "cancel"`（受 `flowRoutingMode` 路由策略保护）。
 - `enhance_job`：启动、`watch`（自适应巡检直到完成/失败/被止损）、读取日志尾部、跨重启对账（`reconcile`）或取消后台无时限长作业。
 
 ---
@@ -74,6 +83,6 @@ omp --extension .
 
 ```sh
 bun run probe:phase0 # 真机验证本机 OMP 公开 SDK、账号继承与隔离会话生命周期
-bun run check        # 类型检查 + 核心代码行数/零私有导入门禁 (≤ 2,900 LoC) + 单元测试
+bun run check        # 类型检查 + 核心代码行数/零私有导入门禁 (≤ 3,450 LoC) + 单元测试
 bun run verify:omp   # 调用本机真实 omp 执行端到端集成验收
 ```

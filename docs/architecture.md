@@ -65,8 +65,9 @@ flowchart TB
 | `src/store.ts` | `bun:sqlite` WAL 事务存储 + 工作区 glob `sha256` 快照比对 | 单一事实源，替代手搓文件锁 |
 | `src/role-loader.ts` | `Bun.YAML.parse` 解析校验、三级目录合并、条件块渲染、YAML 序列化与 Copy-on-Write 角色保存/重置 | 零第三方解析库依赖 |
 | `src/settings.ts` | 实时读取 OMP 原生插件设置（`omp-plugins.lock.json` / `.omp/plugin-overrides.json` / `.omp/enhance.yaml`）与角色模型解析（`@advisor` 默认继承） | 与系统内置 `/settings → Plugins` 无缝互通 |
-| `src/role-studio.ts` | 内聚在 `/role` 命令下的原生 TUI 角色工作台（模型选择、工具 Checkbox 复选框、新建向导、YAML 在线校验编辑） | 100% 基于公开 `ExtensionUIContext`，零新增斜杠命令 |
-| `src/session-tracker.ts` | `tool_call` 写路径边界守卫 + `tool_execution_end` 真实调用留痕 | 不阻断合法原生操作 |
+| `src/role-studio.ts` | 内聚在 `/role` 命令下的原生 TUI 角色工作台（模型选择、工具 Checkbox 复选框、拷贝/自定义删除、YAML 在线校验编辑） | 100% 基于公开 `ExtensionUIContext`，零新增斜杠命令 |
+| `src/flow-room.ts` | 双流协同房间状态机、左右对称群聊气泡排版（`Bun.stringWidth` 精准 CJK 对齐）、主窗口 `aboveEditor` 实时悬停条、`omp-enhance-room` 可折叠卡片渲染器与 `/flow` 双栏动作检查器 | 100% 基于公开 `setWidget`、`registerMessageRenderer` 与 `ui.custom` |
+| `src/session-tracker.ts` | `tool_call` 写路径边界守卫 + `tool_execution_end` 真实调用留痕与可读工具摘要 | 不阻断合法原生操作 |
 | `src/handoff.ts` | 校验证据引用与准出要求，自动扫描改动文件指纹，生成 `HandoffEnvelope` | 严禁模型手抄伪造哈希或调用 ID |
 | `src/orchestrator.ts` | 派生零历史污染的下游角色会话（支持角色级异构模型与推理档位绑定），核验 `protected` 不变性，驱动返修回路与无进展熔断 | 仅调用官方根导出 `pi.pi.createAgentSession` |
 | `src/jobs.ts` | 脱离终端生命周期的后台长作业（训练/批量实验）启动、日志归档、跨重启对账与取消 | 无预设时间上限强杀 |

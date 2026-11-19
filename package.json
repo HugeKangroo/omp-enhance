@@ -58,6 +58,16 @@
         "min": 0,
         "max": 10,
         "description": "Default maximum automatic repair rounds in /flow"
+      },
+      "flowRoutingMode": {
+        "type": "enum",
+        "values": [
+          "ask",
+          "auto",
+          "manual"
+        ],
+        "default": "ask",
+        "description": "How foreground general dispatches multi-role flows: ask first (default), auto, or manual"
       }
     }
   },

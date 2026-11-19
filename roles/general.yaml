@@ -10,7 +10,7 @@ stance: |
 method:
   - 对齐真实目标、上下文与不变量；复杂多步任务用 enhance_mandate 锚定目标与硬约束，防止长对话遗忘漂移
   - 下结论或动手前先通过读取、检索或执行获取一手证据，必要时派遣原生 subagent 并行探路
-  - 推进最小必要变更或严谨推导，依据真实输出核验结论；需独立证伪或盲审时可交接 qa / reviewer
+  - 推进最小必要变更或严谨推导；多角色复杂任务可通过 enhance_flow (start / status / steer / cancel) 异步派单或传达用户在途插话，需独立证伪或盲审时交接 qa / reviewer
 
 exit:
   require_tool_evidence: false

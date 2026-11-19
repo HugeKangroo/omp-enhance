@@ -22,6 +22,21 @@ export function extractTaskSubagents(input: unknown): string[] {
   return [typeof record.agent === "string" && record.agent.trim() ? record.agent.trim() : "task"];
 }
 
+export function summarizeToolCall(toolName: string, input: unknown): string {
+  const r = typeof input === "object" && input !== null && !Array.isArray(input)
+    ? (input as Record<string, unknown>) : {};
+  const clip = (s: string, n = 44): string => {
+    const clean = s.replace(/\s+/g, " ").trim();
+    return clean.length > n ? `${clean.slice(0, n - 1)}…` : clean;
+  };
+  if (toolName === "task") return `task → ${extractTaskSubagents(input).join(", ")}`;
+  for (const key of ["command", "cmd", "path", "file_path", "pattern", "query", "summary"] as const) {
+    if (typeof r[key] === "string" && r[key]!.trim()) return `${toolName} ${clip(String(r[key]))}`;
+  }
+  if (Array.isArray(r.paths) && typeof r.paths[0] === "string") return `${toolName} ${clip(String(r.paths[0]))}`;
+  return toolName;
+}
+
 const WRITE_TOOLS: Record<string, true> = { write: true, edit: true, apply_patch: true };
 
 export function extractWriteTargetPaths(cwd: string, toolName: string, input: unknown): string[] {
@@ -114,6 +129,7 @@ export class TurnTracker {
       isError: event.isError ?? false,
       touchedPaths: extractWriteTargetPaths(cwd, event.toolName, event.args),
       timestamp: new Date().toISOString(),
+      summary: summarizeToolCall(event.toolName, event.args),
     };
     this.calls.push(call);
     return call;

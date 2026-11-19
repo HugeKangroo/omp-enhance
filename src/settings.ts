@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import type { EnhanceSettings, RoleSpec, RoleThinkingLevel } from "./types.ts";
+import type { EnhanceSettings, FlowRoutingMode, RoleSpec, RoleThinkingLevel } from "./types.ts";
 import { ROLE_THINKING_LEVELS } from "./role-loader.ts";
 
 export const PLUGIN_NAME = "omp-enhance";
@@ -12,13 +12,14 @@ export const OMP_MODEL_ROLE_IDS = [
 
 const MODEL_ROLE_SET = new Set<string>(OMP_MODEL_ROLE_IDS);
 const THINKING_SET = new Set<string>(ROLE_THINKING_LEVELS);
+const ROUTING_MODES = new Set<string>(["ask", "auto", "manual"]);
 const clampInt = (value: number, min: number, max: number): number =>
   Math.min(max, Math.max(min, Math.round(value)));
 
 export const DEFAULT_ENHANCE_SETTINGS: EnhanceSettings = {
   defaultRole: "general", showStatusBar: true, supervisorEnabled: true,
   supervisorModel: "@advisor", supervisorThinking: "off",
-  supervisorInitialDelaySec: 30, flowMaxRepairRounds: 2,
+  supervisorInitialDelaySec: 30, flowMaxRepairRounds: 2, flowRoutingMode: "ask",
 };
 
 function readRecord(filePath: string, yaml = false): Record<string, unknown> | null {
@@ -52,6 +53,9 @@ function applyRawPatch(target: EnhanceSettings, raw: unknown): void {
   }
   if (typeof r.flowMaxRepairRounds === "number" && Number.isFinite(r.flowMaxRepairRounds)) {
     target.flowMaxRepairRounds = clampInt(r.flowMaxRepairRounds, 0, 10);
+  }
+  if (typeof r.flowRoutingMode === "string" && ROUTING_MODES.has(r.flowRoutingMode.trim())) {
+    target.flowRoutingMode = r.flowRoutingMode.trim() as FlowRoutingMode;
   }
 }
 
