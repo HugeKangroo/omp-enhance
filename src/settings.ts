@@ -16,7 +16,7 @@ const clampInt = (value: number, min: number, max: number): number =>
   Math.min(max, Math.max(min, Math.round(value)));
 
 export const DEFAULT_ENHANCE_SETTINGS: EnhanceSettings = {
-  defaultRole: "dev", showStatusBar: true, supervisorEnabled: true,
+  defaultRole: "general", showStatusBar: true, supervisorEnabled: true,
   supervisorModel: "@advisor", supervisorThinking: "off",
   supervisorInitialDelaySec: 30, flowMaxRepairRounds: 2,
 };

@@ -14,7 +14,7 @@
     "settings": {
       "defaultRole": {
         "type": "string",
-        "default": "dev",
+        "default": "general",
         "description": "Role activated automatically on session start (use 'off' to disable)"
       },
       "showStatusBar": {

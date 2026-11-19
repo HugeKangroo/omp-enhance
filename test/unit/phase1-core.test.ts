@@ -234,10 +234,10 @@ describe("EnhanceStore", () => {
 });
 
 describe("role-loader", () => {
-  test("loads all five built-in roles", () => {
+  test("loads all six built-in roles with general as universal base", () => {
     const isolated = tempDir();
     const roles = discoverRoles({ cwd: isolated, globalRolesDir: path.join(isolated, "missing-global") });
-    expect([...roles.keys()].sort()).toEqual(["dev", "ml-engineer", "qa", "reviewer", "supervisor"]);
+    expect([...roles.keys()].sort()).toEqual(["dev", "general", "ml-engineer", "qa", "reviewer", "supervisor"]);
     for (const role of roles.values()) {
       expect(role.source).toBe("builtin");
       expect(role.stance.length).toBeGreaterThan(0);

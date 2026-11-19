@@ -95,7 +95,7 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
     if (existing) { existing.settings = loadSettings(cwd); return existing; }
     const roles = discover(cwd), settings = loadSettings(cwd);
     const initialRole = settings.defaultRole === null ? null
-      : (roles.has(settings.defaultRole) ? settings.defaultRole : (roles.has("dev") ? "dev" : null));
+      : (roles.has(settings.defaultRole) ? settings.defaultRole : (roles.has("general") ? "general" : (roles.has("dev") ? "dev" : null)));
     const state: WorkspaceState = {
       cwd, store: new EnhanceStore(path.join(cwd, ".omp-enhance", "state.sqlite")),
       tracker: new TurnTracker(), roles, settings, activeRoleId: initialRole,
@@ -289,8 +289,8 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
     async execute(params, ctx) {
       try {
         const ws = getWorkspace(ctx);
-        const role = activeRole(ws) ?? ws.roles.get("dev");
-        if (!role) throw new Error("No active role and no builtin dev role available.");
+        const role = activeRole(ws) ?? ws.roles.get("general") ?? ws.roles.get("dev");
+        if (!role) throw new Error("No active role and no builtin fallback role available.");
         const verdict = asString(params.verdict);
         if (!verdict || !VERDICTS.includes(verdict as HandoffVerdict)) throw new Error("enhance_handoff requires verdict ready|rejected|blocked.");
         const summary = asString(params.summary);

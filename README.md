@@ -9,7 +9,7 @@
 ## 核心特性
 
 1. **双范式同构（日常 `N = 1` 与协同 `N > 1` 统一）**
-   - **内规范 (`RoleSpec`)**：采用纯 YAML 定义**认知立场 (`stance`)、工作方法步骤 (`method`)、工具与读写边界 (`permissions`)、准出判据 (`exit`)**，使用 Bun 1.4 原生 `Bun.YAML.parse` 零外部依赖解析。内置 `dev`、`qa`、`reviewer`、`ml-engineer`、`supervisor` 五个标准角色。
+   - **内规范 (`RoleSpec`)**：采用纯 YAML 定义**认知立场 (`stance`)、工作方法步骤 (`method`)、工具与读写边界 (`permissions`)、准出判据 (`exit`)**，使用 Bun 1.4 原生 `Bun.YAML.parse` 零外部依赖解析。默认激活全能力通用基态 `general`，并内置 `dev`、`qa`、`reviewer`、`ml-engineer`、`supervisor` 共六个标准角色。
    - **外规范 (`HandoffEnvelope`)**：无论日常向用户收尾，还是跨角色转手（如 `dev → qa`），统一传递**原始需求 (`Mandate`) + 自动计算的产物 `sha256` 快照 + 本轮已核验真实工具证据 + 未决风险**，自动截断上游冗长的试错对话历史，杜绝上下文锚定污染。
 2. **100% 原生继承 OMP 生态，零重复配置**
    - 仅使用 OMP 公开 `ExtensionAPI` 与官方根 SDK `pi.pi.createAgentSession`，自动复用已登录的 `/login` OAuth 订阅账号、API Key、当前选中模型、Thinking 档位及内置 Rust 工具链。

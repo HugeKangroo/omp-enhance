@@ -473,7 +473,7 @@ describe("entry extension", () => {
     const systemPrompt = (start as { systemPrompt: string[] }).systemPrompt;
     expect(systemPrompt[0]).toBe("BASE");
     expect(systemPrompt[1]).toContain("<omp-enhance-conditioning>");
-    expect(systemPrompt[1]).toContain("Active Role: dev");
+    expect(systemPrompt[1]).toContain("Active Role: general");
     expect(systemPrompt[1]).toContain("MANDATE_X");
 
     expect(harness.runHook("input", { text: "/handoff reviewer" }))
@@ -481,7 +481,7 @@ describe("entry extension", () => {
     expect(harness.runHook("input", { text: "/role list" })).toBeUndefined();
 
     await harness.runCommand("role", "list");
-    expect(harness.messages.at(-1)).toContain("* dev [builtin]");
+    expect(harness.messages.at(-1)).toContain("* general [builtin]");
     expect(harness.messages.at(-1)).toContain("qa [builtin]");
 
     await harness.runCommand("role", "create custom-auditor --project Check edge cases");
@@ -535,7 +535,7 @@ describe("entry extension", () => {
       latestHandoff: { id: string } | null;
     };
     expect(status.activeRoleId).toBe("dev");
-    expect(status.roleCount).toBe(6);
+    expect(status.roleCount).toBe(7);
     expect(status.epistemicCount).toBe(0);
     expect(status.latestHandoff?.id).toBe(handoff.id);
 

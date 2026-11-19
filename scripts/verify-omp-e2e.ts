@@ -119,10 +119,10 @@ async function main(): Promise<void> {
   console.log("ok: /role create wrote .omp/roles/custom-auditor.yaml");
 
   const status = JSON.parse(runPrintCommand("/enhance-status", "status")) as StatusPayload;
-  assert(status.activeRoleId === "dev", `Expected activeRoleId dev, got ${status.activeRoleId}`);
-  assert(status.roleCount === 6, `Expected roleCount 6, got ${status.roleCount}`);
+  assert(status.activeRoleId === "general", `Expected activeRoleId general, got ${status.activeRoleId}`);
+  assert(status.roleCount === 7, `Expected roleCount 7, got ${status.roleCount}`);
   assert(status.settings.supervisorModel === "@advisor", `Expected default supervisorModel @advisor, got ${status.settings.supervisorModel}`);
-  console.log("ok: /enhance-status reports activeRoleId=dev roleCount=6 supervisorModel=@advisor");
+  console.log("ok: /enhance-status reports activeRoleId=general roleCount=7 supervisorModel=@advisor");
 
   const overridePath = path.join(workspace, ".omp", "plugin-overrides.json");
   writeFileSync(
