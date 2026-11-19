@@ -1,21 +1,34 @@
 import path from "node:path";
 import { writeFileSync } from "node:fs";
-import type { RoleSpec, RoleThinkingLevel } from "./types.ts";
+import type { EnhanceSettings, RoleSpec, RoleThinkingLevel } from "./types.ts";
 import {
   parseRoleYaml, resetRoleOverride, ROLE_THINKING_LEVELS, saveRoleSpec, scaffoldRoleFile,
   serializeRoleYaml,
 } from "./role-loader.ts";
-import { COMPANION_TOOL_NAMES } from "./session-tracker.ts";
+import { COMPANION_TOOL_NAMES, READONLY_SUBAGENTS } from "./session-tracker.ts";
+import { DEFAULT_ENHANCE_SETTINGS } from "./settings.ts";
 
 export interface RoleStudioDeps {
   cwd: string; globalRolesDir: string; pi: any; ctx: any;
   getRoles: () => Map<string, RoleSpec>; refreshRoles: () => Map<string, RoleSpec>;
+  getSettings?: () => EnhanceSettings;
   getActiveRoleId: () => string | null; activateRole: (roleId: string | null) => Promise<void>;
+  runHandoff?: (roleId: string) => Promise<void>;
 }
 
 const PINNED_MODELS = ["inherit", "@advisor", "@default", "@smol", "@slow", "@plan", "@task"];
 const targetDirFor = (deps: RoleStudioDeps, scope: "global" | "project"): string =>
   scope === "project" ? path.join(deps.cwd, ".omp", "roles") : deps.globalRolesDir;
+
+function padCell(text: string, width: number): string {
+  if (width <= 0) return "";
+  let out = text;
+  while (Bun.stringWidth(out) > width && out.length > 0) {
+    out = `${out.slice(0, Math.max(0, out.length - 2))}…`;
+  }
+  const pad = Math.max(0, width - Bun.stringWidth(out));
+  return out + " ".repeat(pad);
+}
 
 function stripRoleDraft(role: RoleSpec): Omit<RoleSpec, "source" | "filePath" | "contentSha256"> {
   return {
@@ -60,10 +73,50 @@ async function pickRoleTools(role: RoleSpec, deps: RoleStudioDeps): Promise<stri
   const hostTools: string[] = [...new Set<string>(
     (deps.pi?.getAllTools?.() ?? []).map((t: any) => String(t?.name ?? "")).filter((n: string) => Boolean(n) && !companion.has(n)),
   )].sort();
-  if (hostTools.length === 0) hostTools.push("read", "grep", "glob", "find", "lsp", "edit", "write", "bash");
+  if (hostTools.length === 0) hostTools.push("read", "grep", "glob", "find", "lsp", "edit", "write", "bash", "task", "wait");
   const selected = new Set<string>(role.permissions.tools ?? hostTools);
-  const saveLabel = "✓ Save tool selection", allLabel = "[Unrestricted: allow all host tools]", noneLabel = "[No host tools]";
   let cursor = 0;
+
+  if (typeof ui.custom === "function") {
+    return ui.custom((tui: any, theme: any, _kb: any, done: (res: string[] | undefined | null) => void) => {
+      const fg = (c: string, s: string): string => (typeof theme?.fg === "function" ? theme.fg(c, s) : s);
+      let focused = true;
+      return {
+        get focused() { return focused; },
+        set focused(v: boolean) { focused = v; },
+        invalidate() {},
+        handleInput(data: string) {
+          if (data === "\x1b" || data === "\x1b\x1b" || data === "\x03") return done(null);
+          if (data === "\r" || data === "\n") return done(hostTools.filter((n) => selected.has(n)));
+          if (data === "a" || data === "A") return done(undefined);
+          if (data === "z" || data === "Z") return done([]);
+          if (data === "\x1b[A" || data === "k") { cursor = (cursor - 1 + hostTools.length) % hostTools.length; tui?.requestRender?.(); }
+          else if (data === "\x1b[B" || data === "j") { cursor = (cursor + 1) % hostTools.length; tui?.requestRender?.(); }
+          else if (data === " ") {
+            const name = hostTools[cursor]!;
+            if (selected.has(name)) selected.delete(name); else selected.add(name);
+            tui?.requestRender?.();
+          }
+        },
+        render(width: number): string[] {
+          const inner = Math.max(24, width - 4);
+          const lines = [fg("border", `╭─ ${padCell(`Tools · ${role.id} (${selected.size}/${hostTools.length} checked)`, inner)} ─╮`)];
+          for (let i = 0; i < hostTools.length; i++) {
+            const name = hostTools[i]!, on = selected.has(name), cur = i === cursor;
+            const row = `${cur ? "▸" : " "} [${on ? "✓" : " "}] ${name}`;
+            const styled = cur ? fg("accent", padCell(row, inner)) : on ? fg("success", padCell(row, inner)) : padCell(row, inner);
+            lines.push(`${fg("border", "│")} ${styled} ${fg("border", "│")}`);
+          }
+          lines.push(fg("border", `├─${"─".repeat(inner)}─┤`));
+          lines.push(`${fg("border", "│")} ${fg("dim", padCell("Space toggle · Enter save · a unrestricted · z none · Esc cancel", inner))} ${fg("border", "│")}`);
+          lines.push(fg("border", `╰─${"─".repeat(inner)}─╯`));
+          return lines;
+        },
+      };
+    }, { overlay: true });
+  }
+
+  const saveLabel = "✓ Save tool selection", allLabel = "[Unrestricted: allow all host tools]", noneLabel = "[No host tools]";
   while (true) {
     const checkedIndices = hostTools.flatMap((name, idx) => (selected.has(name) ? [idx] : []));
     const choice: string | undefined = await ui.select(
@@ -199,8 +252,111 @@ export async function openRoleEditor(roleId: string, deps: RoleStudioDeps, initi
   }
 }
 
+type OverlayAction =
+  | { act: "activate" | "edit" | "handoff"; roleId: string }
+  | { act: "new" | "off" }
+  | undefined;
+
 export async function openRoleStudioHome(deps: RoleStudioDeps): Promise<void> {
   const ui = deps.ctx?.ui;
+  let cursor = -1;
+
+  if (typeof ui.custom === "function") {
+    while (true) {
+      const roles = [...deps.refreshRoles().values()].sort((a, b) => a.id.localeCompare(b.id));
+      const activeId = deps.getActiveRoleId();
+      const settings = deps.getSettings?.() ?? DEFAULT_ENHANCE_SETTINGS;
+      if (cursor < 0) cursor = Math.max(0, roles.findIndex((r) => r.id === activeId));
+      cursor = Math.min(cursor, Math.max(0, roles.length - 1));
+
+      const action = await ui.custom((tui: any, theme: any, _kb: any, done: (res: OverlayAction) => void) => {
+        const fg = (c: string, s: string): string => (typeof theme?.fg === "function" ? theme.fg(c, s) : s);
+        const bold = (s: string): string => (typeof theme?.bold === "function" ? theme.bold(s) : s);
+        let focused = true;
+        return {
+          get focused() { return focused; },
+          set focused(v: boolean) { focused = v; },
+          invalidate() {},
+          handleInput(data: string) {
+            const sel = roles[cursor];
+            if (data === "\x1b" || data === "\x1b\x1b" || data === "q" || data === "\x03") return done(undefined);
+            if ((data === "\r" || data === "\n") && sel) return done({ act: "activate", roleId: sel.id });
+            if ((data === "e" || data === "E") && sel) return done({ act: "edit", roleId: sel.id });
+            if ((data === "h" || data === "H") && sel) return done({ act: "handoff", roleId: sel.id });
+            if (data === "n" || data === "N") return done({ act: "new" });
+            if (data === "o" || data === "O") return done({ act: "off" });
+            if ((data === "\x1b[A" || data === "k") && roles.length > 0) {
+              cursor = (cursor - 1 + roles.length) % roles.length; tui?.requestRender?.();
+            } else if ((data === "\x1b[B" || data === "j") && roles.length > 0) {
+              cursor = (cursor + 1) % roles.length; tui?.requestRender?.();
+            }
+          },
+          render(width: number): string[] {
+            const inner = Math.max(40, width - 4);
+            const leftW = Math.min(28, Math.max(20, Math.floor(inner * 0.32)));
+            const rightW = Math.max(16, inner - leftW - 3);
+            const sel = roles[cursor];
+            const effModel = sel?.id === "supervisor" && sel.source === "builtin"
+              ? `${settings.supervisorModel} (via /settings)` : (sel?.model ?? "inherit (session model)");
+            const subRule = sel && (sel.permissions.writable !== undefined || (sel.permissions.protected?.length ?? 0) > 0)
+              ? `read-only (${READONLY_SUBAGENTS.join(", ")})` : "all OMP subagents";
+            const rightLines = sel ? [
+              bold(`${sel.id} — ${sel.name}`),
+              sel.description || "(no description)",
+              `Model: ${effModel} · Thinking: ${sel.thinking ?? "inherit"}`,
+              `Tools: ${sel.permissions.tools ? (sel.permissions.tools.join(", ") || "none") : "unrestricted"}`,
+              `Subagents: ${subRule}`,
+              `Writable: ${sel.permissions.writable ? (sel.permissions.writable.join(", ") || "read-only []") : "*"} · Protected: ${sel.permissions.protected?.join(", ") || "none"}`,
+              `Stance: ${sel.stance.trim().replace(/\s+/g, " ")}`,
+              ...sel.method.slice(0, 3).map((m, idx) => `${idx + 1}. ${m}`),
+            ] : ["No roles found"];
+            const rowCount = Math.max(roles.length, rightLines.length, 8);
+            const head = `OMP Enhance · Roles  [session: ${activeId ?? "off"}]`;
+            const out = [fg("border", `╭─ ${padCell(head, inner)} ─╮`)];
+            for (let i = 0; i < rowCount; i++) {
+              const r = roles[i];
+              const leftRaw = r ? `${i === cursor ? "▸" : " "}${activeId === r.id ? "●" : " "} ${r.id} [${r.source[0]}]` : "";
+              const leftCell = i === cursor ? fg("accent", bold(padCell(leftRaw, leftW)))
+                : (r && activeId === r.id ? fg("success", padCell(leftRaw, leftW)) : padCell(leftRaw, leftW));
+              const rightCell = i === 0 ? fg("accent", padCell(rightLines[i] ?? "", rightW))
+                : padCell(rightLines[i] ?? "", rightW);
+              out.push(`${fg("border", "│")} ${leftCell} ${fg("border", "│")} ${rightCell} ${fg("border", "│")}`);
+            }
+            out.push(fg("border", `├─${"─".repeat(inner)}─┤`));
+            const hints = "Enter switch session · h handoff stage · e edit · n new · o off · Esc close";
+            out.push(`${fg("border", "│")} ${fg("dim", padCell(hints, inner))} ${fg("border", "│")}`);
+            out.push(fg("border", `╰─${"─".repeat(inner)}─╯`));
+            return out;
+          },
+        };
+      }, { overlay: true });
+
+      if (!action) return;
+      if (action.act === "activate") {
+        await deps.activateRole(action.roleId);
+        ui.notify?.(`Session role: ${action.roleId}`, "info");
+        return;
+      }
+      if (action.act === "off") {
+        await deps.activateRole(null);
+        ui.notify?.("Role conditioning disabled", "info");
+        return;
+      }
+      if (action.act === "handoff") {
+        await deps.runHandoff?.(action.roleId);
+        return;
+      }
+      if (action.act === "edit") await openRoleEditor(action.roleId, deps);
+      else if (action.act === "new") {
+        const createdId = await openCreateRoleWizard(deps);
+        if (createdId) {
+          await openRoleEditor(createdId, deps);
+          cursor = Math.max(0, [...deps.getRoles().keys()].sort().indexOf(createdId));
+        }
+      }
+    }
+  }
+
   while (true) {
     const roles = [...deps.refreshRoles().values()].sort((a, b) => a.id.localeCompare(b.id));
     const activeId = deps.getActiveRoleId(), roleMap = new Map<string, string>(), options: string[] = [];

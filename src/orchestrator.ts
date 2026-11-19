@@ -138,12 +138,20 @@ export function createOmpRoleSessionRunner(pi: any, hostCtx: any, settings?: Enh
         },
       };
 
+      const setWork = (msg?: string): void => { try { hostCtx?.ui?.setWorkingMessage?.(msg); } catch {} };
       const childGuardExt = (childPi: any): void => {
         childPi.on("tool_call", (ev: any) => {
-          const decision = childTracker.checkToolCallAllowed(stepCtx.cwd, stepCtx.role, ev);
+          const toolName = ev.toolName ?? ev.name ?? "";
+          const decision = childTracker.checkToolCallAllowed(stepCtx.cwd, stepCtx.role, { toolName, input: ev.input ?? ev.args });
+          if (!decision.block) setWork(`stage:${stepCtx.role.id} → ${toolName}`);
           return decision.block ? decision : undefined;
         });
-        childPi.on("tool_execution_end", (ev: any) => { childTracker.recordToolExecutionEnd(stepCtx.cwd, ev); });
+        childPi.on("tool_execution_end", (ev: any) => {
+          childTracker.recordToolExecutionEnd(stepCtx.cwd, {
+            toolCallId: ev.toolCallId ?? ev.id ?? "call", toolName: ev.toolName ?? ev.name ?? "unknown",
+            args: ev.args ?? ev.input, isError: Boolean(ev.isError ?? ev.result?.isError),
+          });
+        });
       };
 
       let allowedTools: string[];
@@ -191,19 +199,21 @@ export function createOmpRoleSessionRunner(pi: any, hostCtx: any, settings?: Enh
         };
       };
       try {
+        setWork(`stage:${stepCtx.role.id} (${stepCtx.role.name}) running...`);
         const supervisor = stepCtx.supervisor;
         if (!supervisor) return await runTurn({ aborted: false, decisions: [] });
         const supervised = await runWithSessionSupervisor({
           supervisorRole: supervisor.role, inspector: supervisor.inspector, goal: stepCtx.mandate.goal,
           initialDelayMs: supervisor.initialDelayMs, minIntervalMs: supervisor.minIntervalMs,
           maxIntervalMs: supervisor.maxIntervalMs, getPulse: pulse,
-          onSteer: async (message) => { await created.session.steer?.(message); },
-          onAbort: async () => { await created.session.abort?.(); },
+          onSteer: async (message) => { setWork(`stage:${stepCtx.role.id} ↺ steered by supervisor`); await created.session.steer?.(message); },
+          onAbort: async () => { setWork(`stage:${stepCtx.role.id} ✕ aborted by supervisor`); await created.session.abort?.(); },
           run: runTurn,
         });
         if (supervised.aborted) return finish(supervised.aborted);
         return supervised.result ?? finish();
       } finally {
+        setWork(undefined);
         await created.session.dispose();
       }
     },

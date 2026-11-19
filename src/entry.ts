@@ -414,15 +414,75 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
     },
   });
 
+  const completeRoleIds = (prefix: string, extras: readonly string[] = []) => {
+    const roles = discover(pi?.cwd ?? process.cwd());
+    const q = prefix.trim().toLowerCase();
+    return [
+      ...extras.map((v) => ({ value: v, label: v })),
+      ...[...roles.values()].sort((a, b) => a.id.localeCompare(b.id)).map((r) => ({
+        value: r.id, label: r.id, description: `[${r.source}] ${r.description || r.name}`,
+      })),
+    ].filter((item) => !q || item.value.toLowerCase().startsWith(q));
+  };
+
+  const handoffHandler = async (args: string, ctx: any): Promise<void> => {
+    const ws = getWorkspace(ctx);
+    refreshRoles(ws);
+    let targetId = args.trim().split(/\s+/)[0] ?? "";
+    if (!targetId && ctx?.hasUI && typeof ctx?.ui?.select === "function") {
+      const candidates = [...ws.roles.values()].filter((r) => r.id !== "supervisor").sort((a, b) => a.id.localeCompare(b.id));
+      const picked: string | undefined = await ctx.ui.select(
+        "Handoff current work to which isolated stage role?",
+        candidates.map((r) => `${r.id} — ${r.description || r.name}`),
+        { outline: true },
+      );
+      if (!picked) return;
+      targetId = picked.split(" — ", 1)[0]?.trim() ?? "";
+    }
+    const target = ws.roles.get(targetId);
+    if (!target) return emitMessage(ctx, targetId ? `Unknown role "${targetId}".` : "Usage: /handoff <targetRole>");
+    try {
+      const mandate = ws.store.getActiveMandate() ?? ws.store.upsertMandate({
+        goal: "Handoff initiated from current workspace state",
+      });
+      const seedRole = activeRole(ws) ?? ws.roles.get("dev")!;
+      const upstream = ws.store.getLatestHandoff(mandate.id) ?? createAndVerifyHandoff({
+        store: ws.store, role: { ...seedRole, exit: { requireToolEvidence: false, criteria: [] } }, cwd: ws.cwd, mandate,
+        toTarget: target.id, verdict: "ready", summary: "Automatic workspace snapshot handoff",
+        baselineSnapshot: ws.tracker.getBaselineSnapshot(), observedCalls: ws.tracker.getObservedCalls(),
+      });
+      const result = await executeRoleStep({
+        cwd: ws.cwd, store: ws.store, role: target,
+        mandate: ws.store.getMandate(upstream.mandateId) ?? mandate, upstreamHandoff: upstream,
+        toTarget: "user", runner: runnerFor(ws, ctx), supervisor: supervisorFor(ws, ctx),
+      });
+      emitMessage(ctx, JSON.stringify({
+        ok: result.ok, targetRole: target.id, upstreamHandoffId: upstream.id,
+        ...(result.ok ? { envelope: result.envelope } : { status: result.status, reason: result.reason }),
+      }, null, 2));
+    } catch (error) {
+      emitMessage(ctx, JSON.stringify({ ok: false, targetRole: target.id, error: String(error) }, null, 2));
+    }
+  };
+
   pi.registerCommand("role", {
-    description: "Open Role Studio, or list, show, edit, create, switch, and disable YAML roles.",
+    description: "Open split-pane Role Studio, or switch, edit, create, list, show, and disable YAML roles.",
+    getArgumentCompletions: (prefix: string) => {
+      if (/^(?:show|edit)\s+/i.test(prefix)) {
+        const head = prefix.match(/^(?:show|edit)\s+/i)![0];
+        return completeRoleIds(prefix.slice(head.length)).map((c) => ({ ...c, value: `${head}${c.value}` }));
+      }
+      return completeRoleIds(prefix, ["off", "list", "studio", "edit ", "show ", "create "]);
+    },
     handler: async (args: string, ctx: any) => {
       const ws = getWorkspace(ctx);
       refreshRoles(ws);
       const studioDeps = (): RoleStudioDeps => ({
         cwd: ws.cwd, globalRolesDir: globalRolesDir(options), pi, ctx,
         getRoles: () => ws.roles, refreshRoles: () => refreshRoles(ws),
+        getSettings: () => ws.settings,
         getActiveRoleId: () => ws.activeRoleId, activateRole: (id) => applyActiveRole(ws, id, ctx),
+        runHandoff: (id) => handoffHandler(id, ctx),
       });
       const trimmed = args.trim(), head = trimmed.split(/\s+/)[0] ?? "";
       if (ctx?.hasUI && (!trimmed || head === "studio")) return openRoleStudioHome(studioDeps());
@@ -478,39 +538,20 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
     },
   });
 
-  const handoffHandler = async (args: string, ctx: any): Promise<void> => {
-    const ws = getWorkspace(ctx);
-    refreshRoles(ws);
-    const targetId = args.trim().split(/\s+/)[0] ?? "", target = ws.roles.get(targetId);
-    if (!target) return emitMessage(ctx, targetId ? `Unknown role "${targetId}".` : "Usage: /handoff <targetRole>");
-    try {
-      const mandate = ws.store.getActiveMandate() ?? ws.store.upsertMandate({
-        goal: "Handoff initiated from current workspace state",
-      });
-      const upstream = ws.store.getLatestHandoff(mandate.id) ?? createAndVerifyHandoff({
-        store: ws.store, role: activeRole(ws) ?? ws.roles.get("dev")!, cwd: ws.cwd, mandate,
-        toTarget: target.id, verdict: "ready", summary: "Automatic workspace snapshot handoff",
-        baselineSnapshot: ws.tracker.getBaselineSnapshot(), observedCalls: ws.tracker.getObservedCalls(),
-      });
-      const result = await executeRoleStep({
-        cwd: ws.cwd, store: ws.store, role: target,
-        mandate: ws.store.getMandate(upstream.mandateId) ?? mandate, upstreamHandoff: upstream,
-        toTarget: "user", runner: runnerFor(ws, ctx), supervisor: supervisorFor(ws, ctx),
-      });
-      emitMessage(ctx, JSON.stringify({
-        ok: result.ok, targetRole: target.id, upstreamHandoffId: upstream.id,
-        ...(result.ok ? { envelope: result.envelope } : { status: result.status, reason: result.reason }),
-      }, null, 2));
-    } catch (error) {
-      emitMessage(ctx, JSON.stringify({ ok: false, targetRole: target.id, error: String(error) }, null, 2));
-    }
-  };
-  const handoffDescription = "Hand the latest verified work (or a workspace snapshot) to an isolated role session.";
-  pi.registerCommand("enhance-handoff", { description: handoffDescription, handler: handoffHandler });
-  pi.registerCommand("handoff", { description: handoffDescription, handler: handoffHandler });
+  const handoffDescription = "Hand the latest verified work (or a workspace snapshot) to an isolated stage role.";
+  const handoffCompletions = (prefix: string) =>
+    prefix.includes(" ") ? [] : completeRoleIds(prefix).filter((c) => c.value !== "supervisor");
+  pi.registerCommand("enhance-handoff", { description: handoffDescription, getArgumentCompletions: handoffCompletions, handler: handoffHandler });
+  pi.registerCommand("handoff", { description: handoffDescription, getArgumentCompletions: handoffCompletions, handler: handoffHandler });
 
   pi.registerCommand("flow", {
     description: "Run a comma-separated role chain with automatic rejection repair.",
+    getArgumentCompletions: (prefix: string) => {
+      if (prefix.includes(" ")) return [];
+      const idx = prefix.lastIndexOf(",");
+      const head = idx >= 0 ? prefix.slice(0, idx + 1) : "", tail = idx >= 0 ? prefix.slice(idx + 1) : prefix;
+      return completeRoleIds(tail).filter((c) => c.value !== "supervisor").map((c) => ({ ...c, value: `${head}${c.value}` }));
+    },
     handler: async (args: string, ctx: any) => {
       const ws = getWorkspace(ctx);
       refreshRoles(ws);

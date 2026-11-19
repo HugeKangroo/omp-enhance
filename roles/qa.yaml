@@ -13,7 +13,7 @@ method:
   - 若发现任何契约违背或缺陷，附最小复现命令与期望/实际差异标为 rejected 打回；全部通过标为 ready
 
 permissions:
-  tools: [read, grep, lsp, edit, write, bash]
+  tools: [read, grep, glob, find, lsp, edit, write, bash, task, wait]
   writable: ["test/**", "tests/**", "**/*.test.*", "**/*.spec.*"]
   protected: ["src/**"]
 

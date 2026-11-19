@@ -3,9 +3,23 @@ import type { ObservedToolCall, RoleSpec } from "./types.ts";
 import { matchesGlobList, snapshotWorkspace, type SnapshotEntry } from "./store.ts";
 
 export const COMPANION_TOOL_NAMES = ["enhance_mandate", "enhance_handoff", "enhance_flow", "enhance_job"] as const;
+export const READONLY_SUBAGENTS = ["scout", "reviewer", "security-reviewer"] as const;
+const READONLY_SUBAGENT_SET = new Set<string>(READONLY_SUBAGENTS);
 
 export function isCompanionTool(toolName: string): boolean {
   return (COMPANION_TOOL_NAMES as readonly string[]).includes(toolName);
+}
+
+export function extractTaskSubagents(input: unknown): string[] {
+  const record = typeof input === "object" && input !== null && !Array.isArray(input)
+    ? (input as Record<string, unknown>) : {};
+  if (Array.isArray(record.tasks) && record.tasks.length > 0) {
+    return record.tasks.map((item) => {
+      const a = typeof item === "object" && item !== null ? (item as Record<string, unknown>).agent : undefined;
+      return typeof a === "string" && a.trim() ? a.trim() : "task";
+    });
+  }
+  return [typeof record.agent === "string" && record.agent.trim() ? record.agent.trim() : "task"];
 }
 
 const WRITE_TOOLS: Record<string, true> = { write: true, edit: true, apply_patch: true };
@@ -57,6 +71,19 @@ export class TurnTracker {
     const allowedTools = role.permissions.tools;
     if (allowedTools && !allowedTools.includes(event.toolName) && !isCompanionTool(event.toolName)) {
       return { block: true, reason: `Role "${role.id}" does not permit tool "${event.toolName}".` };
+    }
+    if (event.toolName === "task") {
+      const hasBoundary = role.permissions.writable !== undefined || (role.permissions.protected?.length ?? 0) > 0;
+      if (hasBoundary) {
+        const forbidden = extractTaskSubagents(event.input).find((agent) => !READONLY_SUBAGENT_SET.has(agent));
+        if (forbidden) {
+          return {
+            block: true,
+            reason: `Role "${role.id}" restricts write paths and may only spawn read-only subagents (${READONLY_SUBAGENTS.join(", ")}); blocked "${forbidden}".`,
+          };
+        }
+      }
+      return { block: false };
     }
     if (!WRITE_TOOLS[event.toolName]) return { block: false };
     const writable = role.permissions.writable;

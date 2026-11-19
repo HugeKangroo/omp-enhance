@@ -11,6 +11,7 @@ import {
   discoverRoles, parseRoleYaml, resetRoleOverride, saveRoleSpec, serializeRoleYaml,
 } from "../../src/role-loader.ts";
 import { createOmpRoleSessionRunner } from "../../src/orchestrator.ts";
+import { TurnTracker } from "../../src/session-tracker.ts";
 import { EnhanceStore } from "../../src/store.ts";
 import ompEnhance from "../../src/entry.ts";
 
@@ -337,5 +338,143 @@ describe("Role Studio & zero-extra-slash-command integration", () => {
       permissions: {}, exit: { requireToolEvidence: false, criteria: [] },
     }).replace("id: qa", "id: qa\nthinking: ultra");
     expect(() => parseRoleYaml(badYaml, "global", path.join(globalDir, "qa.yaml"))).toThrow(/thinking must be one of/);
+  });
+
+  test("allows roles to spawn OMP subagents while blocking write-escalation subagents on restricted roles", () => {
+    const root = tempDir();
+    const roles = discoverRoles({ cwd: root, globalRolesDir: path.join(root, "global"), builtinRolesDir });
+    const dev = roles.get("dev")!;
+    const qa = roles.get("qa")!;
+    const reviewer = roles.get("reviewer")!;
+
+    expect(qa.permissions.tools).toContain("task");
+    expect(qa.permissions.tools).toContain("wait");
+    expect(reviewer.permissions.tools).toContain("task");
+    expect(reviewer.permissions.tools).toContain("glob");
+
+    const tracker = new TurnTracker();
+    tracker.resetTurn(root);
+
+    // dev is unrestricted: can spawn any OMP subagent (scout, sonic, default task worker)
+    expect(tracker.checkToolCallAllowed(root, dev, { toolName: "task", input: { agent: "sonic", task: "refactor" } }))
+      .toEqual({ block: false });
+    expect(tracker.checkToolCallAllowed(root, dev, { toolName: "task", input: { task: "general work" } }))
+      .toEqual({ block: false });
+
+    // qa & reviewer may spawn read-only subagents (single or batch)
+    expect(tracker.checkToolCallAllowed(root, qa, { toolName: "task", input: { agent: "scout", task: "find callers" } }))
+      .toEqual({ block: false });
+    expect(tracker.checkToolCallAllowed(root, reviewer, {
+      toolName: "task",
+      input: { tasks: [{ agent: "scout", task: "scan a" }, { agent: "security-reviewer", task: "audit b" }] },
+    })).toEqual({ block: false });
+
+    // qa & reviewer MUST NOT launder writes through writable subagents (sonic, task, or omitted default agent)
+    expect(tracker.checkToolCallAllowed(root, qa, { toolName: "task", input: { agent: "sonic", task: "edit src" } }))
+      .toMatchObject({ block: true });
+    expect(tracker.checkToolCallAllowed(root, reviewer, { toolName: "task", input: { task: "default worker" } }))
+      .toMatchObject({ block: true });
+    expect(tracker.checkToolCallAllowed(root, qa, {
+      toolName: "task",
+      input: { tasks: [{ agent: "scout", task: "ok" }, { agent: "sonic", task: "sneaky write" }] },
+    })).toMatchObject({ block: true });
+  });
+
+  test("drives split-pane custom /role overlay (1-key Enter switch, h handoff, Space tool toggle) and Tab completions", async () => {
+    const root = tempDir();
+    const cwd = path.join(root, "workspace");
+    const globalDir = path.join(root, "global-roles");
+    const lockPath = path.join(root, "lock.json");
+    mkdirSync(cwd, { recursive: true });
+
+    const commands = new Map<string, {
+      handler: (args: string, ctx: any) => Promise<void>;
+      getArgumentCompletions?: (prefix: string) => Array<{ value: string }>;
+    }>();
+    const workingMessages: Array<string | undefined> = [];
+    let activeRoleSwitched = null as string | null;
+
+    const pi = {
+      cwd,
+      on() {},
+      registerTool() {},
+      registerCommand(name: string, spec: any) { commands.set(name, spec); },
+      sendMessage() {},
+      getAllTools: () => [{ name: "read" }, { name: "grep" }, { name: "bash" }, { name: "task" }],
+      async setActiveTools() {},
+      getThinkingLevel: () => "off",
+      pi: { settings: {} },
+    };
+
+    ompEnhance(pi, {
+      globalRolesDir: globalDir,
+      builtinRolesDir,
+      pluginLockPath: lockPath,
+      runnerFactory: (_pi, hostCtx) => ({
+        async runRoleTurn(stepCtx) {
+          hostCtx?.ui?.setWorkingMessage?.(`stage:${stepCtx.role.id} → read`);
+          const env = stepCtx.store.getLatestHandoff(stepCtx.mandate.id);
+          hostCtx?.ui?.setWorkingMessage?.(undefined);
+          return { envelope: env, observedCalls: [], assistantText: "ok", usage: null };
+        },
+      }),
+    });
+
+    // Verify Tab argument completions for /role, /handoff, and comma-chained /flow
+    const roleComp = commands.get("role")!.getArgumentCompletions!;
+    expect(roleComp("q").map((c) => c.value)).toEqual(["qa"]);
+    expect(roleComp("edit rev").map((c) => c.value)).toEqual(["edit reviewer"]);
+    const handoffComp = commands.get("handoff")!.getArgumentCompletions!;
+    expect(handoffComp("").some((c) => c.value === "supervisor")).toBe(false);
+    expect(handoffComp("rev").map((c) => c.value)).toEqual(["reviewer"]);
+    const flowComp = commands.get("flow")!.getArgumentCompletions!;
+    expect(flowComp("dev,q").map((c) => c.value)).toEqual(["dev,qa"]);
+
+    // Drive split-pane custom overlay: Down (from dev -> ml-engineer -> qa) + Enter -> 1-step switch to qa!
+    const renderedSnapshots: string[][] = [];
+    const customScripts: string[][] = [
+      ["\x1b[B", "\x1b[B", "\r"], // Overlay call 1: move down twice to qa, press Enter to activate!
+      ["e"],                      // Overlay call 2: press 'e' on qa to open editor
+      [" ", "\r"],                // Tool checkbox custom overlay: toggle 1st tool ('bash'), press Enter to save
+      ["h"],                      // Return to split-pane overlay: press 'h' to handoff to qa!
+    ];
+    const selectScripts: Array<string | undefined> = [
+      "Allowed tools: [read, grep, glob, find, lsp, edit, write, bash, task, wait]",
+      undefined, // exit role editor back to split-pane overlay
+    ];
+
+    const ctx = {
+      cwd,
+      hasUI: true,
+      ui: {
+        async custom(factory: any) {
+          const keys = customScripts.shift() ?? ["\x1b"];
+          let resolved: unknown;
+          const comp = factory({ requestRender() {} }, { fg: (_c: string, s: string) => s, bold: (s: string) => s }, {}, (res: unknown) => {
+            resolved = res;
+          });
+          renderedSnapshots.push(comp.render(100));
+          for (const key of keys) comp.handleInput(key);
+          return resolved;
+        },
+        async select() { return selectScripts.shift(); },
+        notify() {},
+        setStatus(_k: string, badge?: string) { activeRoleSwitched = badge ?? null; },
+        setWorkingMessage(msg?: string) { workingMessages.push(msg); },
+      },
+    };
+
+    // 1st /role: Down, Down, Enter -> instant switch to qa!
+    await commands.get("role")!.handler("", ctx);
+    expect(activeRoleSwitched).toBe("enhance:qa");
+    expect(renderedSnapshots[0]!.some((line) => line.includes("OMP Enhance · Roles"))).toBe(true);
+    expect(renderedSnapshots[0]!.some((line) => line.includes("Enter switch session"))).toBe(true);
+
+    // 2nd /role: 'e' -> Space-toggle tool in custom checkbox overlay -> Esc editor -> 'h' handoff!
+    await commands.get("role")!.handler("", ctx);
+    const savedQaPath = path.join(globalDir, "qa.yaml");
+    expect(existsSync(savedQaPath)).toBe(true);
+    expect(workingMessages).toContain("stage:qa → read");
+    expect(workingMessages.at(-1)).toBeUndefined();
   });
 });

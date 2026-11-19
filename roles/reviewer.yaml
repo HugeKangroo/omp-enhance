@@ -13,7 +13,7 @@ method:
   - 存在阻断性问题时标为 rejected 并给出明确修改依据；无阻断问题时标为 ready 并保留风险提示
 
 permissions:
-  tools: [read, grep, lsp]
+  tools: [read, grep, glob, find, lsp, task, wait]
   writable: []
   protected: ["**"]
 

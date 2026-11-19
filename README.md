@@ -49,14 +49,14 @@ omp --extension .
 | 命令 | 说明 |
 | --- | --- |
 | `/settings` → `Plugins` → `omp-enhance` | 在 OMP 系统默认设置面板中配置插件参数（`defaultRole`、`supervisorModel`、`supervisorEnabled`、`flowMaxRepairRounds` 等） |
-| `/role` 或 `/role studio` | 交互式 TUI 下打开可视化 **Role Studio**（管理角色、绑定专属模型、复选框勾选工具、新建角色）；非交互模式下打印角色列表 |
+| `/role` 或 `/role studio` | 打开**单屏左右分栏 Role 面板**（左选角色、右看完整权限与方法论预览；`Enter` 一键切换当前会话角色，`h` 一键向该角色发起独立阶段交接，`e` 编辑配置（`Space` 原地勾选工具），`n` 新建，`o` 关闭；支持 `Tab` 补全） |
 | `/role edit <id>` | 在交互式 TUI 中直接打开指定角色的配置页（内置角色修改时自动 Copy-on-Write 保存至覆盖目录，支持一键恢复默认） |
 | `/role list` | 文本列出当前激活角色及所有可用角色（显示来源与绑定模型） |
 | `/role <id>` / `/role off` | 切换主会话当前激活角色（若角色绑定了专属模型/推理档位会同步切换），或暂时关闭角色条件化注入 |
 | `/role show <id>` | 查看指定角色的完整 YAML 规范、专属模型、读写保护边界与文件路径 |
 | `/role create <id> [--project] <描述>` | CLI 快速生成规范 YAML 角色文件（默认存入 `~/.omp/enhance/roles/`） |
-| `/handoff <role>` | 将当前最新交接成果（或工作区改动）转手给独立子会话角色（如 `/handoff qa`）检验。交互式与 RPC 模式可用；headless `-p` 下因 OMP 内置同名命令保留，请用 `/enhance-handoff <role>` |
-| `/flow <r1,r2,...> [任务说明]` | 按角色序列（如 `/flow dev,qa,reviewer`）执行马尔可夫隔离接力与自动打回返修（返修上限读取插件设置 `flowMaxRepairRounds`） |
+| `/handoff [role]` | 将当前成果转手给独立隔离的阶段角色（如 `/handoff qa`；不带参数敲 `/handoff` 会直接弹出目标角色选择器，支持 `Tab` 补全，执行时底部实时显示正在运行的阶段与工具；`-p` 模式下请用 `/enhance-handoff <role>`） |
+| `/flow <r1,r2,...> [任务说明]` | 按角色序列（如 `/flow dev,qa,reviewer`，支持逗号后 `Tab` 补全）执行马尔可夫隔离接力与自动打回返修 |
 | `/enhance-status` | 本地只读查看当前角色、当前生效插件设置、有效 `Mandate`、认知黑板计数、最近交接链与后台作业 |
 
 ### 模型可调用工具
@@ -72,6 +72,6 @@ omp --extension .
 
 ```sh
 bun run probe:phase0 # 真机验证本机 OMP 公开 SDK、账号继承与隔离会话生命周期
-bun run check        # 类型检查 + 核心代码行数/零私有导入门禁 (≤ 2,400 LoC) + 单元测试
+bun run check        # 类型检查 + 核心代码行数/零私有导入门禁 (≤ 2,650 LoC) + 单元测试
 bun run verify:omp   # 调用本机真实 omp 执行端到端集成验收
 ```
