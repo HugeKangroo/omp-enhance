@@ -1,0 +1,82 @@
+{
+  "name": "omp-enhance",
+  "version": "0.1.0",
+  "description": "First-principles YAML role conditioning, Markov handoff, and long-job orchestration extension for Oh My Pi",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "bun": ">=1.4.0"
+  },
+  "omp": {
+    "extensions": [
+      "./src/entry.ts"
+    ],
+    "settings": {
+      "defaultRole": {
+        "type": "string",
+        "default": "dev",
+        "description": "Role activated automatically on session start (use 'off' to disable)"
+      },
+      "showStatusBar": {
+        "type": "boolean",
+        "default": true,
+        "description": "Show active role and bound model badge in the OMP status bar"
+      },
+      "supervisorEnabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Enable periodic supervisor monitoring for long-running sessions and background jobs"
+      },
+      "supervisorModel": {
+        "type": "string",
+        "default": "@advisor",
+        "description": "Model or OMP role (@advisor, @smol, @slow, inherit, or provider/model-id) for supervisor"
+      },
+      "supervisorThinking": {
+        "type": "enum",
+        "values": [
+          "off",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "inherit"
+        ],
+        "default": "off",
+        "description": "Thinking effort level for periodic supervisor inspections"
+      },
+      "supervisorInitialDelaySec": {
+        "type": "number",
+        "default": 30,
+        "min": 5,
+        "max": 600,
+        "description": "Seconds before the first supervisor check triggers on a running task"
+      },
+      "flowMaxRepairRounds": {
+        "type": "number",
+        "default": 2,
+        "min": 0,
+        "max": 10,
+        "description": "Default maximum automatic repair rounds in /flow"
+      }
+    }
+  },
+  "files": [
+    "src",
+    "roles",
+    "docs",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test test/unit",
+    "check:loc": "bun run scripts/check-loc.ts",
+    "check": "bun run typecheck && bun run check:loc && bun run test",
+    "probe:phase0": "bun run scripts/phase0-probe.ts",
+    "verify:omp": "bun run scripts/verify-omp-e2e.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "typescript": "^5.9.3"
+  }
+}
