@@ -2,7 +2,7 @@
 
 面向 **Oh My Pi (`omp`)** 的轻量级第一性增强插件：基于同一套 **“纯 YAML 角色内规范条件化 ($M_r$) + 马尔可夫屏障交接包 ($H$)”** 统一日常单 Agent 工作与多角色协同工作流，100% 自动继承你在 OMP 中已登录的账号、模型选择与设置。
 
-文档：[整体架构设计](docs/architecture.md) · [交接协议与 YAML 角色编写指南](docs/protocol-and-roles.md)
+文档：[整体架构设计](docs/architecture.md) · [交接协议与 YAML 角色编写指南](docs/protocol-and-roles.md) · [`algo` 实验目录与报告门禁规范](docs/algo-workflow-and-report.md)
 
 ---
 

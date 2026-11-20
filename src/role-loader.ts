@@ -289,11 +289,22 @@ function bullets(title: string, values: readonly string[]): string[] {
   return [title, ...(values.length ? values.map((value) => `- ${value}`) : ["- (none)"])];
 }
 
+export function formatRuntimeVisionHint(visionCapable: boolean | null | undefined): string | null {
+  if (visionCapable === true) {
+    return 'RuntimeVision: native-multimodal (current model sees images directly via read — inspect key plots/images with your own eyes; delegate to role "vision" only for large-batch screening or independent blind review)';
+  }
+  if (visionCapable === false) {
+    return 'RuntimeVision: text-only (current model CANNOT see image pixels — read strips images; you MUST delegate image inspection to role "vision" via enhance_handoff with toTarget="vision", delegateNow=true)';
+  }
+  return null;
+}
+
 export function renderConditioningBlock(input: {
-  role: RoleSpec; mandate?: Mandate | null; epistemicItems?: readonly EpistemicItem[]; upstreamHandoff?: HandoffEnvelope | null;
+  role: RoleSpec; mandate?: Mandate | null; epistemicItems?: readonly EpistemicItem[];
+  upstreamHandoff?: HandoffEnvelope | null; visionCapable?: boolean | null;
 }): string {
-  const { role, mandate = null, epistemicItems = [], upstreamHandoff = null } = input;
-  const permissions = role.permissions;
+  const { role, mandate = null, epistemicItems = [], upstreamHandoff = null, visionCapable } = input;
+  const permissions = role.permissions, visionHint = formatRuntimeVisionHint(visionCapable);
   const lines = [
     "<omp-enhance-conditioning>",
     `## Active Role: ${role.id}`,
@@ -301,6 +312,7 @@ export function renderConditioningBlock(input: {
     `Source: ${role.source}`,
     ...(role.model || role.thinking
       ? [`ModelPref: model=${role.model ?? "inherit"}; thinking=${role.thinking ?? "inherit"}`] : []),
+    ...(visionHint ? [visionHint] : []),
     "Stance:",
     role.stance.trim(),
     "Method:",

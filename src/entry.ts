@@ -17,7 +17,7 @@ import {
 } from "./orchestrator.ts";
 import { cancelJob, readJobLogTail, reconcileJobs, startBackgroundJob } from "./jobs.ts";
 import { createOmpSupervisorInspector, watchBackgroundJob } from "./supervisor.ts";
-import { loadEnhanceSettings, resolveModelSpec } from "./settings.ts";
+import { loadEnhanceSettings, modelSupportsVision, resolveModelSpec } from "./settings.ts";
 import { openRoleEditor, openRoleStudioHome, type RoleStudioDeps } from "./role-studio.ts";
 import { FlowRoomManager, openFlowRoomOverlay, registerRoomMessageRenderer } from "./flow-room.ts";
 export interface EnhanceOptions {
@@ -210,6 +210,7 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
     const block = renderConditioningBlock({ role, mandate,
       epistemicItems: mandate ? ws.store.listEpistemicItems(mandate.id) : [],
       upstreamHandoff: mandate ? ws.store.getLatestHandoff(mandate.id) : null,
+      visionCapable: modelSupportsVision(ctx?.model),
     });
     const existing = Array.isArray(event.systemPrompt)
       ? event.systemPrompt : event.systemPrompt ? [event.systemPrompt] : [];

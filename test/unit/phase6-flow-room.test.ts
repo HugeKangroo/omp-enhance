@@ -612,4 +612,79 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
       "left:algo:✓ ready",
     ]);
   });
+
+  test("injects adaptive RuntimeVision hints (native-multimodal vs text-only) and algo_work/ 4-gate report rules", async () => {
+    const cwd = makeTempDir("algo-spec-ws");
+    const globalDir = makeTempDir("algo-spec-global");
+    const lockPath = path.join(cwd, "omp-plugins.lock.json");
+    writeText(lockPath, JSON.stringify({ settings: { "omp-enhance": { defaultRole: "algo", flowRoutingMode: "auto", supervisorEnabled: false } } }));
+
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const tools = new Map<string, any>();
+    const childSystemPrompts: string[] = [];
+
+    const pi = {
+      cwd,
+      on(ev: string, fn: (...args: any[]) => any) { handlers.set(ev, [...(handlers.get(ev) ?? []), fn]); },
+      registerTool(spec: any) { tools.set(spec.name, spec); },
+      registerCommand() {},
+      registerMessageRenderer() {},
+      sendMessage() {},
+      getAllTools: () => [{ name: "read" }, { name: "bash" }],
+      async setActiveTools() {},
+      pi: {
+        settings: {},
+        async createAgentSession(opts: any) {
+          childSystemPrompts.push(String(opts.customSystemPrompt));
+          const handoffTool = opts.customTools[0];
+          const guardHandlers = new Map<string, Array<(ev: any) => any>>();
+          for (const ext of opts.extensions ?? []) {
+            ext({ on(ev: string, fn: (ev: any) => any) { guardHandlers.set(ev, [...(guardHandlers.get(ev) ?? []), fn]); } });
+          }
+          return {
+            session: {
+              messages: [],
+              async prompt() {
+                for (const fn of guardHandlers.get("tool_execution_end") ?? []) {
+                  fn({ toolCallId: "c1", toolName: "bash", args: { command: "python algo_work/benchmark/eval.py" }, isError: false });
+                }
+                await handoffTool.execute("h1", { verdict: "ready", summary: "ok" });
+              },
+              getLastAssistantText: () => "ok",
+              getLastAssistantMessage: () => null,
+              async dispose() {},
+            },
+          };
+        },
+      },
+    };
+
+    ompEnhance(pi, { globalRolesDir: globalDir, builtinRolesDir, pluginLockPath: lockPath });
+
+    const beforeStart = handlers.get("before_agent_start")![0]!;
+
+    // 1) Multimodal model in main session -> native-multimodal hint + algo_work/ 4-gate contract
+    const multiPrompt = (beforeStart({ systemPrompt: [] }, {
+      cwd, model: { provider: "deepseek", id: "deepseek-flash", input: ["text", "image"] }, ui: { setStatus() {} },
+    }) as { systemPrompt: string[] }).systemPrompt.join("\n");
+    expect(multiPrompt).toContain("RuntimeVision: native-multimodal");
+    expect(multiPrompt).toContain("algo_work/REPORT.md");
+    expect(multiPrompt).toContain("ledger.jsonl");
+    expect(multiPrompt).toContain("benchmark/eval.py");
+    expect(multiPrompt).toContain("algo_work/runs/exp_000_baseline/");
+    expect(multiPrompt).toContain("Keep 或 Discard");
+
+    // 2) Text-only model in main session -> text-only hint requiring delegation to vision (@vision)
+    const textOnlyPrompt = (beforeStart({ systemPrompt: [] }, {
+      cwd, model: { provider: "deepseek", id: "deepseek-reasoner", input: ["text"] }, ui: { setStatus() {} },
+    }) as { systemPrompt: string[] }).systemPrompt.join("\n");
+    expect(textOnlyPrompt).toContain("RuntimeVision: text-only");
+    expect(textOnlyPrompt).toContain('toTarget="vision", delegateNow=true');
+
+    // 3) Child session in enhance_flow also receives exact resolved model's RuntimeVision hint!
+    await tools.get("enhance_flow")!.execute("f-text", { roles: ["algo"], goal: "Test vision hint", wait: true }, null, null, {
+      cwd, hasUI: false, model: { provider: "deepseek", id: "deepseek-reasoner", input: ["text"] }, models: { resolve: () => undefined, list: () => [] },
+    });
+    expect(childSystemPrompts[0]).toContain("RuntimeVision: text-only");
+  });
 });

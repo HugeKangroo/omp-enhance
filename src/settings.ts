@@ -87,6 +87,11 @@ export function resolveModelSpec(spec: string | undefined, hostCtx: any): unknow
   return list.find((m) => m && (`${m.provider}/${m.id}` === normalized || m.id === normalized)) ?? hostCtx?.model;
 }
 
+export function modelSupportsVision(model: unknown): boolean | null {
+  if (!model || typeof model !== "object" || !Array.isArray((model as { input?: unknown }).input)) return null;
+  return ((model as { input: unknown[] }).input).includes("image");
+}
+
 export function resolveRoleRuntimeConfig(
   role: RoleSpec, pi: any, hostCtx: any, settings: EnhanceSettings = DEFAULT_ENHANCE_SETTINGS,
 ): { model: unknown; thinkingLevel: string | undefined } {

@@ -4,10 +4,10 @@ import type {
 } from "./types.ts";
 import type { EnhanceStore } from "./store.ts";
 import { findProtectedViolations, snapshotWorkspace } from "./store.ts";
-import { renderConditioningBlock } from "./role-loader.ts";
+import { formatRuntimeVisionHint, renderConditioningBlock } from "./role-loader.ts";
 import { createAndVerifyHandoff } from "./handoff.ts";
 import { summarizeToolCall, TurnTracker } from "./session-tracker.ts";
-import { resolveRoleRuntimeConfig } from "./settings.ts";
+import { modelSupportsVision, resolveRoleRuntimeConfig } from "./settings.ts";
 import {
   runWithSessionSupervisor, type SessionSupervisorControl, type SupervisorInspector,
 } from "./supervisor.ts";
@@ -203,6 +203,9 @@ export function createOmpRoleSessionRunner(
       const resolvedModel = model as { provider?: string; id?: string } | undefined;
       const modelLabel = resolvedModel?.provider && resolvedModel?.id
         ? `${resolvedModel.provider}/${resolvedModel.id}` : (stepCtx.role.model ?? "default");
+      const vHint = !stepCtx.conditioningPrompt.includes("\nRuntimeVision: ")
+        ? formatRuntimeVisionHint(modelSupportsVision(model)) : null;
+      const sysPrompt = vHint ? stepCtx.conditioningPrompt.replace("\nStance:\n", `\n${vHint}\nStance:\n`) : stepCtx.conditioningPrompt;
       stepCtx.observer?.onStageStart?.({
         stageId, role: stepCtx.role, round: stepCtx.round ?? 0, toTarget: stepCtx.toTarget, modelLabel,
       });
@@ -212,7 +215,7 @@ export function createOmpRoleSessionRunner(
         settings: pi.pi.settings, bindProcessState: false, disableExtensionDiscovery: true,
         noContextFiles: true, enableMCP: false, enableLsp: false,
         // OMP binds inline extensions only without restrictToolNames; toolNames still restricts the active set.
-        customSystemPrompt: stepCtx.conditioningPrompt, customTools: [childHandoffTool],
+        customSystemPrompt: sysPrompt, customTools: [childHandoffTool],
         extensions: [childGuardExt], toolNames: allowedTools, allowRestrictedCustomTools: true,
       });
 
