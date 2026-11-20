@@ -166,19 +166,20 @@ export class FlowRoomManager {
       isCancelled: () => this.cancelled,
       bindControls: (controls) => { this.controls = controls; },
       onStageStart: ({ stageId, role, round, toTarget, modelLabel }) => {
-        this.activeStageId = stageId;
         const existing = this.stages.find((s) => s.stageId === stageId);
-        if (existing) { existing.modelLabel = modelLabel; this.notify(); return; }
+        if (existing) { existing.modelLabel = modelLabel; this.activeStageId = stageId; this.notify(); return; }
+        const entry: RoomEntry = {
+          id: `stage-${stageId}`, side: "left", speaker: role.id, target: toTarget,
+          badge: round > 0 ? `● 返修#${round}` : "● 执行中", tone: "info",
+          text: "正在分析上下文并准备执行...", timestamp: new Date().toISOString(), stageId,
+        };
+        this.insertBeforeRunning(entry);
         this.stages.push({
           stageId, roleId: role.id, roleName: role.name, round, status: "running", modelLabel,
           startedAt: new Date().toISOString(), endedAt: null, activeTool: null, calls: [],
           assistantText: "", envelope: null, notes: [],
         });
-        this.entries.push({
-          id: `stage-${stageId}`, side: "left", speaker: role.id, target: toTarget,
-          badge: round > 0 ? `● 返修#${round}` : "● 执行中", tone: "info",
-          text: "正在分析上下文并准备执行...", timestamp: new Date().toISOString(), stageId,
-        });
+        this.activeStageId = stageId;
         this.notify();
       },
       onToolStart: (stageId, summary) => {
@@ -234,7 +235,7 @@ export class FlowRoomManager {
             en.target = "user"; en.text = reason ?? outcome?.envelope?.summary ?? "执行中止";
           }
         }
-        if (this.activeStageId === stageId) this.activeStageId = null;
+        this.activeStageId = [...this.stages].reverse().find((s) => s.status === "running")?.stageId ?? null;
         this.notify();
       },
     };

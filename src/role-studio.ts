@@ -17,7 +17,7 @@ export interface RoleStudioDeps {
   runHandoff?: (roleId: string) => Promise<void>;
 }
 
-const PINNED_MODELS = ["inherit", "@advisor", "@default", "@smol", "@slow", "@plan", "@task"];
+const PINNED_MODELS = ["inherit", "@vision", "@advisor", "@default", "@smol", "@slow", "@plan", "@task"];
 const targetDirFor = (deps: RoleStudioDeps, scope: "global" | "project"): string =>
   scope === "project" ? path.join(deps.cwd, ".omp", "roles") : deps.globalRolesDir;
 

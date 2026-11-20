@@ -506,4 +506,110 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
       text: "/flow qa 验证 LRU 淘汰",
     });
   });
+
+  test("supports algo mid-turn visual consultation to vision (@vision) with chronological Flow room bubbles", async () => {
+    const cwd = makeTempDir("algo-vis-ws");
+    const globalDir = makeTempDir("algo-vis-global");
+    const lockPath = path.join(cwd, "omp-plugins.lock.json");
+    writeText(lockPath, JSON.stringify({ settings: { "omp-enhance": { flowRoutingMode: "auto", supervisorEnabled: false } } }));
+
+    const tools = new Map<string, any>();
+    const sentMessages: any[] = [];
+    const createdModels: unknown[] = [];
+
+    const pi = {
+      cwd,
+      on() {},
+      registerTool(spec: any) { tools.set(spec.name, spec); },
+      registerCommand() {},
+      registerMessageRenderer() {},
+      sendMessage(msg: any) { sentMessages.push(msg); },
+      getAllTools: () => [{ name: "read" }, { name: "glob" }, { name: "write" }, { name: "bash" }],
+      async setActiveTools() {},
+      pi: {
+        settings: {},
+        async createAgentSession(opts: any) {
+          createdModels.push(opts.model);
+          const handoffTool = opts.customTools[0];
+          const guardHandlers = new Map<string, Array<(ev: any) => any>>();
+          for (const ext of opts.extensions ?? []) {
+            ext({ on(ev: string, fn: (ev: any) => any) { guardHandlers.set(ev, [...(guardHandlers.get(ev) ?? []), fn]); } });
+          }
+          const emitEnd = (toolCallId: string, toolName: string, args: unknown) => {
+            for (const fn of guardHandlers.get("tool_execution_end") ?? []) fn({ toolCallId, toolName, args, isError: false });
+          };
+          const isVision = String(opts.customSystemPrompt).includes("Active Role: vision");
+          return {
+            session: {
+              messages: [],
+              async prompt() {
+                if (isVision) {
+                  emitEnd("vis-read-1", "read", { path: "artifacts/vis/badcases.png" });
+                  await handoffTool.execute("vh-1", {
+                    verdict: "ready",
+                    summary: "样本 #3/#7 真值框偏移，其余 10 例集中在高频突变区滞后",
+                    verifiedFacts: [{ claim: "样本 #3/#7 真值偏移", evidenceRef: "vis-read-1" }],
+                  });
+                  return;
+                }
+                // algo renders plot -> consults vision mid-turn -> receives visual diagnosis -> finishes optimization!
+                writeText(path.join(cwd, "artifacts", "vis", "badcases.png"), "PNG_BYTES");
+                emitEnd("algo-plot-1", "bash", { command: "python plot_badcases.py" });
+                const consultRes = await handoffTool.execute("ah-consult", {
+                  verdict: "ready",
+                  toTarget: "vision",
+                  delegateNow: true,
+                  artifactPaths: ["artifacts/vis/badcases.png"],
+                  summary: "请核查 artifacts/vis/badcases.png 中的 Top-12 误差样本规律",
+                });
+                const parsedConsult = JSON.parse(consultRes.content[0].text);
+                expect(parsedConsult.delegated.ok).toBe(true);
+                expect(parsedConsult.delegated.envelope.summary).toContain("样本 #3/#7 真值框偏移");
+
+                emitEnd("algo-opt-2", "bash", { command: "python eval_v1.py" });
+                await handoffTool.execute("ah-final", {
+                  verdict: "ready",
+                  summary: "依据视觉诊断修正边缘滞后与剔除脏标后，MAE 较基线降低 32%",
+                  artifactPaths: ["artifacts/vis/badcases.png"],
+                });
+              },
+              getLastAssistantText: () => "done",
+              getLastAssistantMessage: () => null,
+              async dispose() {},
+            },
+          };
+        },
+      },
+    };
+
+    ompEnhance(pi, { globalRolesDir: globalDir, builtinRolesDir, pluginLockPath: lockPath });
+
+    const ctx = {
+      cwd,
+      hasUI: true,
+      model: { provider: "deepseek", id: "deepseek-r1" },
+      models: {
+        resolve: (spec: string) => (spec === "@vision" ? { provider: "openrouter", id: "qwen/qwen3.8-flash" } : undefined),
+        list: () => [],
+      },
+      ui: { setWidget() {}, setStatus() {}, notify() {} },
+    };
+
+    const res = JSON.parse((await tools.get("enhance_flow")!.execute("f1", {
+      roles: ["algo"], goal: "优化传感器真值回归算法", wait: true,
+    }, null, null, ctx)).content[0].text);
+
+    expect(res.status).toBe("completed");
+    expect(createdModels).toEqual([
+      { provider: "deepseek", id: "deepseek-r1" },
+      { provider: "openrouter", id: "qwen/qwen3.8-flash" },
+    ]);
+    const snap = sentMessages[0]!.details as FlowRoomSnapshot;
+    // Chronological order in group chat: User -> vision (@vision diagnosis) -> algo (final optimization delivery)
+    expect(snap.entries.map((e) => `${e.side}:${e.speaker}:${e.badge}`)).toEqual([
+      "right:你:目标",
+      "left:vision:✓ ready",
+      "left:algo:✓ ready",
+    ]);
+  });
 });

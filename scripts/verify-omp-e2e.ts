@@ -120,9 +120,9 @@ async function main(): Promise<void> {
 
   const status = JSON.parse(runPrintCommand("/enhance-status", "status")) as StatusPayload;
   assert(status.activeRoleId === "general", `Expected activeRoleId general, got ${status.activeRoleId}`);
-  assert(status.roleCount === 7, `Expected roleCount 7, got ${status.roleCount}`);
+  assert(status.roleCount === 9, `Expected roleCount 9, got ${status.roleCount}`);
   assert(status.settings.supervisorModel === "@advisor", `Expected default supervisorModel @advisor, got ${status.settings.supervisorModel}`);
-  console.log("ok: /enhance-status reports activeRoleId=general roleCount=7 supervisorModel=@advisor");
+  console.log("ok: /enhance-status reports activeRoleId=general roleCount=9 supervisorModel=@advisor");
 
   const overridePath = path.join(workspace, ".omp", "plugin-overrides.json");
   writeFileSync(

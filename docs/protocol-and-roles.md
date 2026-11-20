@@ -73,7 +73,7 @@ method:
 按以下优先级从高到低合并（同名 `id` 上层覆盖下层）：
 1. **项目级 (`project`)**：`<当前工作区>/.omp/roles/*.{yaml,yml}`
 2. **个人全局级 (`global`)**：`~/.omp/enhance/roles/*.{yaml,yml}`（`/role create` 默认保存位置，跨项目通用）
-3. **插件内置 (`builtin`)**：`<omp-enhance>/roles/{general,dev,qa,reviewer,ml-engineer,supervisor}.yaml`（默认会话基态为 `general`）
+3. **插件内置 (`builtin`)**：`<omp-enhance>/roles/{general,algo,vision,dev,qa,reviewer,ml-engineer,supervisor}.yaml`（默认会话基态为 `general`）
 
 ### 1.4 内置监督角色 (`supervisor`) 与 `@advisor` 默认继承
 

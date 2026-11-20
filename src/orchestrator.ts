@@ -81,38 +81,32 @@ function taskPromptFor(input: {
 function handoffParameters(pi: any): unknown {
   const T = pi?.typebox?.Type;
   if (T?.Object) {
-    const opt = (value: unknown) => (T.Optional ? T.Optional(value) : value);
-    const str = () => T.String();
+    const opt = (v: unknown) => (T.Optional ? T.Optional(v) : v), str = () => T.String();
     return T.Object({
       verdict: T.Union([T.Literal("ready"), T.Literal("rejected"), T.Literal("blocked")]),
-      summary: str(),
+      summary: str(), toTarget: opt(str()), delegateNow: opt(T.Boolean ? T.Boolean() : { type: "boolean" }),
       artifactPaths: opt(T.Array(str())),
       verifiedFacts: opt(T.Array(T.Object({ claim: str(), evidenceRef: str() }))),
-      openRisks: opt(T.Array(str())),
-      feedbackForUpstream: opt(str()),
+      openRisks: opt(T.Array(str())), feedbackForUpstream: opt(str()),
     });
   }
   return {
-    type: "object",
+    type: "object", required: ["verdict", "summary"],
     properties: {
       verdict: { type: "string", enum: ["ready", "rejected", "blocked"] },
-      summary: { type: "string" },
+      summary: { type: "string" }, toTarget: { type: "string" }, delegateNow: { type: "boolean" },
       artifactPaths: { type: "array", items: { type: "string" } },
       verifiedFacts: {
         type: "array",
-        items: {
-          type: "object",
-          properties: { claim: { type: "string" }, evidenceRef: { type: "string" } },
-          required: ["claim", "evidenceRef"],
-        },
+        items: { type: "object", properties: { claim: { type: "string" }, evidenceRef: { type: "string" } }, required: ["claim", "evidenceRef"] },
       },
-      openRisks: { type: "array", items: { type: "string" } },
-      feedbackForUpstream: { type: "string" },
+      openRisks: { type: "array", items: { type: "string" } }, feedbackForUpstream: { type: "string" },
     },
-    required: ["verdict", "summary"],
   };
 }
-export function createOmpRoleSessionRunner(pi: any, hostCtx: any, settings?: EnhanceSettings): RoleSessionRunner {
+export function createOmpRoleSessionRunner(
+  pi: any, hostCtx: any, settings?: EnhanceSettings, roles?: ReadonlyMap<string, RoleSpec>,
+): RoleSessionRunner {
   return {
     async runRoleTurn(stepCtx: RoleStepContext): Promise<RoleTurnOutcome> {
       const childTracker = new TurnTracker();
@@ -126,13 +120,10 @@ export function createOmpRoleSessionRunner(pi: any, hostCtx: any, settings?: Enh
         for (const call of childTracker.getObservedCalls()) calls.set(call.toolCallId, call);
         const messages: any[] = Array.isArray(childSession?.messages) ? childSession.messages : [];
         for (const message of messages) {
-          if (message?.role !== "toolResult" || typeof message.toolCallId !== "string") continue;
-          if (calls.has(message.toolCallId)) continue;
+          if (message?.role !== "toolResult" || typeof message.toolCallId !== "string" || calls.has(message.toolCallId)) continue;
           calls.set(message.toolCallId, {
-            toolCallId: message.toolCallId,
-            toolName: typeof message.toolName === "string" ? message.toolName : "unknown",
-            isError: message.isError === true,
-            touchedPaths: [],
+            toolCallId: message.toolCallId, toolName: typeof message.toolName === "string" ? message.toolName : "unknown",
+            isError: message.isError === true, touchedPaths: [],
             timestamp: typeof message.timestamp === "string" ? message.timestamp : new Date().toISOString(),
           });
         }
@@ -141,18 +132,32 @@ export function createOmpRoleSessionRunner(pi: any, hostCtx: any, settings?: Enh
 
       const childHandoffTool = {
         name: "enhance_handoff", label: "Submit Role Handoff", loadMode: "essential", approval: "write",
-        description: "Submit the final verified role conclusion as a HandoffEnvelope.",
+        description: "Submit the final verified role conclusion (or set toTarget + delegateNow=true to consult a specialist role such as vision mid-turn).",
         parameters: handoffParameters(pi),
         async execute(_toolCallId: string, params: any) {
           try {
+            const consultId = params.delegateNow === true && typeof params.toTarget === "string" ? params.toTarget.trim() : "";
+            const consultRole = consultId && consultId !== stepCtx.role.id && consultId !== "user" ? roles?.get(consultId) : undefined;
+            if (params.delegateNow === true && consultId && consultId !== "user" && consultId !== stepCtx.role.id && !consultRole) {
+              throw new Error(`Unknown delegation target role "${consultId}".`);
+            }
             const envelope = createAndVerifyHandoff({
               store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
-              parentHandoffId: stepCtx.upstreamHandoff?.id ?? null, toTarget: stepCtx.toTarget,
+              parentHandoffId: stepCtx.upstreamHandoff?.id ?? null, toTarget: consultRole ? consultRole.id : stepCtx.toTarget,
               verdict: params.verdict, summary: params.summary, artifactPaths: params.artifactPaths,
               baselineSnapshot: childTracker.getBaselineSnapshot(), observedCalls: collectObservedCalls(),
               verifiedFacts: params.verifiedFacts, openRisks: params.openRisks,
               feedbackForUpstream: params.feedbackForUpstream,
             });
+            if (consultRole) {
+              const subObserver = stepCtx.observer ? { ...stepCtx.observer, bindControls: undefined } : undefined;
+              const delegated = await executeRoleStep({
+                cwd: stepCtx.cwd, store: stepCtx.store, role: consultRole, mandate: stepCtx.mandate,
+                upstreamHandoff: envelope, toTarget: stepCtx.role.id, observer: subObserver,
+                runner: createOmpRoleSessionRunner(pi, hostCtx, settings),
+              });
+              return { content: [{ type: "text", text: JSON.stringify({ handoff: envelope, delegated }, null, 2) }], ...(!delegated.ok ? { isError: true } : {}) };
+            }
             submittedEnvelope = envelope;
             return { content: [{ type: "text", text: JSON.stringify(envelope, null, 2) }] };
           } catch (error) {

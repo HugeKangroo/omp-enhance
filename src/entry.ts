@@ -116,7 +116,7 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
     syncStatusBar(ws, ctx);
   }
   const runnerFor = (ws: WorkspaceState, ctx: any): RoleSessionRunner =>
-    options.runnerFactory?.(pi, ctx) ?? createOmpRoleSessionRunner(pi, ctx, ws.settings);
+    options.runnerFactory?.(pi, ctx) ?? createOmpRoleSessionRunner(pi, ctx, ws.settings, ws.roles);
   function supervisorFor(ws: WorkspaceState, ctx: any, force = false): RoleSupervisorConfig | undefined {
     if (!force && !ws.settings.supervisorEnabled) return undefined;
     const role = ws.roles.get("supervisor");

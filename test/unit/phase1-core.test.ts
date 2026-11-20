@@ -242,16 +242,24 @@ describe("EnhanceStore", () => {
 });
 
 describe("role-loader", () => {
-  test("loads all six built-in roles with general as universal base", () => {
+  test("loads all eight built-in roles including general, algo, and vision (@vision)", () => {
     const isolated = tempDir();
     const roles = discoverRoles({ cwd: isolated, globalRolesDir: path.join(isolated, "missing-global") });
-    expect([...roles.keys()].sort()).toEqual(["dev", "general", "ml-engineer", "qa", "reviewer", "supervisor"]);
+    expect([...roles.keys()].sort()).toEqual([
+      "algo", "dev", "general", "ml-engineer", "qa", "reviewer", "supervisor", "vision",
+    ]);
     for (const role of roles.values()) {
       expect(role.source).toBe("builtin");
       expect(role.stance.length).toBeGreaterThan(0);
       expect(role.method.length).toBeGreaterThan(0);
       expect(role.contentSha256).toMatch(/^[a-f0-9]{64}$/);
     }
+    expect(roles.get("algo")?.exit.requireToolEvidence).toBe(true);
+    expect(roles.get("vision")?.model).toBe("@vision");
+    expect(roles.get("vision")?.permissions.tools).toEqual(["read", "glob"]);
+    expect(roles.get("vision")?.permissions.writable).toEqual([]);
+    expect(roles.get("vision")?.permissions.protected).toEqual(["**"]);
+    expect(roles.get("vision")?.exit.requireToolEvidence).toBe(true);
     expect(roles.get("qa")?.permissions.writable).toEqual(["test/**", "tests/**", "**/*.test.*", "**/*.spec.*"]);
     expect(roles.get("qa")?.exit.requireToolEvidence).toBe(true);
     expect(roles.get("reviewer")?.permissions.writable).toEqual([]);

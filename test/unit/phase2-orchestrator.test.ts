@@ -535,7 +535,7 @@ describe("entry extension", () => {
       latestHandoff: { id: string } | null;
     };
     expect(status.activeRoleId).toBe("dev");
-    expect(status.roleCount).toBe(7);
+    expect(status.roleCount).toBe(9);
     expect(status.epistemicCount).toBe(0);
     expect(status.latestHandoff?.id).toBe(handoff.id);
 
