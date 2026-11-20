@@ -19,6 +19,7 @@ export interface ActiveStageControls {
 export interface FlowObserver {
   isCancelled?: () => boolean;
   bindControls?: (controls: ActiveStageControls | null) => void;
+  onProgress?: (info: { currentIndex: number; repairRound: number; lastHandoffId: string | null }) => void;
   onStageStart?: (info: { stageId: string; role: RoleSpec; round: number; toTarget: string; modelLabel: string }) => void;
   onToolStart?: (stageId: string, summary: string) => void;
   onToolEnd?: (stageId: string, call: ObservedToolCall) => void;
@@ -328,15 +329,17 @@ export async function executeRoleStep(input: ExecuteRoleStepInput): Promise<Exec
 export interface ExecuteRoleFlowInput {
   cwd: string; store: EnhanceStore; roles: readonly RoleSpec[]; mandate: Mandate;
   initialHandoff?: HandoffEnvelope | null; runner: RoleSessionRunner;
-  maxRepairRounds?: number; supervisor?: RoleSupervisorConfig; observer?: FlowObserver;
+  maxRepairRounds?: number; startIndex?: number; initialRepairRound?: number;
+  supervisor?: RoleSupervisorConfig; observer?: FlowObserver;
 }
 export async function executeRoleFlow(input: ExecuteRoleFlowInput): Promise<FlowRunResult> {
   if (input.roles.length < 1) throw new Error("executeRoleFlow requires at least one role.");
   const maxRepairRounds = input.maxRepairRounds ?? 2, steps: FlowStepResult[] = [];
-  let repairRound = 0, lastRejectionSig: string | null = null;
-  let upstream = input.initialHandoff ?? null, idx = 0, seq = 0;
+  let repairRound = input.initialRepairRound ?? 0, lastRejectionSig: string | null = null;
+  let upstream = input.initialHandoff ?? null, idx = Math.max(0, Math.min(input.startIndex ?? 0, input.roles.length - 1)), seq = 0;
 
   while (idx < input.roles.length) {
+    input.observer?.onProgress?.({ currentIndex: idx, repairRound, lastHandoffId: upstream?.id ?? null });
     if (input.observer?.isCancelled?.()) {
       return { status: "cancelled", steps, finalEnvelope: upstream, reason: "Cancelled by user." };
     }
@@ -383,6 +386,7 @@ export async function executeRoleFlow(input: ExecuteRoleFlowInput): Promise<Flow
       repairRound += 1; upstream = res.envelope; idx = 0; continue;
     }
     upstream = res.envelope; idx += 1;
+    input.observer?.onProgress?.({ currentIndex: idx, repairRound, lastHandoffId: upstream?.id ?? null });
   }
   return { status: "completed", steps, finalEnvelope: upstream };
 }

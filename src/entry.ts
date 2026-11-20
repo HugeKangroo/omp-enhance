@@ -26,7 +26,7 @@ export interface EnhanceOptions {
 }
 interface WorkspaceState {
   cwd: string; store: EnhanceStore; tracker: TurnTracker; room: FlowRoomManager;
-  roles: Map<string, RoleSpec>; settings: EnhanceSettings; activeRoleId: string | null;
+  roles: Map<string, RoleSpec>; settings: EnhanceSettings; activeRoleId: string | null; lastSessionId?: string;
 }
 const EPISTEMIC_KINDS: readonly EpistemicKind[] = ["fact", "hypothesis", "inquiry", "decision"];
 const EPISTEMIC_STATUSES: readonly EpistemicStatus[] = ["open", "verified", "falsified", "deferred"];
@@ -69,6 +69,29 @@ const toolResult = (payload: unknown, isError = false) => ({
   content: [{ type: "text", text: JSON.stringify(payload, null, 2) }], ...(isError ? { isError: true } : {}),
 });
 const toolError = (error: unknown) => toolResult({ error: error instanceof Error ? error.message : String(error) }, true);
+const sessionKey = (ctx: any): string =>
+  ctx?.sessionManager?.getSessionId?.() ?? ctx?.sessionManager?.getSessionFile?.() ?? "__default__";
+function readSessionRoleOverride(ctx: any, roles: Map<string, RoleSpec>): { found: boolean; roleId: string | null } {
+  const entries: any[] = ctx?.sessionManager?.getBranch?.() ?? ctx?.sessionManager?.getEntries?.() ?? [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (e?.type === "custom" && e?.customType === "omp-enhance-role") {
+      const id = e?.data?.roleId;
+      if (id === null) return { found: true, roleId: null };
+      if (typeof id === "string" && roles.has(id)) return { found: true, roleId: id };
+    }
+  }
+  return { found: false, roleId: null };
+}
+function turnFailedOrAborted(event: any): boolean {
+  if (event?.stopReason === "error" || event?.stopReason === "aborted" || Boolean(event?.error)) return true;
+  const msgs = Array.isArray(event?.messages) ? event.messages : [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m?.role === "assistant" || m?.stopReason) return m.stopReason === "error" || m.stopReason === "aborted" || Boolean(m.errorMessage);
+  }
+  return false;
+}
 export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void {
   const workspaces = new Map<string, WorkspaceState>();
   const kit = schemaKit(pi);
@@ -79,17 +102,19 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
 
   const loadSettings = (cwd: string): EnhanceSettings =>
     loadEnhanceSettings({ cwd, pluginLockPath: options.pluginLockPath });
+  const defaultRoleId = (roles: Map<string, RoleSpec>, settings: EnhanceSettings): string | null =>
+    settings.defaultRole === null ? null
+      : (roles.has(settings.defaultRole) ? settings.defaultRole : (roles.has("general") ? "general" : (roles.has("dev") ? "dev" : null)));
 
   function getWorkspace(ctx: any): WorkspaceState {
     const cwd = path.resolve(ctx?.cwd ?? process.cwd());
     const existing = workspaces.get(cwd);
     if (existing) { existing.settings = loadSettings(cwd); return existing; }
     const roles = discover(cwd), settings = loadSettings(cwd);
-    const initialRole = settings.defaultRole === null ? null
-      : (roles.has(settings.defaultRole) ? settings.defaultRole : (roles.has("general") ? "general" : (roles.has("dev") ? "dev" : null)));
+    const store = new EnhanceStore(path.join(cwd, ".omp-enhance", "state.sqlite"));
     const state: WorkspaceState = {
-      cwd, store: new EnhanceStore(path.join(cwd, ".omp-enhance", "state.sqlite")),
-      tracker: new TurnTracker(), room: new FlowRoomManager(pi), roles, settings, activeRoleId: initialRole,
+      cwd, store, tracker: new TurnTracker(), room: new FlowRoomManager(pi, store),
+      roles, settings, activeRoleId: defaultRoleId(roles, settings),
     };
     workspaces.set(cwd, state);
     return state;
@@ -99,13 +124,17 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
     ws.roles = discover(ws.cwd); ws.settings = loadSettings(ws.cwd); return ws.roles;
   };
   function syncStatusBar(ws: WorkspaceState, ctx: any): void {
-    const role = activeRole(ws);
+    const role = activeRole(ws), snap = ws.room.getSnapshot();
     const roleBadge = role ? `enhance:${role.id}${role.model ? ` (${role.model})` : ""}` : "enhance:off";
-    const flowBadge = ws.room.isRunning() ? ` · flow:${ws.room.getSnapshot().roleChain.join("→")}` : "";
+    const flowBadge = ws.room.isRunning() ? ` · flow:${snap.roleChain.join("→")}` : snap.status === "interrupted" ? " · flow:paused" : "";
     ctx?.ui?.setStatus?.("omp-enhance", ws.settings.showStatusBar ? `${roleBadge}${flowBadge}` : undefined);
   }
-  async function applyActiveRole(ws: WorkspaceState, roleId: string | null, ctx: any): Promise<void> {
+  async function applyActiveRole(ws: WorkspaceState, roleId: string | null, ctx: any, persistToSession = false): Promise<void> {
     ws.activeRoleId = roleId;
+    if (persistToSession) {
+      ws.lastSessionId = sessionKey(ctx);
+      try { pi.appendEntry?.("omp-enhance-role", { roleId }); } catch {}
+    }
     const role = activeRole(ws), allNames = pi.getAllTools?.().map((t: any) => t.name) ?? [];
     await pi.setActiveTools?.(role ? resolveRoleActiveTools(role, allNames) : allNames);
     if (role?.model && role.model !== "inherit" && typeof pi.setModel === "function") {
@@ -134,6 +163,22 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
       else ctx?.ui?.notify?.(text, "info");
     } catch {}
   }
+  function runFlowTask(ws: WorkspaceState, ctx: any, execInput: {
+    roles: RoleSpec[]; mandate: Mandate; initialHandoff: HandoffEnvelope | null;
+    maxRepairRounds: number; startIndex?: number; initialRepairRound?: number;
+  }): Promise<FlowRunResult> {
+    syncStatusBar(ws, ctx);
+    return (async () => {
+      try {
+        const res = await executeRoleFlow({
+          cwd: ws.cwd, store: ws.store, ...execInput,
+          runner: runnerFor(ws, ctx), supervisor: supervisorFor(ws, ctx), observer: ws.room.createObserver(ctx),
+        });
+        ws.room.finishFlow(res, ctx);
+        return res;
+      } catch (err) { ws.room.failFlow(err, ctx); throw err; } finally { syncStatusBar(ws, ctx); }
+    })();
+  }
   async function startManagedFlow(input: {
     ws: WorkspaceState; ctx: any; roles: RoleSpec[]; mandate: Mandate;
     initialHandoff: HandoffEnvelope | null; maxRepairRounds: number;
@@ -141,21 +186,27 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
   }): Promise<{ started: true; flowId: string; background: true; status: "running"; roleChain: string[]; goal: string } | FlowRunResult> {
     const { ws, ctx, roles, mandate, initialHandoff, maxRepairRounds, background, initiatorText } = input;
     const roleChain = roles.map((r) => r.id);
-    const flowId = ws.room.beginFlow({ goal: mandate.goal, roleChain, initiatorText, ctx });
-    syncStatusBar(ws, ctx);
-    const runPromise = (async (): Promise<FlowRunResult> => {
-      try {
-        const res = await executeRoleFlow({
-          cwd: ws.cwd, store: ws.store, roles, mandate, initialHandoff, runner: runnerFor(ws, ctx),
-          maxRepairRounds, supervisor: supervisorFor(ws, ctx), observer: ws.room.createObserver(ctx),
-        });
-        ws.room.finishFlow(res, ctx);
-        return res;
-      } catch (err) { ws.room.failFlow(err, ctx); throw err; } finally { syncStatusBar(ws, ctx); }
-    })();
+    const flowId = ws.room.beginFlow({
+      mandateId: mandate.id, goal: mandate.goal, roleChain, maxRepairRounds, lastHandoffId: initialHandoff?.id ?? null, initiatorText, ctx,
+    });
+    const runPromise = runFlowTask(ws, ctx, { roles, mandate, initialHandoff, maxRepairRounds });
     if (!background) return await runPromise;
     void runPromise.catch(() => {});
     return { started: true, flowId, background: true, status: "running", roleChain, goal: mandate.goal };
+  }
+  async function resumeManagedFlow(
+    ws: WorkspaceState, ctx: any, background: boolean,
+  ): Promise<{ resumed: true; flowId: string; startIndex: number; background: true; status: "running"; roleChain: string[] } | FlowRunResult> {
+    const plan = ws.room.resumeFlow(ctx);
+    const roles = plan.roleChain.map((id) => { const r = ws.roles.get(id); if (!r) throw new Error(`Unknown role "${id}".`); return r; });
+    const mandate = ws.store.getMandate(plan.mandateId) ?? ws.store.getActiveMandate() ?? ws.store.upsertMandate({ goal: ws.room.getSnapshot().goal || "Resumed Flow" });
+    const initialHandoff = plan.lastHandoffId ? ws.store.getHandoff(plan.lastHandoffId) : null;
+    const runPromise = runFlowTask(ws, ctx, {
+      roles, mandate, initialHandoff, maxRepairRounds: plan.maxRepairRounds, startIndex: plan.startIndex, initialRepairRound: plan.repairRound,
+    });
+    if (!background) return await runPromise;
+    void runPromise.catch(() => {});
+    return { resumed: true, flowId: plan.flowId, startIndex: plan.startIndex, background: true, status: "running", roleChain: plan.roleChain };
   }
 
   async function dispatchFollowUpFromRoom(ws: WorkspaceState, ctx: any, rawText: string): Promise<void> {
@@ -194,7 +245,11 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
   });
 
   pi.on("session_start", async (_event: any, ctx: any) => {
-    const ws = getWorkspace(ctx); refreshRoles(ws); await applyActiveRole(ws, ws.activeRoleId, ctx);
+    const ws = getWorkspace(ctx); refreshRoles(ws);
+    const prevSid = ws.lastSessionId; ws.lastSessionId = sessionKey(ctx);
+    const ov = readSessionRoleOverride(ctx, ws.roles);
+    const nextRole = ov.found ? ov.roleId : (prevSid !== undefined ? defaultRoleId(ws.roles, ws.settings) : ws.activeRoleId);
+    await applyActiveRole(ws, nextRole, ctx, false);
   });
   pi.on("session_shutdown", () => { for (const ws of workspaces.values()) { ws.room.dispose(); ws.store.close(); } workspaces.clear(); });
 
@@ -202,8 +257,15 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
     const ws = getWorkspace(ctx);
     reconcileJobs(ws.store);
     refreshRoles(ws);
+    const sid = sessionKey(ctx);
+    if (sid !== ws.lastSessionId) {
+      const prevSid = ws.lastSessionId; ws.lastSessionId = sid;
+      const ov = readSessionRoleOverride(ctx, ws.roles);
+      if (ov.found) ws.activeRoleId = ov.roleId;
+      else if (prevSid !== undefined) ws.activeRoleId = defaultRoleId(ws.roles, ws.settings);
+    }
     syncStatusBar(ws, ctx);
-    ws.tracker.resetTurn(ws.cwd);
+    ws.tracker.beginTurn(ws.cwd, true);
     const role = activeRole(ws);
     if (!role) return;
     const mandate = ws.store.getActiveMandate();
@@ -216,6 +278,10 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
     const existing = Array.isArray(event.systemPrompt)
       ? event.systemPrompt : event.systemPrompt ? [event.systemPrompt] : [];
     return { systemPrompt: [...existing, block] };
+  });
+
+  pi.on("agent_end", (event: any, ctx: any) => {
+    if (!turnFailedOrAborted(event)) getWorkspace(ctx).tracker.completeTurn();
   });
 
   pi.on("tool_call", (event: any, ctx: any) => {
@@ -348,9 +414,9 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
 
   registerTool({
     name: "enhance_flow", label: "Enhance Flow", approval: "exec",
-    description: "Start, inspect status, steer, or cancel a Markov-isolated multi-role collaboration Flow.",
+    description: "Start, resume, inspect status, steer, or cancel a Markov-isolated multi-role collaboration Flow.",
     parameters: kit.obj({
-      action: kit.en(["start", "status", "steer", "cancel"]),
+      action: kit.en(["start", "status", "steer", "cancel", "resume"]),
       roles: kit.arr(kit.str()), goal: kit.str(), message: kit.str(),
       maxRepairRounds: kit.num(), initialHandoffId: kit.str(), wait: kit.bool(),
     }, []),
@@ -359,7 +425,8 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
         const ws = getWorkspace(ctx);
         refreshRoles(ws);
         const action = asString(params.action) ?? "start";
-        if (action === "status") return toolResult(ws.room.getSnapshot());
+        if (action === "status") return toolResult({ ...ws.room.getSnapshot(), resumable: ws.room.isResumable() });
+        if (action === "resume") return toolResult(await resumeManagedFlow(ws, ctx, params.wait === true ? false : Boolean(ctx?.hasUI)));
         if (action === "cancel") {
           const cancelled = await ws.room.cancelActiveFlow(ctx);
           syncStatusBar(ws, ctx);
@@ -519,7 +586,7 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
         cwd: ws.cwd, globalRolesDir: globalRolesDir(options), builtinRolesDir: options.builtinRolesDir, pi, ctx,
         getRoles: () => ws.roles, refreshRoles: () => refreshRoles(ws),
         getSettings: () => ws.settings,
-        getActiveRoleId: () => ws.activeRoleId, activateRole: (id) => applyActiveRole(ws, id, ctx),
+        getActiveRoleId: () => ws.activeRoleId, activateRole: (id) => applyActiveRole(ws, id, ctx, true),
         runHandoff: (id) => handoffHandler(id, ctx),
       });
       const trimmed = args.trim(), head = trimmed.split(/\s+/)[0] ?? "";
@@ -575,15 +642,15 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
           refreshRoles(ws);
           if (ws.activeRoleId === delId) {
             const fb = ws.settings.defaultRole && ws.roles.has(ws.settings.defaultRole) ? ws.settings.defaultRole : (ws.roles.has("general") ? "general" : null);
-            await applyActiveRole(ws, fb, ctx);
+            await applyActiveRole(ws, fb, ctx, true);
           }
           return emitMessage(ctx, `Deleted custom role "${delId}".`);
         } catch (err) { return emitMessage(ctx, err instanceof Error ? err.message : String(err)); }
       }
-      if (head === "off") { await applyActiveRole(ws, null, ctx); return emitMessage(ctx, "Role conditioning disabled."); }
+      if (head === "off") { await applyActiveRole(ws, null, ctx, true); return emitMessage(ctx, "Role conditioning disabled."); }
       const role = ws.roles.get(trimmed);
       if (!role) return emitMessage(ctx, `Unknown role "${trimmed}". Use /role list.`);
-      await applyActiveRole(ws, role.id, ctx);
+      await applyActiveRole(ws, role.id, ctx, true);
       emitMessage(ctx, `Active role: ${role.id} [${role.source}]`);
     },
   });
@@ -594,7 +661,7 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
   pi.registerCommand("enhance-handoff", { description: handoffDescription, getArgumentCompletions: handoffCompletions, handler: handoffHandler });
 
   pi.registerCommand("flow", {
-    description: "Open split-pane Flow Room & Action Inspector (/flow), or start, steer, inspect, and cancel multi-role Flows.",
+    description: "Open split-pane Flow Room & Action Inspector (/flow), or start, continue, steer, inspect, and cancel multi-role Flows.",
     getArgumentCompletions: (prefix: string) => {
       if (prefix.includes(" ")) return [];
       const idx = prefix.lastIndexOf(",");
@@ -602,7 +669,7 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
         const head = prefix.slice(0, idx + 1), tail = prefix.slice(idx + 1);
         return completeRoleIds(tail).filter((c) => c.value !== "supervisor").map((c) => ({ ...c, value: `${head}${c.value}` }));
       }
-      return completeRoleIds(prefix, ["hub", "status", "steer ", "cancel"]).filter((c) => c.value !== "supervisor");
+      return completeRoleIds(prefix, ["hub", "continue", "resume", "status", "steer ", "cancel"]).filter((c) => c.value !== "supervisor");
     },
     handler: async (args: string, ctx: any) => {
       const ws = getWorkspace(ctx);
@@ -610,10 +677,28 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
       const trimmed = args.trim(), [first = "", ...restParts] = trimmed.split(/\s+/);
       if (!trimmed || first === "hub" || first === "room") {
         return ctx?.hasUI
-          ? openFlowRoomOverlay({ ctx, room: ws.room, onFollowUp: (msg) => dispatchFollowUpFromRoom(ws, ctx, msg) })
-          : emitMessage(ctx, JSON.stringify(ws.room.getSnapshot(), null, 2));
+          ? openFlowRoomOverlay({
+            ctx, room: ws.room, onFollowUp: (msg) => dispatchFollowUpFromRoom(ws, ctx, msg),
+            onResume: async () => { await resumeManagedFlow(ws, ctx, true); },
+          })
+          : emitMessage(ctx, JSON.stringify({ ...ws.room.getSnapshot(), resumable: ws.room.isResumable() }, null, 2));
       }
-      if (first === "status") return emitMessage(ctx, JSON.stringify(ws.room.getSnapshot(), null, 2));
+      if (first === "status") return emitMessage(ctx, JSON.stringify({ ...ws.room.getSnapshot(), resumable: ws.room.isResumable() }, null, 2));
+      if (first === "continue" || first === "resume") {
+        try {
+          if (ctx?.hasUI) {
+            const r = await resumeManagedFlow(ws, ctx, true) as { startIndex: number; roleChain: string[] };
+            ctx?.ui?.notify?.(`已从阶段 ${r.startIndex + 1}/${r.roleChain.length} (${r.roleChain[r.startIndex]}) 断点续跑 Flow`, "info");
+            return;
+          }
+          const result = await resumeManagedFlow(ws, ctx, false) as FlowRunResult;
+          return emitMessage(ctx, JSON.stringify({
+            status: result.status, reason: result.reason,
+            steps: result.steps.map((s) => ({ stepIndex: s.stepIndex, roleId: s.roleId, round: s.round, verdict: s.envelope.verdict, summary: s.envelope.summary, envelopeId: s.envelope.id })),
+            finalEnvelopeId: result.finalEnvelope?.id ?? null,
+          }, null, 2));
+        } catch (error) { return emitMessage(ctx, JSON.stringify({ status: "error", error: String(error) }, null, 2)); }
+      }
       if (first === "cancel" || first === "stop") {
         const ok = await ws.room.cancelActiveFlow(ctx); syncStatusBar(ws, ctx);
         return emitMessage(ctx, ok ? "已中止当前协作 Flow。" : "当前没有运行中的协作 Flow。");
@@ -625,7 +710,7 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
         return emitMessage(ctx, res.delivered ? `已实时插话至当前阶段 (${res.activeStageId}): ${msg}` : `已记录群聊留言: ${msg}`);
       }
       const roleIds = first.split(",").map((id) => id.trim()).filter(Boolean);
-      if (roleIds.length === 0) return emitMessage(ctx, "Usage: /flow [hub|status|steer <msg>|cancel|<role1,role2,...> [goal]]");
+      if (roleIds.length === 0) return emitMessage(ctx, "Usage: /flow [hub|continue|status|steer <msg>|cancel|<role1,role2,...> [goal]]");
       try {
         const roles = roleIds.map((id) => { const r = ws.roles.get(id); if (!r) throw new Error(`Unknown role "${id}".`); return r; });
         const goal = restParts.join(" ").trim();
@@ -656,7 +741,7 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
       const flowSnap = ws.room.getSnapshot();
       emitMessage(ctx, JSON.stringify({
         activeRoleId: ws.activeRoleId, roleCount: ws.roles.size, settings: ws.settings,
-        flow: { flowId: flowSnap.flowId, status: flowSnap.status, roleChain: flowSnap.roleChain },
+        flow: { flowId: flowSnap.flowId, status: flowSnap.status, currentIndex: flowSnap.currentIndex, resumable: ws.room.isResumable(), roleChain: flowSnap.roleChain },
         activeMandate: mandate ? { id: mandate.id, rev: mandate.rev, goal: mandate.goal, status: mandate.status } : null,
         epistemicCount: mandate ? ws.store.listEpistemicItems(mandate.id).length : 0,
         latestHandoff: latest ? { id: latest.id, fromRole: latest.fromRole, toTarget: latest.toTarget, verdict: latest.verdict, summary: latest.summary, createdAt: latest.createdAt } : null,

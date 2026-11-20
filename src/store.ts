@@ -83,7 +83,16 @@ CREATE TABLE IF NOT EXISTS handoffs (id TEXT PRIMARY KEY, mandate_id TEXT NOT NU
   observed_usage TEXT, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS jobs (job_id TEXT PRIMARY KEY, mandate_id TEXT, hypothesis_id TEXT, command TEXT NOT NULL,
   cwd TEXT NOT NULL, pid INTEGER NOT NULL, pgid INTEGER NOT NULL, log_path TEXT NOT NULL, exit_file_path TEXT NOT NULL,
-  status TEXT NOT NULL, exit_code INTEGER, started_at TEXT NOT NULL, ended_at TEXT);`;
+  status TEXT NOT NULL, exit_code INTEGER, started_at TEXT NOT NULL, ended_at TEXT);
+CREATE TABLE IF NOT EXISTS flow_runs (flow_id TEXT PRIMARY KEY, mandate_id TEXT NOT NULL, goal TEXT NOT NULL,
+  role_chain TEXT NOT NULL, status TEXT NOT NULL, current_index INTEGER NOT NULL, repair_round INTEGER NOT NULL,
+  last_handoff_id TEXT, max_repair_rounds INTEGER NOT NULL, snapshot_json TEXT NOT NULL, updated_at TEXT NOT NULL);`;
+
+export interface PersistedFlowCheckpoint {
+  flowId: string; mandateId: string; goal: string; roleChain: string[]; status: string;
+  currentIndex: number; repairRound: number; lastHandoffId: string | null;
+  maxRepairRounds: number; snapshotJson: string; updatedAt: string;
+}
 
 interface MandateRow { id: string; rev: number; goal: string; constraints: string; acceptance: string; status: Mandate["status"]; created_at: string; updated_at: string }
 interface EpistemicRow { id: string; mandate_id: string; kind: EpistemicKind; statement: string; evidence_ref: string | null; verification_plan: string | null; status: EpistemicStatus; created_at: string }
@@ -252,5 +261,26 @@ export class EnhanceStore {
     const db = this.conn(false);
     return db ? db.query("SELECT * FROM jobs WHERE (? IS NULL OR status = ?) ORDER BY started_at DESC, rowid DESC")
       .all(status ?? null, status ?? null).map((row) => toJob(row as JobRow)) : [];
+  }
+
+  saveFlowCheckpoint(cp: PersistedFlowCheckpoint): void {
+    this.conn(true)!.query(`INSERT OR REPLACE INTO flow_runs (flow_id, mandate_id, goal, role_chain, status,
+      current_index, repair_round, last_handoff_id, max_repair_rounds, snapshot_json, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      cp.flowId, cp.mandateId, cp.goal, JSON.stringify(cp.roleChain), cp.status,
+      cp.currentIndex, cp.repairRound, cp.lastHandoffId, cp.maxRepairRounds, cp.snapshotJson, cp.updatedAt,
+    );
+  }
+
+  getLatestFlowCheckpoint(): PersistedFlowCheckpoint | null {
+    const db = this.conn(false);
+    const row = db ? db.query("SELECT * FROM flow_runs ORDER BY updated_at DESC, rowid DESC LIMIT 1").get() as Record<string, any> | null : null;
+    return row ? {
+      flowId: String(row.flow_id), mandateId: String(row.mandate_id), goal: String(row.goal),
+      roleChain: parseArray<string>(String(row.role_chain)), status: String(row.status),
+      currentIndex: Number(row.current_index), repairRound: Number(row.repair_round),
+      lastHandoffId: row.last_handoff_id ? String(row.last_handoff_id) : null,
+      maxRepairRounds: Number(row.max_repair_rounds), snapshotJson: String(row.snapshot_json), updatedAt: String(row.updated_at),
+    } : null;
   }
 }

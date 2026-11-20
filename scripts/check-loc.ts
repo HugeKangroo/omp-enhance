@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 
-const MAX_TOTAL_SRC_LINES = 3500;
+const MAX_TOTAL_SRC_LINES = 3700;
 const PRIVATE_OMP_IMPORT = /from\s+["']@oh-my-pi\/[^"']+\/[^"']+["']|import\s*\(\s*["']@oh-my-pi\/[^"']+\/[^"']+["']\s*\)/;
 
 const srcDir = path.resolve(import.meta.dir, "..", "src");

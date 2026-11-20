@@ -71,10 +71,22 @@ export function extractWriteTargetPaths(cwd: string, toolName: string, input: un
 export class TurnTracker {
   private baseline: Map<string, SnapshotEntry> | null = null;
   private calls: ObservedToolCall[] = [];
+  private turnOpen = false;
 
   resetTurn(cwd: string): void {
+    this.turnOpen = false;
+    this.beginTurn(cwd, false);
+  }
+
+  beginTurn(cwd: string, preserveIfIncomplete = true): void {
+    if (preserveIfIncomplete && this.turnOpen && this.baseline !== null) return;
     this.baseline = snapshotWorkspace(cwd);
     this.calls = [];
+    this.turnOpen = true;
+  }
+
+  completeTurn(): void {
+    this.turnOpen = false;
   }
 
   checkToolCallAllowed(

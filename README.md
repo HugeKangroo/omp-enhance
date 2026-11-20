@@ -18,8 +18,10 @@
 4. **原生融入系统 `/settings` 与内聚 `Role Studio`（零多余斜杠命令）**
    - 自动发现优先级：项目级 `.omp/roles/*.yaml` > 个人全局库 `~/.omp/enhance/roles/*.yaml` > 插件内置 `roles/*.yaml`。
    - 插件全局参数直接集成在 OMP 系统默认 **`/settings → Plugins → omp-enhance`**（及 `omp plugin config`），不额外占用斜杠命令；交互式 TUI 下执行 `/role`、`/role studio` 或 `/role edit <id>` 即可打开可视化 **Role Studio**（新建角色向导、绑定角色专属模型、勾选工具复选框、Copy-on-Write 覆盖与一键恢复默认）。
-5. **无时限后台长作业管理与跨重启对账**
-   - 面向模型训练、批量评测等未知时长任务，独立进程组后台执行，状态持久化至 `.omp-enhance/state.sqlite`（WAL 事务模式），终端重开后自动对账真实进程与完成状态。
+5. **全链路状态持久化、崩溃断点续跑与 `--continue` / `F5` 无损恢复**
+   - **长作业与状态对账**：后台长作业与 `Mandate` / `HandoffEnvelope` / 认知黑板全程持久化至 `.omp-enhance/state.sqlite`（WAL 模式，按需惰性创建），终端重开后自动对账真实进程状态。
+   - **Flow 断点续跑（`/flow continue` / `Ctrl+R`）**：多角色 Flow 每步与阶段切换自动写入检查点；若进程中断后通过 `omp --continue` 重开，已完成阶段绝不重跑，群聊气泡与工具轨迹完整恢复，输入 `/flow continue`（或在 `/flow` 面板按 `Ctrl+R`）即可直接从中断阶段继续执行。
+   - **会话角色记忆与 `F5` 重试保护**：当前会话切换的 `/role <id>` 自动随 OMP `.jsonl` 会话分支持久化（`--continue` / `/resume` 自动恢复）；当单轮请求因网络波动报错或中断后按 **`F5` 重试**时，自动保留报错前的文件基线快照与已执行工具证据。
 6. **运行期自适应巡检与止损（Supervisor 默认继承 `@advisor`）**
    - 内置 `supervisor` 默认自动继承你在 OMP 中配置的 **`@advisor`（Advisor 模型角色）**，也可在 `/settings → Plugins → omp-enhance`（`supervisorModel`）或 `/role edit supervisor` 中自由改绑任意模型。
    - 周期性消费增量脉搏（新增日志 / 新增工具调用 / 静默时长），只输出 `continue`、`steer` 或 `abort` 三种裁决，并按 `nextCheckSec` 自适应拉长巡检间隔。
@@ -64,9 +66,9 @@ omp --extension .
 | `/role show <id>` | 查看指定角色的完整 YAML 规范、专属模型、读写保护边界与文件路径 |
 | `/role create <id> [--project] <描述>` | CLI 快速生成规范 YAML 角色文件（默认存入 `~/.omp/enhance/roles/`） |
 | `/handoff [role]` | 将当前成果转手给独立隔离的阶段角色（如 `/handoff qa`；不带参数敲 `/handoff` 会直接弹出目标角色选择器，支持 `Tab` 补全，执行时底部实时显示正在运行的阶段与工具；`-p` 模式下请用 `/enhance-handoff <role>`） |
-| `/flow` 或 `/flow hub` | 打开**双栏群聊与 Agent 动作检查器面板**（左栏左右对称群聊流，右栏检视每个 Agent 的工具动作轨迹与产物，底部输入框回车实时 `steer` 插话，`Ctrl+X` 中止，`Esc` 关闭） |
+| `/flow` 或 `/flow hub` | 打开**双栏群聊与 Agent 动作检查器面板**（左栏左右对称群聊流，右栏检视每个 Agent 的工具动作轨迹与产物，底部输入框回车实时 `steer` 插话，`Ctrl+R` 断点续跑中断流程，`Ctrl+X` 中止，`Esc` 关闭） |
 | `/flow <r1,r2,...> [任务说明]` | 后台非阻塞启动马尔可夫隔离角色链与自动打回返修（如 `/flow dev,qa,reviewer`），主窗口显示实时悬停条并在完成后归档为可 `Ctrl+O` 展开的群聊卡片 |
-| `/flow steer <内容>` / `/flow cancel` / `/flow status` | 从命令行直接向正在运行的后台 Flow 实时插话纠偏、中止执行或查看快照 |
+| `/flow continue` / `/flow steer <内容>` / `/flow cancel` / `/flow status` | 从上次中断/失败阶段断点续跑、向运行中的后台 Flow 实时插话纠偏、中止执行或查看快照 |
 | `@<roleId> <任务>` | 在主输入框直接点名某个角色（如 `@qa 验证并发边界`）执行独立隔离阶段并汇报 |
 | `/enhance-status` | 本地只读查看当前角色、当前生效插件设置、Flow 房间状态、有效 `Mandate`、认知黑板计数、最近交接链与后台作业 |
 
@@ -74,7 +76,7 @@ omp --extension .
 
 - `enhance_mandate`：建立/更新原始需求契约（目标、硬约束、验收条件）及读写认知黑板（`fact` 强制绑定真实证据引用、`hypothesis`、`inquiry`、`decision`）。
 - `enhance_handoff`：收束本轮工作生成标准 `HandoffEnvelope`（自动计算变更文件 `sha256` 并核验真实工具调用证据），可选直接委托下一角色。
-- `enhance_flow`：双流协同控制工具，支持 `action: "start" | "status" | "steer" | "cancel"`（受 `flowRoutingMode` 路由策略保护）。
+- `enhance_flow`：双流协同控制工具，支持 `action: "start" | "resume" | "status" | "steer" | "cancel"`（受 `flowRoutingMode` 路由策略保护）。
 - `enhance_job`：启动、`watch`（自适应巡检直到完成/失败/被止损）、读取日志尾部、跨重启对账（`reconcile`）或取消后台无时限长作业。
 
 ---
@@ -83,6 +85,6 @@ omp --extension .
 
 ```sh
 bun run probe:phase0 # 真机验证本机 OMP 公开 SDK、账号继承与隔离会话生命周期
-bun run check        # 类型检查 + 核心代码行数/零私有导入门禁 (≤ 3,500 LoC) + 单元测试
+bun run check        # 类型检查 + 核心代码行数/零私有导入门禁 + 单元测试
 bun run verify:omp   # 调用本机真实 omp 执行端到端集成验收
 ```

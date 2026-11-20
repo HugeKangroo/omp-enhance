@@ -1,14 +1,15 @@
 import type { FlowRunResult, FlowStageTrace, ObservedToolCall, RoomEntry } from "./types.ts";
+import type { EnhanceStore } from "./store.ts";
 import type { ActiveStageControls, FlowObserver } from "./orchestrator.ts";
 
-export type FlowRoomStatus = "idle" | "running" | "completed" | "blocked" | "failed" | "cancelled";
+export type FlowRoomStatus = "idle" | "running" | "interrupted" | "completed" | "blocked" | "failed" | "cancelled";
 export interface FlowRoomSnapshot {
   flowId: string | null; goal: string; roleChain: string[]; status: FlowRoomStatus; reason?: string;
-  startedAt: string | null; endedAt: string | null; activeStageId: string | null;
+  currentIndex?: number; startedAt: string | null; endedAt: string | null; activeStageId: string | null;
   entries: RoomEntry[]; stages: FlowStageTrace[];
 }
 export interface FlowRoomOverlayDeps {
-  ctx: any; room: FlowRoomManager; onFollowUp?: (text: string) => Promise<void>;
+  ctx: any; room: FlowRoomManager; onFollowUp?: (text: string) => Promise<void>; onResume?: () => Promise<void>;
 }
 
 export function truncateDisplay(text: string, maxWidth: number): string {
@@ -57,10 +58,11 @@ const toneColor = (t: RoomEntry["tone"]): string =>
   t === "success" ? "success" : t === "warning" ? "warning" : t === "error" ? "error" : "accent";
 const statusBadge = (s: FlowRoomStatus): { text: string; color: string } =>
   s === "running" ? { text: "● 运行中", color: "accent" }
-    : s === "completed" ? { text: "✓ 已完成", color: "success" }
-      : s === "blocked" ? { text: "! 需你介入", color: "warning" }
-        : s === "cancelled" ? { text: "⏹ 已取消", color: "muted" }
-          : s === "failed" ? { text: "✕ 异常中止", color: "error" } : { text: "○ 空闲", color: "muted" };
+    : s === "interrupted" ? { text: "⏸ 中断可续跑", color: "warning" }
+      : s === "completed" ? { text: "✓ 已完成", color: "success" }
+        : s === "blocked" ? { text: "! 需你介入", color: "warning" }
+          : s === "cancelled" ? { text: "⏹ 已取消", color: "muted" }
+            : s === "failed" ? { text: "✕ 异常中止", color: "error" } : { text: "○ 空闲", color: "muted" };
 
 /** Render a single chat bubble: Agent/Supervisor on the left, User ("你") on the right. */
 export function renderChatBubbleLines(
@@ -86,25 +88,67 @@ export function renderChatBubbleLines(
 }
 
 export class FlowRoomManager {
-  private flowId: string | null = null;
+  private flowId: string | null = null; private mandateId = "";
   private goal = ""; private roleChain: string[] = []; private status: FlowRoomStatus = "idle";
+  private currentIndex = 0; private repairRound = 0; private lastHandoffId: string | null = null; private maxRepairRounds = 2;
   private reason: string | undefined; private startedAt: string | null = null; private endedAt: string | null = null;
   private activeStageId: string | null = null; private entries: RoomEntry[] = []; private stages: FlowStageTrace[] = [];
   private controls: ActiveStageControls | null = null; private cancelled = false; private seq = 0;
   private widgetTui: any = null; private listeners = new Set<() => void>();
 
-  constructor(private readonly pi: any) {}
+  constructor(private readonly pi: any, private readonly store?: EnhanceStore) { this.hydrateFromStore(); }
   isRunning(): boolean { return this.status === "running"; }
+  isResumable(): boolean {
+    return Boolean(this.flowId && this.mandateId && this.roleChain.length > 0 &&
+      this.currentIndex < this.roleChain.length && (this.status === "interrupted" || this.status === "failed" || this.status === "cancelled"));
+  }
   subscribe(fn: () => void): () => void { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; }
   private notify(): void {
     try { this.widgetTui?.requestRender?.(); } catch {}
     for (const fn of this.listeners) { try { fn(); } catch {} }
   }
+  private persist(): void {
+    if (!this.store || !this.flowId || !this.mandateId) return;
+    try {
+      this.store.saveFlowCheckpoint({
+        flowId: this.flowId, mandateId: this.mandateId, goal: this.goal, roleChain: this.roleChain,
+        status: this.status, currentIndex: this.currentIndex, repairRound: this.repairRound,
+        lastHandoffId: this.lastHandoffId, maxRepairRounds: this.maxRepairRounds,
+        snapshotJson: JSON.stringify(this.getSnapshot()), updatedAt: new Date().toISOString(),
+      });
+    } catch {}
+  }
+  private hydrateFromStore(): void {
+    const cp = this.store?.getLatestFlowCheckpoint();
+    if (!cp) return;
+    try {
+      const snap = JSON.parse(cp.snapshotJson) as FlowRoomSnapshot;
+      this.flowId = cp.flowId; this.mandateId = cp.mandateId; this.goal = cp.goal; this.roleChain = [...cp.roleChain];
+      this.currentIndex = cp.currentIndex; this.repairRound = cp.repairRound;
+      this.lastHandoffId = cp.lastHandoffId; this.maxRepairRounds = cp.maxRepairRounds;
+      this.startedAt = snap.startedAt; this.endedAt = snap.endedAt; this.reason = snap.reason;
+      this.entries = Array.isArray(snap.entries) ? snap.entries : [];
+      this.stages = Array.isArray(snap.stages) ? snap.stages : [];
+      this.seq = this.entries.length + 1;
+      if (cp.status === "running") {
+        this.status = "interrupted"; this.activeStageId = null; this.endedAt = new Date().toISOString();
+        this.reason = "上次进程中断，输入 /flow continue 断点续跑";
+        for (const st of this.stages) {
+          if (st.status === "running") { st.status = "aborted"; st.endedAt = this.endedAt; st.activeTool = null; }
+        }
+        for (const en of this.entries) {
+          if (en.badge?.startsWith("●")) { en.badge = "⏸ 中断"; en.tone = "warning"; en.text = "进程中断，输入 /flow continue (或 Ctrl+R) 从本阶段续跑"; }
+        }
+        this.persist();
+      } else this.status = cp.status as FlowRoomStatus;
+    } catch {}
+  }
 
   getSnapshot(): FlowRoomSnapshot {
     return {
       flowId: this.flowId, goal: this.goal, roleChain: [...this.roleChain], status: this.status,
-      ...(this.reason ? { reason: this.reason } : {}), startedAt: this.startedAt, endedAt: this.endedAt,
+      currentIndex: this.currentIndex, ...(this.reason ? { reason: this.reason } : {}),
+      startedAt: this.startedAt, endedAt: this.endedAt,
       activeStageId: this.activeStageId, entries: this.entries.map((e) => ({ ...e })),
       stages: this.stages.map((s) => ({
         ...s, calls: s.calls.map((c) => ({ ...c, touchedPaths: [...c.touchedPaths] })), notes: [...s.notes],
@@ -117,18 +161,47 @@ export class FlowRoomManager {
     if (idx >= 0) this.entries.splice(idx, 0, entry); else this.entries.push(entry);
   }
 
-  beginFlow(input: { goal: string; roleChain: string[]; initiatorText?: string; ctx?: any }): string {
+  beginFlow(input: {
+    mandateId?: string; goal: string; roleChain: string[]; maxRepairRounds?: number;
+    lastHandoffId?: string | null; initiatorText?: string; ctx?: any;
+  }): string {
     if (this.status === "running") throw new Error("已有正在运行的协作 Flow；可通过 steer 插话、/flow 查看或 cancel 取消。");
     this.seq += 1; this.flowId = `flow-${Date.now().toString(36)}-${this.seq}`;
-    this.goal = input.goal; this.roleChain = [...input.roleChain]; this.status = "running";
+    this.mandateId = input.mandateId ?? ""; this.goal = input.goal; this.roleChain = [...input.roleChain];
+    this.currentIndex = 0; this.repairRound = 0; this.lastHandoffId = input.lastHandoffId ?? null;
+    this.maxRepairRounds = input.maxRepairRounds ?? 2; this.status = "running";
     this.reason = undefined; this.startedAt = new Date().toISOString(); this.endedAt = null;
     this.activeStageId = null; this.controls = null; this.cancelled = false; this.stages = [];
     this.entries = [{
       id: `user-${this.seq}-init`, side: "right", speaker: "你", badge: "目标",
       tone: "success", text: input.initiatorText ?? input.goal, timestamp: this.startedAt,
     }];
-    this.mountWidget(input.ctx); this.notify();
+    this.persist(); this.mountWidget(input.ctx); this.notify();
     return this.flowId;
+  }
+
+  resumeFlow(ctx?: any): {
+    flowId: string; mandateId: string; roleChain: string[]; startIndex: number;
+    repairRound: number; lastHandoffId: string | null; maxRepairRounds: number;
+  } {
+    if (!this.isResumable()) throw new Error("当前没有可断点续跑的中断/失败 Flow。");
+    this.status = "running"; this.cancelled = false; this.endedAt = null; this.reason = undefined; this.seq += 1;
+    const roleId = this.roleChain[this.currentIndex]!, retryId = `${this.currentIndex}:${roleId}:r${this.repairRound}`;
+    const prev = this.stages.find((s) => s.stageId === retryId);
+    if (prev) {
+      const archived = `${retryId}-prev${this.seq}`; prev.stageId = archived;
+      for (const e of this.entries) { if (e.id === `stage-${retryId}`) e.id = `stage-${archived}`; if (e.stageId === retryId) e.stageId = archived; }
+    }
+    this.entries.push({
+      id: `user-${this.seq}-resume`, side: "right", speaker: "你", badge: "续跑", tone: "success",
+      text: `从阶段 ${this.currentIndex + 1}/${this.roleChain.length} (${roleId}) 断点继续`, timestamp: new Date().toISOString(),
+    });
+    this.persist(); this.mountWidget(ctx); this.notify();
+    return {
+      flowId: this.flowId!, mandateId: this.mandateId, roleChain: [...this.roleChain],
+      startIndex: this.currentIndex, repairRound: this.repairRound,
+      lastHandoffId: this.lastHandoffId, maxRepairRounds: this.maxRepairRounds,
+    };
   }
 
   async postUserSteer(message: string, ctx?: any): Promise<{ delivered: boolean; activeStageId: string | null }> {
@@ -145,7 +218,7 @@ export class FlowRoomManager {
     let delivered = false;
     if (this.status === "running" && this.controls) { await this.controls.steer(clean); delivered = true; }
     if (this.status === "running") this.mountWidget(ctx);
-    this.notify();
+    this.persist(); this.notify();
     return { delivered, activeStageId: this.activeStageId };
   }
 
@@ -157,7 +230,7 @@ export class FlowRoomManager {
       tone: "warning", text: "停止当前协作 Flow", timestamp: new Date().toISOString(),
     });
     if (this.controls) await this.controls.abort();
-    this.clearWidget(ctx); this.notify();
+    this.clearWidget(ctx); this.persist(); this.notify();
     return true;
   }
 
@@ -165,9 +238,13 @@ export class FlowRoomManager {
     return {
       isCancelled: () => this.cancelled,
       bindControls: (controls) => { this.controls = controls; },
+      onProgress: ({ currentIndex, repairRound, lastHandoffId }) => {
+        this.currentIndex = currentIndex; this.repairRound = repairRound; this.lastHandoffId = lastHandoffId;
+        this.persist();
+      },
       onStageStart: ({ stageId, role, round, toTarget, modelLabel }) => {
         const existing = this.stages.find((s) => s.stageId === stageId);
-        if (existing) { existing.modelLabel = modelLabel; this.activeStageId = stageId; this.notify(); return; }
+        if (existing) { existing.modelLabel = modelLabel; this.activeStageId = stageId; this.persist(); this.notify(); return; }
         const entry: RoomEntry = {
           id: `stage-${stageId}`, side: "left", speaker: role.id, target: toTarget,
           badge: round > 0 ? `● 返修#${round}` : "● 执行中", tone: "info",
@@ -180,7 +257,7 @@ export class FlowRoomManager {
           assistantText: "", envelope: null, notes: [],
         });
         this.activeStageId = stageId;
-        this.notify();
+        this.persist(); this.notify();
       },
       onToolStart: (stageId, summary) => {
         const st = this.stages.find((s) => s.stageId === stageId);
@@ -197,7 +274,7 @@ export class FlowRoomManager {
           const en = this.entries.find((e) => e.id === `stage-${stageId}`);
           if (en) en.text = `${call.isError ? "✕" : "✓"} 已执行 ${st.calls.length} 步 · ${call.summary ?? call.toolName}`;
         }
-        this.notify();
+        this.persist(); this.notify();
       },
       onSupervisorNote: (stageId, note) => {
         const st = this.stages.find((s) => s.stageId === stageId);
@@ -207,7 +284,7 @@ export class FlowRoomManager {
           id: `sup-${this.seq}`, side: "left", speaker: "supervisor", target: st?.roleId,
           badge: "↺ 督导", tone: "warning", text: note, timestamp: new Date().toISOString(), stageId,
         });
-        this.notify();
+        this.persist(); this.notify();
       },
       onStageEnd: (stageId, { status, outcome, reason }) => {
         const st = this.stages.find((s) => s.stageId === stageId);
@@ -236,7 +313,7 @@ export class FlowRoomManager {
           }
         }
         this.activeStageId = [...this.stages].reverse().find((s) => s.status === "running")?.stageId ?? null;
-        this.notify();
+        this.persist(); this.notify();
       },
     };
   }
@@ -265,7 +342,7 @@ export class FlowRoomManager {
         tone: "warning", text: result.reason ?? "多轮修复未收敛，请介入决策。", timestamp: this.endedAt,
       });
     }
-    this.clearWidget(ctx);
+    this.clearWidget(ctx); this.persist();
     const snap = this.getSnapshot();
     this.sendCard(snap, result.finalEnvelope?.summary ?? result.reason ?? snap.status, ctx);
     this.notify();
@@ -277,7 +354,7 @@ export class FlowRoomManager {
     this.endedAt = new Date().toISOString(); this.activeStageId = null; this.controls = null;
     this.status = "failed"; this.reason = msg; this.seq += 1;
     this.entries.push({ id: `err-${this.seq}`, side: "left", speaker: "flow", target: "user", badge: "✕ 错误", tone: "error", text: msg, timestamp: this.endedAt });
-    this.clearWidget(ctx);
+    this.clearWidget(ctx); this.persist();
     const snap = this.getSnapshot();
     this.sendCard(snap, msg, ctx);
     this.notify();
@@ -353,7 +430,7 @@ export function registerRoomMessageRenderer(pi: any): void {
 type OverlayInputEvent =
   | { kind: "escape" } | { kind: "enter" } | { kind: "backspace" }
   | { kind: "up" } | { kind: "down" } | { kind: "scroll_up" } | { kind: "scroll_down" }
-  | { kind: "cancel_flow" } | { kind: "text"; text: string };
+  | { kind: "cancel_flow" } | { kind: "resume_flow" } | { kind: "text"; text: string };
 
 export function parseFlowOverlayInput(data: string, kb?: any, hasDraft = false): OverlayInputEvent | null {
   if (!data || data.startsWith("\x1b[<") || /^\x1b\[[0-9;:]*:3[u~A-Z]$/.test(data)) return null;
@@ -362,11 +439,13 @@ export function parseFlowOverlayInput(data: string, kb?: any, hasDraft = false):
     return pasted ? { kind: "text", text: pasted } : null;
   }
   if (data === "\x18") return { kind: "cancel_flow" };
+  if (data === "\x12") return { kind: "resume_flow" };
   const kitty = /^\x1b\[(\d+)(?::(\d+))?(?:;(\d+)(?::(\d+))?)?u$/.exec(data);
   if (kitty) {
     if (kitty[4] === "3") return null;
     const cp = Number(kitty[1]), shifted = kitty[2] ? Number(kitty[2]) : undefined, mod = kitty[3] ? Number(kitty[3]) - 1 : 0;
     if ((mod & 4) !== 0 && (cp === 120 || cp === 88)) return { kind: "cancel_flow" };
+    if ((mod & 4) !== 0 && (cp === 114 || cp === 82)) return { kind: "resume_flow" };
     if (cp === 27 || ((mod & 4) !== 0 && cp === 99)) return { kind: "escape" };
     if (cp === 13 || cp === 10) return { kind: "enter" };
     if (cp === 127 || cp === 8) return { kind: "backspace" };
@@ -478,6 +557,14 @@ export async function openFlowRoomOverlay(deps: FlowRoomOverlayDeps): Promise<vo
           }, onErr);
           return;
         }
+        if (ev.kind === "resume_flow") {
+          if (deps.onResume && deps.room.isResumable()) {
+            followTail = true; statusNote = "▶ 正在从断点续跑 Flow";
+            void deps.onResume().then(() => tui?.requestRender?.(), onErr);
+          } else statusNote = "当前无待续跑的中断 Flow";
+          tui?.requestRender?.();
+          return;
+        }
         if (ev.kind === "enter") {
           const msg = draft.trim();
           if (!msg) return;
@@ -518,7 +605,8 @@ export async function openFlowRoomOverlay(deps: FlowRoomOverlayDeps): Promise<vo
         const hint = snap.status === "running" ? "实时插话 (Enter 发送给当前 Agent)" : "发起跟进 (Enter 启动协作，支持 @role)";
         const inputLine = draft ? `💬 你: ${draft}█` : `💬 ${hint}...`;
         out.push(`${fg("border", "│")} ${draft ? fg("accent", padLeftCell(inputLine, inner)) : fg("muted", padLeftCell(inputLine, inner))} ${fg("border", "│")}`);
-        const foot = `${statusNote ? `${statusNote} · ` : ""}↑↓ 选消息 · [/] 滚详情 · 输入+Enter 插话 · Ctrl+X 中止 · Esc 关闭`;
+        const resumeHint = deps.room.isResumable() ? "Ctrl+R 断点续跑 · " : "";
+        const foot = `${statusNote ? `${statusNote} · ` : ""}${resumeHint}↑↓ 选消息 · [/] 滚详情 · 输入+Enter 插话 · Ctrl+X 中止 · Esc 关闭`;
         out.push(fg("border", `╰─ ${padLeftCell(foot, inner - 2)} ─╯`));
         return out;
       },
