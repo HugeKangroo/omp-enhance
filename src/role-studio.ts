@@ -372,7 +372,7 @@ export async function openRoleStudioHome(deps: RoleStudioDeps): Promise<void> {
         { kind: "new", label: "+ 新建角色 (New)", detail: "从模板向导创建新的纯 YAML 角色，创建后直接进入模型与工具配置页。" },
         { kind: "copy-pick", label: "⧉ 拷贝角色 (Copy)", detail: "以任意内置或自定义角色为蓝本拷贝出新角色（完整保留方法论、模型与工具设置供微调）。" },
         { kind: "edit-pick", label: "✎ 修改角色 (Edit)", detail: "选择角色修改绑定模型、Thinking、工具复选框、路径边界或完整 YAML（内置角色自动写时复制）。" },
-        ...(customRoles.length > 0 ? [{ kind: "delete-pick" as const, label: "🗑 删除角色 (Del)", detail: "删除用户自建/拷贝的自定义角色（6 个内置默认角色受保护不可删除）。" }] : []),
+        ...(customRoles.length > 0 ? [{ kind: "delete-pick" as const, label: "🗑 删除角色 (Del)", detail: "删除用户自建/拷贝的自定义角色（全部内置默认角色均受保护不可删除）。" }] : []),
         { kind: "off", label: "○ 关闭角色 (Off)", detail: "关闭当前主会话的角色条件化注入，恢复无附加角色的状态。" },
         { kind: "close", label: "✕ 退出面板 (Esc)", detail: "关闭面板返回主对话（也可在任意位置按 Esc 或 q 直接退出）。" },
       ];

@@ -207,10 +207,11 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
     const role = activeRole(ws);
     if (!role) return;
     const mandate = ws.store.getActiveMandate();
+    const effectiveModel = role.model && role.model !== "inherit" ? resolveModelSpec(role.model, ctx) : ctx?.model;
     const block = renderConditioningBlock({ role, mandate,
       epistemicItems: mandate ? ws.store.listEpistemicItems(mandate.id) : [],
       upstreamHandoff: mandate ? ws.store.getLatestHandoff(mandate.id) : null,
-      visionCapable: modelSupportsVision(ctx?.model),
+      visionCapable: modelSupportsVision(effectiveModel),
     });
     const existing = Array.isArray(event.systemPrompt)
       ? event.systemPrompt : event.systemPrompt ? [event.systemPrompt] : [];
@@ -333,8 +334,8 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
           if (!target) throw new Error(`Unknown delegation target role "${toTarget}".`);
           const delegated = await executeRoleStep({
             cwd: ws.cwd, store: ws.store, role: target, upstreamHandoff: envelope,
-            mandate: ws.store.getMandate(envelope.mandateId)!, toTarget: "user", runner: runnerFor(ws, ctx),
-            supervisor: supervisorFor(ws, ctx),
+            mandate: ws.store.getMandate(envelope.mandateId)!, toTarget: activeRole(ws)?.id ?? "user",
+            runner: runnerFor(ws, ctx), supervisor: supervisorFor(ws, ctx),
           });
           return toolResult({ handoff: envelope, delegated }, !delegated.ok);
         }

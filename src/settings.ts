@@ -77,19 +77,24 @@ export function normalizeModelSpec(spec: string | undefined): string | undefined
   return trimmed.startsWith("@") || !MODEL_ROLE_SET.has(trimmed) ? trimmed : `@${trimmed}`;
 }
 
+export function modelSupportsVision(model: unknown): boolean | null {
+  if (!model || typeof model !== "object" || !Array.isArray((model as { input?: unknown }).input)) return null;
+  return ((model as { input: unknown[] }).input).includes("image");
+}
+
 export function resolveModelSpec(spec: string | undefined, hostCtx: any): unknown {
   const normalized = normalizeModelSpec(spec);
   if (!normalized) return hostCtx?.model;
   const resolved = hostCtx?.models?.resolve?.(normalized) ??
     (normalized.startsWith("@") ? hostCtx?.models?.resolve?.(normalized.slice(1)) : undefined);
-  if (resolved !== undefined && resolved !== null) return resolved;
   const list: any[] = Array.isArray(hostCtx?.models?.list?.()) ? hostCtx.models.list() : [];
+  if (normalized === "@vision") {
+    if (resolved !== undefined && resolved !== null && modelSupportsVision(resolved) !== false) return resolved;
+    if (modelSupportsVision(hostCtx?.model) === true) return hostCtx.model;
+    return list.find((m) => modelSupportsVision(m) === true) ?? resolved ?? hostCtx?.model;
+  }
+  if (resolved !== undefined && resolved !== null) return resolved;
   return list.find((m) => m && (`${m.provider}/${m.id}` === normalized || m.id === normalized)) ?? hostCtx?.model;
-}
-
-export function modelSupportsVision(model: unknown): boolean | null {
-  if (!model || typeof model !== "object" || !Array.isArray((model as { input?: unknown }).input)) return null;
-  return ((model as { input: unknown[] }).input).includes("image");
 }
 
 export function resolveRoleRuntimeConfig(
