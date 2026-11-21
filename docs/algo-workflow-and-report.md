@@ -1,18 +1,18 @@
 # `algo` 实验工作目录与渐进式报告规范
 
-本文档定义内置角色 **[algo.yaml](../roles/algo.yaml)**（引导型有监督算法优化专家）与 **[vision.yaml](../roles/vision.yaml)**（`@vision` 视觉诊断专员）的微观工程契约。该规范将**物理目录隔离**与**渐进式报告门禁**作为状态机，约束 Agent 在带真值 $(X, Y)$ 的算法调优中不跳步、不覆写旧实验、不暗改评测脚本、不凭记忆编造指标。
+本文档定义内置角色 **[algo.yaml](../roles/algo.yaml)**（引导型有监督算法优化专家）与 **[vision.yaml](../roles/vision.yaml)**（`@vision` 视觉诊断专员）的工程方法论契约。该规范通过角色内规范条件化（`stance` / `method` / `exit.criteria`）配合 `require_tool_evidence: true` 真实执行取证与产物 `sha256` 快照追踪，引导 Agent 在带真值 $(X, Y)$ 的算法调优中遵循**三区工作目录约定**与**四道渐进式报告门禁**——不跳步、不覆写旧实验、不暗改评测脚本、不凭记忆编造指标。（注：若需对原始数据目录或定稿后的基准目录施加硬物理写拦截，可在项目覆盖角色 `.omp/roles/algo.yaml` 中按实际目录配置 `permissions.protected` 与 `permissions.writable`。）
 
 ---
 
 ## 1. 标准三区隔离工作目录 (`algo_work/`)
 
-所有实验脚本、切分索引、图表与报告统一收敛在项目下的 `algo_work/` 目录内，**严禁修改或污染用户的原始输入数据目录**：
+所有实验脚本、切分索引、图表与报告统一收敛在项目下的 `algo_work/` 目录内，**避免修改或污染用户的原始输入数据目录**：
 
 ```text
 algo_work/
 ├── REPORT.md                     # 【主实验报告】按四道门禁随进度实时更新（支持 Markdown 相对路径嵌图）
 ├── ledger.jsonl                  # 【机器可读总台账】每完成一个实验件追加 1 行 JSON
-├── benchmark/                    # 【1. 宪法基准区 —— 门禁 1 定稿后只读锁死】
+├── benchmark/                    # 【1. 宪法基准区 —— 门禁 1 定稿后保持不变】
 │   ├── data_profile.json         # 输入 X / 真值 Y 样本量、维度、缺失率、极值与分布统计
 │   ├── splits.json               # 防同源泄漏切分索引（Train / Val / 封存的 Holdout Test）
 │   ├── eval.py                   # 唯一法定评估入口（输出统一结构的 metrics.json）
@@ -31,14 +31,16 @@ algo_work/
     └── ...                       # 最优 Keep 实验件的推理入口与模型/参数副本
 ```
 
+长耗时训练或超参搜索无论在主会话（`/role algo`）还是隔离阶段（`/flow`、`/enhance-handoff algo`、`@algo`）中，均可直接调用 `enhance_job`（`start` / `watch`）在后台进程组中运行并自适应止损，使用 `enhance_mandate` 在认知黑板登记假设与已核验指标证据。
+
 ---
 
 ## 2. 运行时自适应看图准则 + 高可读出图铁律
 
 ### 2.1 运行时自动分流 (`RuntimeVision`)
-`omp-enhance` 在每轮自动检测当前运行模型的 `model.input` 能力并注入 `RuntimeVision` 标识：
-- **`native-multimodal`（当前模型原生支持图像输入）**：`algo` 必须**自己调用 `read` 亲眼读取**关键体检图、错例图与首尾对比图，将像素级现象直接关联回刚编写的算法逻辑；仅在大批量初筛（如数十张图）或结项独立复核时按需委托 `vision`。
-- **`text-only`（当前模型为纯文本推理/代码模型）**：直接 `read` 图像看不到像素，**必须**调用 `enhance_handoff(toTarget="vision", delegateNow=true, artifactPaths=[...])` 委托绑定了 `@vision` 的只读角色 `vision` 读取图像并返回结构化观察证据。
+当宿主模型公开了 `model.input` 模态元数据时，`omp-enhance` 自动注入 `RuntimeVision` 提示标识（对 `vision` 角色自身自动抑制自指委托提示）：
+- **`native-multimodal`（当前模型原生支持图像输入）**：`algo` 必须**自己调用 `read` 亲眼读取**关键体检图、错例图与首尾对比图，将像素级现象直接关联回刚编写的算法逻辑；仅在大批量初筛（如数十张图）或结项独立盲审时按需委托 `vision`。
+- **`text-only`（当前模型为纯文本推理/代码模型）**：直接 `read` 图像看不到像素，**必须**调用 `enhance_handoff(toTarget="vision", delegateNow=true, artifactPaths=[...])`（或交互式执行 `/enhance-handoff vision`）委托绑定了 `@vision` 的只读角色 `vision`（允许 `read`、`glob`、`find`）读取图像并返回结构化观察事实（`verifiedFacts`）。
 
 ### 2.2 诊断图绘制规范（防止 VLM 误读与乱码）
 1. **防方块乱码**：图像标题、坐标轴、图例统一使用清晰的 **英文 / ASCII 与数字**（避免跨环境缺少中文字体产生 `□□□` 乱码；面向用户的通俗中文解读写在 `REPORT.md` 与 `summary.md` 中）。

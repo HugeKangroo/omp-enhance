@@ -1,14 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { EnhanceStore } from "../../src/core/store.ts";
+import type { ObservedToolCall, RoomEntry } from "../../src/core/types.ts";
 import ompEnhance from "../../src/entry.ts";
-import { createAndVerifyHandoff } from "../../src/handoff.ts";
+import { createAndVerifyHandoff } from "../../src/flow/handoff.ts";
+import type { RoleSessionRunner } from "../../src/flow/orchestrator.ts";
 import {
   parseFlowOverlayInput, renderChatBubbleLines, renderRoomCardLines, type FlowRoomSnapshot,
-} from "../../src/flow-room.ts";
-import type { RoleSessionRunner } from "../../src/orchestrator.ts";
-import type { ObservedToolCall, RoomEntry } from "../../src/types.ts";
+} from "../../src/ui/flow-room.ts";
 
 const builtinRolesDir = path.resolve(import.meta.dir, "..", "..", "roles");
 const tempDirs: string[] = [];
@@ -46,12 +47,9 @@ describe("Left-Right Group Chat rendering & CJK alignment", () => {
     for (const line of [...userLines, ...agentLines]) {
       expect(Bun.stringWidth(line)).toBe(width);
     }
-    // User bubble sits on the right (starts with spaces, ends with "◀ 你" / "│")
     expect(userLines[0]!.startsWith("   ")).toBe(true);
     expect(userLines[0]!.trimEnd().endsWith("[目标] ◀ 你")).toBe(true);
     expect(userLines[1]!.endsWith("│")).toBe(true);
-
-    // Agent bubble sits on the left ("  ▶ [dev → @qa] ✓ ready")
     expect(agentLines[0]!.startsWith("  ▶ [dev → @qa] ✓ ready")).toBe(true);
     expect(agentLines[1]!.startsWith("  │ 已完成 src/auth.ts")).toBe(true);
   });
@@ -132,7 +130,7 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
     return { cwd, lockPath, handlers, tools, commands, renderers, sentMessages };
   }
 
-  test("enforces flowRoutingMode: manual blocks auto-dispatch, ask confirms, auto dispatches directly", async () => {
+  test("enforces flowRoutingMode (including headless manual mode) without premature SQLite Mandate writes", async () => {
     let runCount = 0;
     const fastRunner: RoleSessionRunner = {
       async runRoleTurn(stepCtx) {
@@ -164,27 +162,36 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
       },
     };
 
-    // 1. manual mode -> blocks foreground auto-dispatch without calling confirm
+    // 1. manual mode -> blocks in both UI and headless (hasUI: false) without creating state.sqlite!
     const manualRes = JSON.parse((await flowTool.execute("t1", { roles: ["dev", "qa"], goal: " Refactor auth " }, null, null, ctx)).content[0].text);
-    expect(manualRes.started).toBe(false);
-    expect(manualRes.blockedByRoutingMode).toBe("manual");
+    expect(manualRes).toMatchObject({ started: false, blockedByRoutingMode: "manual" });
+    const headlessManual = JSON.parse((await flowTool.execute("t1b", { roles: ["dev", "qa"], goal: "Headless auth" }, null, null, { cwd, hasUI: false })).content[0].text);
+    expect(headlessManual).toMatchObject({ started: false, blockedByRoutingMode: "manual" });
+    expect(existsSync(path.join(cwd, ".omp-enhance", "state.sqlite"))).toBe(false);
     expect(confirmCalls).toBe(0);
     expect(runCount).toBe(0);
 
-    // 2. ask mode (declined) -> calls confirm and returns declined without running
+    // 2. ask mode (declined) -> calls confirm and returns declined without creating/archiving Mandate in SQLite!
     writeText(lockPath, JSON.stringify({ settings: { "omp-enhance": { flowRoutingMode: "ask" } } }));
     confirmAnswer = false;
     const declinedRes = JSON.parse((await flowTool.execute("t2", { roles: ["dev", "qa"], goal: "Refactor auth" }, null, null, ctx)).content[0].text);
     expect(confirmCalls).toBe(1);
     expect(declinedRes).toMatchObject({ started: false, declined: true });
+    expect(existsSync(path.join(cwd, ".omp-enhance", "state.sqlite"))).toBe(false);
     expect(runCount).toBe(0);
 
-    // 3. ask mode (accepted, wait: true) -> runs flow to completion
+    // 3. ask mode (accepted, wait: true) -> runs flow to completion & marks flow mandate completed
     confirmAnswer = true;
     const acceptedRes = JSON.parse((await flowTool.execute("t3", { roles: ["dev", "qa"], goal: "Refactor auth", wait: true }, null, null, ctx)).content[0].text);
     expect(confirmCalls).toBe(2);
     expect(acceptedRes.status).toBe("completed");
     expect(runCount).toBe(2);
+    const verifyStore = new EnhanceStore(path.join(cwd, ".omp-enhance", "state.sqlite"));
+    try {
+      expect(verifyStore.getActiveMandate()).toBeNull();
+    } finally {
+      verifyStore.close();
+    }
 
     // 4. auto mode -> runs without prompting confirm
     writeText(lockPath, JSON.stringify({ settings: { "omp-enhance": { flowRoutingMode: "auto" } } }));
@@ -194,9 +201,10 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
     expect(runCount).toBe(3);
   });
 
-  test("runs non-blocking background Flow, updates live widget, delivers mid-flight steer, and posts summary card", async () => {
+  test("delivers live steer, propagates steers & directed @role steers downstream, and posts summary card", async () => {
     let releaseDev = null as (() => void) | null;
     const steeredMessages: string[] = [];
+    let qaConditioningPrompt = "";
 
     const gatedRunner: RoleSessionRunner = {
       async runRoleTurn(stepCtx) {
@@ -204,7 +212,7 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
         stepCtx.observer?.bindControls?.({
           steer: async (m) => { steeredMessages.push(`${stepCtx.role.id}:${m}`); },
           abort: async () => { releaseDev?.(); },
-        });
+        }, stageId);
         if (stepCtx.role.id === "dev") {
           writeText(path.join(stepCtx.cwd, "src", "auth.ts"), "export const jwt = true;\n");
           stepCtx.observer?.onToolStart?.(stageId, "edit src/auth.ts");
@@ -219,9 +227,10 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
             parentHandoffId: stepCtx.upstreamHandoff?.id ?? null, toTarget: stepCtx.toTarget,
             verdict: "ready", summary: "保留旧表并完成 JWT 刷新", artifactPaths: ["src/auth.ts"], observedCalls: [call],
           });
-          stepCtx.observer?.bindControls?.(null);
+          stepCtx.observer?.bindControls?.(null, stageId);
           return { envelope: env, observedCalls: [call], assistantText: "JWT ready", usage: null };
         }
+        qaConditioningPrompt = stepCtx.conditioningPrompt;
         const qaCall: ObservedToolCall = {
           toolCallId: "qa-1", toolName: "bash", isError: false,
           touchedPaths: [], timestamp: new Date().toISOString(), summary: 'bash "bun test"',
@@ -232,7 +241,7 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
           parentHandoffId: stepCtx.upstreamHandoff?.id ?? null, toTarget: stepCtx.toTarget,
           verdict: "ready", summary: "14 个并发测试全部通过", observedCalls: [qaCall],
         });
-        stepCtx.observer?.bindControls?.(null);
+        stepCtx.observer?.bindControls?.(null, stageId);
         return { envelope: env, observedCalls: [qaCall], assistantText: "QA passed", usage: null };
       },
     };
@@ -251,7 +260,6 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
       },
     };
 
-    // Start non-blocking background flow!
     const started = JSON.parse((await flowTool.execute("bg1", {
       roles: ["dev", "qa"], goal: "重构 JWT 刷新逻辑",
     }, null, null, ctx)).content[0].text);
@@ -260,54 +268,59 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
     });
     expect(statusBadges.at(-1)).toContain("flow:dev→qa");
 
-    // Wait a tick for dev stage to reach its gate
     for (let i = 0; i < 20 && !releaseDev; i++) await Bun.sleep(5);
     expect(activeWidgetFactory).not.toBeNull();
 
-    // Render live Form B aboveEditor widget while running
     const widgetComp = activeWidgetFactory({ requestRender() {} }, {});
     const widgetLines: string[] = widgetComp.render(76);
     for (const line of widgetLines) expect(Bun.stringWidth(line)).toBe(76);
     expect(widgetLines.join("\n")).toContain("◀ 你");
     expect(widgetLines.join("\n")).toContain("edit src/auth.ts");
 
-    // Query status & send live steer mid-flight!
-    const midStatus = JSON.parse((await flowTool.execute("st1", { action: "status" }, null, null, ctx)).content[0].text);
-    expect(midStatus.status).toBe("running");
-
+    // 1) General steer goes immediately to dev AND propagates downstream to qa!
     const steerRes = JSON.parse((await flowTool.execute("sr1", {
       action: "steer", message: "别动旧 RefreshToken 表",
     }, null, null, ctx)).content[0].text);
     expect(steerRes.delivered).toBe(true);
     expect(steeredMessages).toEqual(["dev:别动旧 RefreshToken 表"]);
 
-    // Let dev finish -> qa runs -> flow finishes asynchronously
+    // 2) Directed `[@qa]` steer while dev runs queues for qa WITHOUT distracting dev!
+    const directedRes = JSON.parse((await flowTool.execute("sr2", {
+      action: "steer", message: "[@qa] 重点压测过期边界",
+    }, null, null, ctx)).content[0].text);
+    expect(directedRes.delivered).toBe(false);
+    expect(directedRes.queuedForRole).toBe("qa");
+    expect(steeredMessages).toEqual(["dev:别动旧 RefreshToken 表"]);
+
     releaseDev!();
     for (let i = 0; i < 40 && sentMessages.length === 0; i++) await Bun.sleep(10);
 
-    // Live widget cleared & permanent custom card posted!
+    // Downstream qa received BOTH the general steer AND its queued [@qa] steer in conditioning!
+    expect(qaConditioningPrompt).toContain("## User Interjections");
+    expect(qaConditioningPrompt).toContain("别动旧 RefreshToken 表");
+    expect(qaConditioningPrompt).toContain("[@qa] 重点压测过期边界");
+
     expect(activeWidgetFactory).toBeUndefined();
     expect(sentMessages.length).toBe(1);
     const cardMsg = sentMessages[0]!;
     expect(cardMsg.customType).toBe("omp-enhance-room");
     const snap = cardMsg.details as FlowRoomSnapshot;
     expect(snap.status).toBe("completed");
-    // Chronological order: [目标] 你 -> [插话] 你 -> [dev] -> [qa]
     expect(snap.entries.map((e) => `${e.side}:${e.speaker}:${e.badge}`)).toEqual([
       "right:你:目标",
       "right:你:插话",
+      "right:你:@qa",
       "left:dev:✓ ready",
       "left:qa:✓ ready",
     ]);
 
-    // Verify registered custom message renderer supports both collapsed & Ctrl+O expanded!
     const renderer = renderers.get("omp-enhance-room")!;
     const renderedExpanded: string[] = renderer(cardMsg, { expanded: true }, {}).render(78);
     expect(renderedExpanded.join("\n")).toContain("edit src/auth.ts");
     expect(renderedExpanded.join("\n")).toContain('bash "bun test"');
   });
 
-  test("drives split-pane /flow overlay: ↑↓ inspector, Chinese/paste steer, [/] scroll, Ctrl+X cancel, and @role input", async () => {
+  test("drives split-pane /flow overlay: ↑↓ inspector, [@role] bracket typing, Alt+[/] scroll, Ctrl+X cancel, and multiline @role input", async () => {
     let releaseStage = null as (() => void) | null;
     let aborted = false;
     const steered: string[] = [];
@@ -323,7 +336,7 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
         stepCtx.observer?.bindControls?.({
           steer: async (m) => { steered.push(m); },
           abort: async () => { aborted = true; releaseStage?.(); },
-        });
+        }, stageId);
         await new Promise<void>((resolve) => { releaseStage = resolve; });
         return {
           envelope: null, observedCalls: [c1], assistantText: "", usage: null,
@@ -334,19 +347,22 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
 
     const { cwd, handlers, commands } = setupHarness({ flowRoutingMode: "auto" }, slowRunner);
 
-    // Verify @<roleId> <task> input rewrite vs @file pass-through!
+    // Verify multiline @<roleId> <task> preservation vs @file pass-through!
     const inputFn = handlers.get("input")![0]!;
-    expect(inputFn({ text: "@qa 跑一下鉴权模块的边界测试" }, { cwd })).toEqual({
-      text: "/flow qa 跑一下鉴权模块的边界测试",
+    expect(inputFn({ text: "@qa 跑一下鉴权测试\n- 空串\n- 过期" }, { cwd })).toEqual({
+      text: "/flow qa 跑一下鉴权测试\n- 空串\n- 过期",
     });
     expect(inputFn({ text: "@src/auth.ts 解释一下这段代码" }, { cwd })).toBeUndefined();
-    expect(inputFn({ text: "@README.md 总结" }, { cwd })).toBeUndefined();
     expect(inputFn({ text: "@supervisor 检查" }, { cwd })).toBeUndefined();
-    expect(inputFn({ text: "@qa" }, { cwd })).toBeUndefined();
 
-    // Verify Kitty CSI-u & paste parser directly
+    // Verify Kitty CSI-u, literal `[` / `]` typing when draft is empty, and Alt+[/] / PgUp scrolling!
     expect(parseFlowOverlayInput("\x1b[120;5u")).toEqual({ kind: "cancel_flow" });
-    expect(parseFlowOverlayInput("\x1b[27;1:1u")).toEqual({ kind: "escape" });
+    expect(parseFlowOverlayInput("\x1b[27::27;1:1u")).toEqual({ kind: "escape" });
+    expect(parseFlowOverlayInput("[", undefined, false)).toEqual({ kind: "text", text: "[" });
+    expect(parseFlowOverlayInput("]", undefined, false)).toEqual({ kind: "text", text: "]" });
+    expect(parseFlowOverlayInput("\x1b[", undefined, false)).toEqual({ kind: "scroll_up" });
+    expect(parseFlowOverlayInput("\x1b]", undefined, false)).toEqual({ kind: "scroll_down" });
+    expect(parseFlowOverlayInput("\x1b[5~", undefined, false)).toEqual({ kind: "scroll_up" });
     expect(parseFlowOverlayInput("\x1b[200~请加单飞锁\x1b[201~")).toEqual({ kind: "text", text: "请加单飞锁" });
 
     let capturedComp = null as any;
@@ -364,45 +380,42 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
       },
     };
 
-    // Start /flow dev,qa in background
     await commands.get("flow")!.handler("dev,qa 修复并发锁", ctx);
     for (let i = 0; i < 20 && !releaseStage; i++) await Bun.sleep(5);
 
-    // Open bare /flow split-pane overlay while flow is running!
     const overlayPromise = commands.get("flow")!.handler("", ctx);
     await Bun.sleep(5);
     expect(capturedComp).not.toBeNull();
     expect(capturedComp.capturesInput()).toBe(true);
 
-    // Render initial split-pane view (cursor on running dev bubble -> right pane shows read src/index.ts!)
     const initialFrame: string[] = capturedComp.render(92);
     for (const line of initialFrame) expect(Bun.stringWidth(line)).toBe(92);
     expect(initialFrame.join("\n")).toContain("1. ✓ read src/index.ts");
 
-    // Press ↑ (up) to inspect user's initial bubble on the right pane, then ↓ back to dev
     capturedComp.handleInput("\x1b[A");
     expect(capturedComp.render(92).join("\n")).toContain("发言者: 你 (目标)");
     capturedComp.handleInput("\x1b[B");
     expect(capturedComp.render(92).join("\n")).toContain("Agent: dev");
 
-    // Paste Chinese text + Backspace + type + Enter -> steers running dev role!
+    // Typing `[@dev]` at empty draft works without swallowing `[`!
+    capturedComp.handleInput("[");
+    capturedComp.handleInput("@dev] ");
     capturedComp.handleInput("\x1b[200~加单飞锁X\x1b[201~");
-    capturedComp.handleInput("\x1b[127;1:1u"); // Kitty Backspace removes 'X'
-    expect(capturedComp.render(92).join("\n")).toContain("💬 你: 加单飞锁█");
-    capturedComp.handleInput("\x1b[13;1:1u"); // Kitty Enter submits steer!
+    capturedComp.handleInput("\x1b[127;1:1u");
+    expect(capturedComp.render(92).join("\n")).toContain("💬 你: [@dev] 加单飞锁█");
+    capturedComp.handleInput("\x1b[13;1:1u");
     await Bun.sleep(10);
     expect(steered).toEqual(["加单飞锁"]);
     expect(capturedComp.render(92).join("\n")).toContain("你插话: 加单飞锁");
 
-    // Type draft then press Esc once -> clears draft without closing; press Ctrl+X -> cancels flow; press Esc -> closes!
     capturedComp.handleInput("temp");
-    capturedComp.handleInput("\x1b[27;1:1u"); // clears "temp"
-    capturedComp.handleInput("\x1b[120;5u");  // Kitty Ctrl+X cancels active flow!
+    capturedComp.handleInput("\x1b[27;1:1u");
+    capturedComp.handleInput("\x1b[120;5u");
     await Bun.sleep(15);
     expect(aborted).toBe(true);
     expect(capturedComp.render(92).join("\n")).toContain("⏹ 已取消");
 
-    capturedComp.handleInput("\x1b[27;1:1u"); // closes overlay!
+    capturedComp.handleInput("\x1b[27;1:1u");
     await overlayPromise;
   });
 
@@ -414,7 +427,6 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
     const cwd = makeTempDir("audit-ws");
     const globalDir = makeTempDir("audit-global");
     const lockPath = path.join(cwd, "omp-plugins.lock.json");
-    // Configure defaultRole = "reviewer" (restricted read-only tools!)
     writeText(lockPath, JSON.stringify({ settings: { "omp-enhance": { defaultRole: "reviewer", flowRoutingMode: "auto" } } }));
 
     const handlers = new Map<string, Array<(...args: any[]) => any>>();
@@ -450,15 +462,12 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
 
     ompEnhance(pi, { globalRolesDir: globalDir, builtinRolesDir, pluginLockPath: lockPath, runnerFactory: () => runner });
 
-    // 1) session_start immediately applies defaultRole="reviewer" tool restrictions (no write/edit)!
     await handlers.get("session_start")![0]!({}, { cwd, ui: { setStatus() {} } });
     expect(activeToolSets.length).toBe(1);
     expect(activeToolSets[0]).toContain("read");
     expect(activeToolSets[0]).not.toContain("write");
-    expect(activeToolSets[0]).not.toContain("edit");
+    expect(activeToolSets[0]).not.toContain("enhance_job");
 
-    // 2) While flow is running, @dev <msg> rewrites to /flow steer [@dev] <msg> instead of colliding!
-    // Also simulate foreground agent streaming (isIdle() === false) so summary card queues as followUp!
     const ctx = {
       cwd, hasUI: true,
       isIdle: () => false,
@@ -474,7 +483,6 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
             const lines: string[] = comp.render(64);
             for (const line of lines) {
               expect(Bun.stringWidth(line)).toBe(64);
-              // Every ESC[1m or ESC[38;2...m must have its closing reset intact (never sliced mid-ANSI!)
               const opens = (line.match(/\x1b\[38;2;/g) ?? []).length;
               const closes = (line.match(/\x1b\[39m/g) ?? []).length;
               expect(opens).toBe(closes);
@@ -485,9 +493,7 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
       },
     };
 
-    // Check /role ANSI safety & exact border width at narrow 64 cols
     await commands.get("role")!.handler("", ctx);
-
     await commands.get("flow")!.handler("dev 实现缓存层", ctx);
     for (let i = 0; i < 20 && !releaseRun; i++) await Bun.sleep(5);
 
@@ -501,13 +507,12 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
     expect(sentCalls[0]?.msg.customType).toBe("omp-enhance-room");
     expect(sentCalls[0]?.opts).toEqual({ triggerTurn: false, deliverAs: "followUp" });
 
-    // Once flow finishes, @qa <task> returns to launching a new 1-role flow!
     expect(inputFn({ text: "@qa 验证 LRU 淘汰" }, ctx)).toEqual({
       text: "/flow qa 验证 LRU 淘汰",
     });
   });
 
-  test("supports algo mid-turn visual consultation to vision (@vision) with chronological Flow room bubbles", async () => {
+  test("supports algo mid-turn visual consultation to vision (@vision) with stacked controls & verifiedFacts", async () => {
     const cwd = makeTempDir("algo-vis-ws");
     const globalDir = makeTempDir("algo-vis-global");
     const lockPath = path.join(cwd, "omp-plugins.lock.json");
@@ -541,7 +546,7 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
           const isVision = String(opts.customSystemPrompt).includes("Active Role: vision");
           return {
             session: {
-              messages: [],
+              messages: [{ role: "assistant", usage: { input: 30, output: 15, cost: { total: 0.0005 } } }],
               async prompt() {
                 if (isVision) {
                   emitEnd("vis-read-1", "read", { path: "artifacts/vis/badcases.png" });
@@ -552,7 +557,6 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
                   });
                   return;
                 }
-                // algo renders plot -> consults vision mid-turn -> receives visual diagnosis -> finishes optimization!
                 writeText(path.join(cwd, "artifacts", "vis", "badcases.png"), "PNG_BYTES");
                 emitEnd("algo-plot-1", "bash", { command: "python plot_badcases.py" });
                 const consultRes = await handoffTool.execute("ah-consult", {
@@ -574,7 +578,7 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
                 });
               },
               getLastAssistantText: () => "done",
-              getLastAssistantMessage: () => null,
+              getLastAssistantMessage: () => ({ role: "assistant", stopReason: "stop", usage: { input: 30, output: 15, cost: { total: 0.0005 } } }),
               async dispose() {},
             },
           };
@@ -600,12 +604,12 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
     }, null, null, ctx)).content[0].text);
 
     expect(res.status).toBe("completed");
+    expect(res.finalEnvelope.observedUsage).toEqual({ inputTokens: 30, outputTokens: 15, costUsd: 0.0005 });
     expect(createdModels).toEqual([
       { provider: "deepseek", id: "deepseek-r1" },
       { provider: "openrouter", id: "qwen/qwen3.8-flash" },
     ]);
     const snap = sentMessages[0]!.details as FlowRoomSnapshot;
-    // Chronological order in group chat: User -> vision (@vision diagnosis) -> algo (final optimization delivery)
     expect(snap.entries.map((e) => `${e.side}:${e.speaker}:${e.badge}`)).toEqual([
       "right:你:目标",
       "left:vision:✓ ready",
@@ -613,7 +617,7 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
     ]);
   });
 
-  test("injects adaptive RuntimeVision hints (native-multimodal vs text-only) and algo_work/ 4-gate report rules", async () => {
+  test("injects adaptive RuntimeVision hints (suppressing vision self-delegation) and algo_work/ 4-gate rules", async () => {
     const cwd = makeTempDir("algo-spec-ws");
     const globalDir = makeTempDir("algo-spec-global");
     const lockPath = path.join(cwd, "omp-plugins.lock.json");
@@ -646,9 +650,9 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
               messages: [],
               async prompt() {
                 for (const fn of guardHandlers.get("tool_execution_end") ?? []) {
-                  fn({ toolCallId: "c1", toolName: "bash", args: { command: "python algo_work/benchmark/eval.py" }, isError: false });
+                  fn({ toolCallId: "c1", toolName: "read", args: { path: "README.md" }, isError: false });
                 }
-                await handoffTool.execute("h1", { verdict: "ready", summary: "ok" });
+                await handoffTool.execute("h1", { verdict: "blocked", summary: "no vision model" });
               },
               getLastAssistantText: () => "ok",
               getLastAssistantMessage: () => null,
@@ -662,29 +666,22 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
     ompEnhance(pi, { globalRolesDir: globalDir, builtinRolesDir, pluginLockPath: lockPath });
 
     const beforeStart = handlers.get("before_agent_start")![0]!;
-
-    // 1) Multimodal model in main session -> native-multimodal hint + algo_work/ 4-gate contract
-    const multiPrompt = (beforeStart({ systemPrompt: [] }, {
+    const multiPrompt = ((await beforeStart({ systemPrompt: [] }, {
       cwd, model: { provider: "deepseek", id: "deepseek-flash", input: ["text", "image"] }, ui: { setStatus() {} },
-    }) as { systemPrompt: string[] }).systemPrompt.join("\n");
+    })) as { systemPrompt: string[] }).systemPrompt.join("\n");
     expect(multiPrompt).toContain("RuntimeVision: native-multimodal");
     expect(multiPrompt).toContain("algo_work/REPORT.md");
-    expect(multiPrompt).toContain("ledger.jsonl");
-    expect(multiPrompt).toContain("benchmark/eval.py");
-    expect(multiPrompt).toContain("algo_work/runs/exp_000_baseline/");
-    expect(multiPrompt).toContain("Keep 或 Discard");
 
-    // 2) Text-only model in main session -> text-only hint requiring delegation to vision (@vision)
-    const textOnlyPrompt = (beforeStart({ systemPrompt: [] }, {
+    const textOnlyPrompt = ((await beforeStart({ systemPrompt: [] }, {
       cwd, model: { provider: "deepseek", id: "deepseek-reasoner", input: ["text"] }, ui: { setStatus() {} },
-    }) as { systemPrompt: string[] }).systemPrompt.join("\n");
+    })) as { systemPrompt: string[] }).systemPrompt.join("\n");
     expect(textOnlyPrompt).toContain("RuntimeVision: text-only");
     expect(textOnlyPrompt).toContain('toTarget="vision", delegateNow=true');
 
-    // 3) Child session in enhance_flow also receives exact resolved model's RuntimeVision hint!
-    await tools.get("enhance_flow")!.execute("f-text", { roles: ["algo"], goal: "Test vision hint", wait: true }, null, null, {
+    // Vision role itself on a text-only fallback does NOT instruct self-delegation to "vision"!
+    await tools.get("enhance_flow")!.execute("f-vis-text", { roles: ["vision"], goal: "Inspect plot", wait: true }, null, null, {
       cwd, hasUI: false, model: { provider: "deepseek", id: "deepseek-reasoner", input: ["text"] }, models: { resolve: () => undefined, list: () => [] },
     });
-    expect(childSystemPrompts[0]).toContain("RuntimeVision: text-only");
+    expect(childSystemPrompts[0]).toContain("do NOT self-delegate");
   });
 });

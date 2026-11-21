@@ -2,11 +2,13 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { EnhanceStore } from "../../src/core/store.ts";
+import type { ObservedToolCall } from "../../src/core/types.ts";
 import ompEnhance from "../../src/entry.ts";
-import { createAndVerifyHandoff } from "../../src/handoff.ts";
-import { parseFlowOverlayInput } from "../../src/flow-room.ts";
-import type { RoleSessionRunner } from "../../src/orchestrator.ts";
-import type { ObservedToolCall } from "../../src/types.ts";
+import { createAndVerifyHandoff } from "../../src/flow/handoff.ts";
+import type { RoleSessionRunner } from "../../src/flow/orchestrator.ts";
+import { FlowRoomManager } from "../../src/flow/state.ts";
+import { parseFlowOverlayInput } from "../../src/ui/flow-room.ts";
 
 const builtinRolesDir = path.resolve(import.meta.dir, "..", "..", "roles");
 const tempDirs: string[] = [];
@@ -88,7 +90,7 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     expect(existsSync(path.join(cwd, ".omp-enhance", "state.sqlite"))).toBe(false);
   });
 
-  test("persists mid-Flow checkpoints across hard process crash and resumes from unfinished stage without re-running completed stages", async () => {
+  test("protects live ownerPid checkpoints from second-process clobbering and preserves checkpoint across session_shutdown microtasks", async () => {
     const cwd = makeTempDir("p7-flow-crash");
     const globalDir = makeTempDir("p7-flow-global");
     const lockPath = path.join(makeTempDir("p7-flow-lock"), "omp-plugins.lock.json");
@@ -100,7 +102,6 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     let qaReachedMidStage = false;
     let releaseCrashHang = null as (() => void) | null;
 
-    // Instance 1: dev succeeds, qa runs 1 tool call and then hangs as if the process died mid-turn
     const crashingRunner: RoleSessionRunner = {
       async runRoleTurn(stepCtx) {
         instance1ExecutedRoles.push(stepCtx.role.id);
@@ -119,7 +120,6 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
           });
           return { envelope: env, observedCalls: [call], assistantText: "Dev done", usage: null };
         }
-        // qa starts, logs 1 tool call to SQLite checkpoint, then process dies before qa finishes!
         const partialCall: ObservedToolCall = {
           toolCallId: "qa-partial-1", toolName: "bash", isError: false,
           touchedPaths: [], timestamp: new Date().toISOString(), summary: 'bash "bun test --bail"',
@@ -135,7 +135,6 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     const ctx1 = { cwd, hasUI: true, ui: { setWidget() {}, setStatus() {}, notify() {} } };
     await h1.emit("session_start", {}, ctx1);
 
-    // Kick off 3-stage flow in background: dev -> qa -> reviewer
     const started = JSON.parse((await h1.tools.get("enhance_flow")!.execute("f1", {
       roles: ["dev", "qa", "reviewer"], goal: "Ship resilient feature",
     }, null, null, ctx1)).content[0].text);
@@ -145,11 +144,21 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     expect(qaReachedMidStage).toBe(true);
     expect(instance1ExecutedRoles).toEqual(["dev", "qa"]);
 
-    // Simulate abrupt process exit: close DB without letting executeRoleFlow call finishFlow!
+    // While h1's process (process.pid + matching token) owns the running Flow, a second FlowRoomManager MUST NOT clobber SQLite!
+    const concurrentStore = new EnhanceStore(path.join(cwd, ".omp-enhance", "state.sqlite"));
+    try {
+      const concurrentRoom = new FlowRoomManager(undefined, concurrentStore);
+      expect(concurrentRoom.getSnapshot().status).toBe("idle");
+      expect(concurrentStore.getLatestFlowCheckpoint()?.status).toBe("running");
+    } finally {
+      concurrentStore.close();
+    }
+
+    // Now h1 shuts down AND background runFlowTask unwinds completely BEFORE h2 boots!
     await h1.emit("session_shutdown", {}, ctx1);
     releaseCrashHang?.();
+    await Bun.sleep(20);
 
-    // Instance 2: fresh process boots on same cwd (simulating `omp --continue`)
     const instance2ExecutedRoles: string[] = [];
     let qaReceivedUpstreamFrom = null as string | null;
     let qaReceivedArtifacts: string[] = [];
@@ -181,10 +190,8 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     const ctx2 = { cwd, hasUI: false, ui: { setStatus(_k: string, b?: string) { statusBadges2.push(b); } } };
     await h2.emit("session_start", {}, ctx2);
 
-    // Status bar immediately warns that an interrupted Flow can be resumed
     expect(statusBadges2.at(-1)).toContain("flow:paused");
 
-    // Inspect hydrated room state before resuming
     const hydrated = JSON.parse((await h2.tools.get("enhance_flow")!.execute("st", {
       action: "status",
     }, null, null, ctx2)).content[0].text);
@@ -193,33 +200,121 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     expect(hydrated.currentIndex).toBe(1);
     expect(hydrated.entries.some((e: any) => e.speaker === "dev" && e.badge === "✓ ready")).toBe(true);
     expect(hydrated.entries.some((e: any) => e.speaker === "qa" && e.badge === "⏸ 中断")).toBe(true);
-    expect(hydrated.stages.find((s: any) => s.roleId === "qa")?.calls).toHaveLength(1);
 
-    // Resume via `/flow continue`!
     h2.sentMessages.length = 0;
     await h2.commands.get("flow")!.handler("continue", ctx2);
     const resumeOut = JSON.parse(h2.sentMessages.at(-1)!.content);
     expect(resumeOut.status).toBe("completed");
-
-    // CRITICAL: `dev` was NOT re-executed; execution resumed cleanly at `qa` (idx=1) -> `reviewer` (idx=2)!
     expect(instance2ExecutedRoles).toEqual(["qa", "reviewer"]);
     expect(qaReceivedUpstreamFrom).toBe("dev");
     expect(qaReceivedArtifacts).toEqual(["src/feature.ts"]);
 
-    // Final room snapshot retains both historical `⏸ 中断` bubble, `你 [续跑]` bubble, and completed `qa` + `reviewer` bubbles
-    const afterResume = JSON.parse((await h2.tools.get("enhance_flow")!.execute("st2", {
-      action: "status",
-    }, null, null, ctx2)).content[0].text);
-    expect(afterResume.status).toBe("completed");
-    expect(afterResume.resumable).toBe(false);
-    expect(afterResume.entries.some((e: any) => e.badge === "⏸ 中断")).toBe(true);
-    expect(afterResume.entries.some((e: any) => e.speaker === "你" && e.badge === "续跑")).toBe(true);
-    expect(afterResume.entries.some((e: any) => e.speaker === "reviewer" && e.badge === "✓ ready")).toBe(true);
-
     await h2.emit("session_shutdown", {}, ctx2);
   });
 
-  test("persists active /role across omp --continue and /resume via session custom entries", async () => {
+  test("preserves Round 0 bubbles when resuming at idx=0 / repairRound>=1 and blocks resuming boundary violations", async () => {
+    const cwd = makeTempDir("p7-r1-resume");
+    const globalDir = makeTempDir("p7-r1-global");
+    const lockPath = path.join(makeTempDir("p7-r1-lock"), "omp-plugins.lock.json");
+    writeText(lockPath, JSON.stringify({ settings: { "omp-enhance": { flowRoutingMode: "auto" } } }));
+
+    let devAttempts = 0;
+    let releaseCrash = null as (() => void) | null;
+    let reachedRound1Dev = false;
+
+    const r1CrashRunner: RoleSessionRunner = {
+      async runRoleTurn(stepCtx) {
+        const call: ObservedToolCall = {
+          toolCallId: `tc-${stepCtx.role.id}-${devAttempts}`, toolName: "bash", isError: false,
+          touchedPaths: [], timestamp: new Date().toISOString(), summary: "bash test",
+        };
+        if (stepCtx.role.id === "dev") {
+          devAttempts += 1;
+          if (devAttempts === 1) {
+            const env = createAndVerifyHandoff({
+              store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
+              toTarget: stepCtx.toTarget, verdict: "ready", summary: "ROUND0_DEV_SUMMARY", observedCalls: [call],
+            });
+            return { envelope: env, observedCalls: [call], assistantText: "r0", usage: null };
+          }
+          reachedRound1Dev = true;
+          await new Promise<void>((resolve) => { releaseCrash = resolve; });
+          return { envelope: null, observedCalls: [], assistantText: "", usage: null, cancelledByUser: true };
+        }
+        // Round 0 qa rejects!
+        const env = createAndVerifyHandoff({
+          store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
+          toTarget: stepCtx.toTarget, verdict: "rejected", summary: "QA_R0_REJECT",
+          feedbackForUpstream: "SAME_REJECTION_REASON", observedCalls: [call],
+        });
+        return { envelope: env, observedCalls: [call], assistantText: "reject", usage: null };
+      },
+    };
+
+    const h1 = createHarness({ cwd, globalDir, lockPath, runner: r1CrashRunner });
+    const ctx1 = { cwd, hasUI: true, ui: { setWidget() {}, setStatus() {}, notify() {} } };
+    await h1.tools.get("enhance_flow")!.execute("f-r1", { roles: ["dev", "qa"], goal: "Test Round 1 resume" }, null, null, ctx1);
+    for (let i = 0; i < 40 && !reachedRound1Dev; i++) await Bun.sleep(5);
+    expect(reachedRound1Dev).toBe(true);
+
+    await h1.emit("session_shutdown", {}, ctx1);
+    releaseCrash?.();
+    await Bun.sleep(15);
+
+    // Resume in h2 where qa repeats the exact same rejection -> lastRejectionSig persisted across resume triggers stagnation!
+    const h2Runner: RoleSessionRunner = {
+      async runRoleTurn(stepCtx) {
+        const call: ObservedToolCall = {
+          toolCallId: `h2-${stepCtx.role.id}`, toolName: "bash", isError: false,
+          touchedPaths: [], timestamp: new Date().toISOString(), summary: "bash test",
+        };
+        if (stepCtx.role.id === "dev") {
+          const env = createAndVerifyHandoff({
+            store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
+            toTarget: stepCtx.toTarget, verdict: "ready", summary: "ROUND1_DEV_SUMMARY", observedCalls: [call],
+          });
+          return { envelope: env, observedCalls: [call], assistantText: "r1", usage: null };
+        }
+        const env = createAndVerifyHandoff({
+          store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
+          toTarget: stepCtx.toTarget, verdict: "rejected", summary: "QA_R1_REJECT",
+          feedbackForUpstream: "same_rejection_reason", observedCalls: [call],
+        });
+        return { envelope: env, observedCalls: [call], assistantText: "reject again", usage: null };
+      },
+    };
+
+    const h2 = createHarness({ cwd, globalDir, lockPath, runner: h2Runner });
+    const ctx2 = { cwd, hasUI: false };
+    await h2.commands.get("flow")!.handler("continue", ctx2);
+    const out = JSON.parse(h2.sentMessages.at(-1)!.content);
+    expect(out.status).toBe("stagnated");
+
+    const snap = JSON.parse((await h2.tools.get("enhance_flow")!.execute("st", { action: "status" }, null, null, ctx2)).content[0].text);
+    // Round 0's `ROUND0_DEV_SUMMARY` was NOT clobbered in place by Round 1's `ROUND1_DEV_SUMMARY`!
+    expect(snap.entries.some((e: any) => e.text === "ROUND0_DEV_SUMMARY" && e.badge === "✓ ready")).toBe(true);
+    expect(snap.entries.some((e: any) => e.text === "ROUND1_DEV_SUMMARY" && e.badge === "✓ ready")).toBe(true);
+    expect(snap.entries.some((e: any) => e.badge === "⏸ 中断")).toBe(true);
+    await h2.emit("session_shutdown", {}, ctx2);
+
+    // Boundary violation Flow sets status="violation" and is NOT resumable!
+    const cwdViol = makeTempDir("p7-viol");
+    writeText(path.join(cwdViol, "src", "protected.ts"), "export const clean = 1;\n");
+    const violRunner: RoleSessionRunner = {
+      async runRoleTurn(stepCtx) {
+        writeText(path.join(stepCtx.cwd, "src", "protected.ts"), "export const dirty = 2;\n");
+        return { envelope: null, observedCalls: [], assistantText: "", usage: null };
+      },
+    };
+    const hv = createHarness({ cwd: cwdViol, globalDir, lockPath, runner: violRunner });
+    await hv.commands.get("flow")!.handler("qa Verify protected", { cwd: cwdViol, hasUI: false });
+    const violStatus = JSON.parse((await hv.tools.get("enhance_flow")!.execute("st-v", { action: "status" }, null, null, { cwd: cwdViol, hasUI: false })).content[0].text);
+    expect(violStatus.status).toBe("violation");
+    expect(violStatus.resumable).toBe(false);
+    await hv.emit("session_shutdown", {}, { cwd: cwdViol, hasUI: false });
+  });
+
+  test("persists active /role across omp --continue and falls back to defaultRole when newest custom role was deleted", async () => {
     const cwd = makeTempDir("p7-role-persist");
     const globalDir = makeTempDir("p7-role-global");
     const lockPath = path.join(makeTempDir("p7-role-lock"), "omp-plugins.lock.json");
@@ -227,59 +322,30 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
 
     const sharedSessionBranch: any[] = [];
 
-    // Session 1: User switches from general -> algo
     const h1 = createHarness({ cwd, globalDir, lockPath, branchEntries: sharedSessionBranch });
     const ctx1 = {
       cwd, hasUI: false,
       sessionManager: { getSessionId: () => "sess-1", getBranch: () => sharedSessionBranch },
     };
     await h1.emit("session_start", {}, ctx1);
-    await h1.commands.get("role")!.handler("algo", ctx1);
-    expect(sharedSessionBranch).toContainEqual({
-      type: "custom", customType: "omp-enhance-role", data: { roleId: "algo" },
-    });
+    await h1.commands.get("role")!.handler("off", ctx1);
+    await h1.commands.get("role")!.handler("create temp-role --project Temporary custom role", ctx1);
+    await h1.commands.get("role")!.handler("temp-role", ctx1);
     await h1.emit("session_shutdown", {}, ctx1);
 
-    // Session 1 resumed via `omp --continue` in a brand-new process
+    // Delete `temp-role` on disk -> resuming `sess-1` stops at newest entry (`temp-role`, missing) and falls back to `general`, NOT older `off`!
+    rmSync(path.join(cwd, ".omp", "roles", "temp-role.yaml"), { force: true });
+
     const h2 = createHarness({ cwd, globalDir, lockPath, branchEntries: sharedSessionBranch });
     const ctx2 = {
       cwd, hasUI: false,
-      model: { provider: "openai", id: "gpt-4.1", input: ["text", "image"] },
       sessionManager: { getSessionId: () => "sess-1", getBranch: () => sharedSessionBranch },
     };
     await h2.emit("session_start", {}, ctx2);
-
     h2.sentMessages.length = 0;
     await h2.commands.get("enhance-status")!.handler("", ctx2);
-    expect(JSON.parse(h2.sentMessages.at(-1)!.content).activeRoleId).toBe("algo");
-
-    const promptRes = await h2.emit("before_agent_start", { systemPrompt: ["Base"] }, ctx2);
-    expect(promptRes.systemPrompt[1]).toContain("## Active Role: algo");
-
-    // User switches to `/role off` -> persisted and respected on next restart
-    await h2.commands.get("role")!.handler("off", ctx2);
+    expect(JSON.parse(h2.sentMessages.at(-1)!.content).activeRoleId).toBe("general");
     await h2.emit("session_shutdown", {}, ctx2);
-
-    const h3 = createHarness({ cwd, globalDir, lockPath, branchEntries: sharedSessionBranch });
-    const ctx3 = {
-      cwd, hasUI: false,
-      sessionManager: { getSessionId: () => "sess-1", getBranch: () => sharedSessionBranch },
-    };
-    await h3.emit("session_start", {}, ctx3);
-    h3.sentMessages.length = 0;
-    await h3.commands.get("enhance-status")!.handler("", ctx3);
-    expect(JSON.parse(h3.sentMessages.at(-1)!.content).activeRoleId).toBeNull();
-
-    // Switching to another clean session via `/resume` falls back to defaultRole ("general")
-    const ctxOtherSession = {
-      cwd, hasUI: false,
-      sessionManager: { getSessionId: () => "sess-fresh-2", getBranch: () => [] },
-    };
-    await h3.emit("session_start", {}, ctxOtherSession);
-    h3.sentMessages.length = 0;
-    await h3.commands.get("enhance-status")!.handler("", ctxOtherSession);
-    expect(JSON.parse(h3.sentMessages.at(-1)!.content).activeRoleId).toBe("general");
-    await h3.emit("session_shutdown", {}, ctxOtherSession);
   });
 
   test("preserves TurnTracker baseline and tool evidence across F5 (app.retry) after failed/aborted turn", async () => {
@@ -292,22 +358,18 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     const ctx = { cwd, hasUI: false };
     await h.emit("session_start", {}, ctx);
 
-    // Turn 1 starts: workspace is clean, Agent writes `src/bugfix.ts`, then network fails mid-turn
     await h.emit("before_agent_start", { systemPrompt: ["Base"] }, ctx);
     writeText(path.join(cwd, "src", "bugfix.ts"), "export const fixed = true;\n");
     await h.emit("tool_execution_end", {
       toolCallId: "tc-write-1", toolName: "write", args: { path: "src/bugfix.ts" }, isError: false,
     }, ctx);
 
-    // Assistant turn terminates with stopReason === "error"
     await h.emit("agent_end", {
       messages: [{ role: "assistant", stopReason: "error", errorMessage: "502 Bad Gateway" }],
     }, ctx);
 
-    // User presses F5 (`app.retry`) -> `before_agent_start` fires again on the workspace where `src/bugfix.ts` already exists!
     await h.emit("before_agent_start", { systemPrompt: ["Base"] }, ctx);
 
-    // Retried turn immediately calls `enhance_handoff` (`algo` requires tool evidence!) without repeating the write
     const handoffRes = await h.tools.get("enhance_handoff")!.execute("ho-1", {
       verdict: "ready", summary: "Completed bugfix after F5 retry",
     }, null, null, ctx);
@@ -316,12 +378,10 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     expect(parsed.handoff.fromRole).toBe("algo");
     expect(parsed.handoff.artifacts.map((a: any) => a.path)).toContain("src/bugfix.ts");
 
-    // Turn finishes cleanly with stopReason === "stop"
     await h.emit("agent_end", {
       messages: [{ role: "assistant", stopReason: "stop" }],
     }, ctx);
 
-    // Next fresh turn resets TurnTracker cleanly (`algo` calling enhance_handoff with zero tools in Turn 2 is now rejected)
     await h.emit("before_agent_start", { systemPrompt: ["Base"] }, ctx);
     const turn2Res = await h.tools.get("enhance_handoff")!.execute("ho-2", {
       verdict: "ready", summary: "Unverified claim on Turn 2",

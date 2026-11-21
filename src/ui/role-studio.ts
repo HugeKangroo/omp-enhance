@@ -1,13 +1,16 @@
 import path from "node:path";
-import { writeFileSync } from "node:fs";
-import type { EnhanceSettings, RoleSpec, RoleThinkingLevel } from "./types.ts";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import type { EnhanceSettings, RoleSpec, RoleThinkingLevel } from "../core/types.ts";
+import { splitBraceSafeGlobs } from "../core/fs.ts";
+import { COMPANION_TOOL_NAMES, READONLY_SUBAGENTS } from "../core/policy.ts";
+import { DEFAULT_ENHANCE_SETTINGS } from "../core/settings.ts";
 import {
   cloneRoleSpec, deleteCustomRole, hasBuiltinRole, parseRoleYaml, resetRoleOverride,
   ROLE_THINKING_LEVELS, saveRoleSpec, scaffoldRoleFile, serializeRoleYaml,
-} from "./role-loader.ts";
-import { COMPANION_TOOL_NAMES, READONLY_SUBAGENTS } from "./session-tracker.ts";
-import { DEFAULT_ENHANCE_SETTINGS } from "./settings.ts";
-import { padLeftCell as padCell } from "./flow-room.ts";
+} from "../roles/loader.ts";
+import { computeScrollWindow, padLeftCell as padCell, parseOverlayKey } from "./kit.ts";
+
+export { parseOverlayKey };
 
 export interface RoleStudioDeps {
   cwd: string; globalRolesDir: string; builtinRolesDir?: string; pi: any; ctx: any;
@@ -18,54 +21,16 @@ export interface RoleStudioDeps {
 }
 
 const PINNED_MODELS = ["inherit", "@vision", "@advisor", "@default", "@smol", "@slow", "@plan", "@task"];
+const FALLBACK_TOOLS = ["read", "grep", "glob", "find", "lsp", "edit", "write", "apply_patch", "bash", "task", "wait"];
 const targetDirFor = (deps: RoleStudioDeps, scope: "global" | "project"): string =>
   scope === "project" ? path.join(deps.cwd, ".omp", "roles") : deps.globalRolesDir;
 
-/** Normalize raw ANSI & Kitty keyboard protocol (CSI-u) input sequences. */
-export function parseOverlayKey(data: string, kb?: any): string | null {
-  if (!data || data.startsWith("\x1b[<")) return null;
-  if (/^\x1b\[[0-9;:]*:3[u~A-Z]$/.test(data)) return null;
-  if (kb?.matches?.(data, "tui.select.cancel") || kb?.matches?.(data, "app.interrupt")) return "escape";
-  if (kb?.matches?.(data, "tui.select.up") || kb?.matches?.(data, "tui.editor.cursorUp")) return "up";
-  if (kb?.matches?.(data, "tui.select.down") || kb?.matches?.(data, "tui.editor.cursorDown")) return "down";
-  if (kb?.matches?.(data, "tui.editor.cursorRight")) return "right";
-  if (kb?.matches?.(data, "tui.editor.cursorLeft")) return "left";
-  if (kb?.matches?.(data, "tui.select.confirm") || kb?.matches?.(data, "tui.input.submit")) return "enter";
-  if (kb?.matches?.(data, "tui.input.tab")) return "tab";
-
-  const kitty = /^\x1b\[(\d+)(?::(\d+))?(?:;(\d+)(?::(\d+))?)?u$/.exec(data);
-  if (kitty) {
-    if (kitty[4] === "3") return null;
-    const cp = Number(kitty[1]), shiftedCp = kitty[2] ? Number(kitty[2]) : undefined;
-    const mod = kitty[3] ? Number(kitty[3]) - 1 : 0;
-    if (cp === 27 || ((mod & 4) !== 0 && cp === 99)) return "escape";
-    if (cp === 13 || cp === 10) return "enter";
-    if (cp === 9) return "tab";
-    if (cp === 127 || cp === 8) return "backspace";
-    if (cp === 32 && (mod & ~1) === 0) return "space";
-    if ((mod & ~1) === 0 && cp >= 33 && cp <= 126) {
-      if ((mod & 1) !== 0 && shiftedCp && shiftedCp >= 33 && shiftedCp <= 126) return String.fromCodePoint(shiftedCp);
-      const ch = String.fromCodePoint(cp);
-      return (mod & 1) !== 0 ? ch.toUpperCase() : ch;
-    }
-    return null;
-  }
-  if (data === "\x1b" || data === "\x1b\x1b" || data === "\x03") return "escape";
-  if (data === "\r" || data === "\n") return "enter";
-  if (data === "\t") return "tab";
-  if (data === " ") return "space";
-  if (data === "\x7f" || data === "\b" || data === "\x1b[3~") return "backspace";
-  if (/^\x1b\[(?:1;\d+(?::[12])?)?A$/.test(data) || data === "\x1bOA") return "up";
-  if (/^\x1b\[(?:1;\d+(?::[12])?)?B$/.test(data) || data === "\x1bOB") return "down";
-  if (/^\x1b\[(?:1;\d+(?::[12])?)?C$/.test(data) || data === "\x1bOC") return "right";
-  if (/^\x1b\[(?:1;\d+(?::[12])?)?D$/.test(data) || data === "\x1bOD") return "left";
-  return data.length === 1 && data >= "!" && data <= "~" ? data : null;
-}
-
-function stripRoleDraft(role: RoleSpec): Omit<RoleSpec, "source" | "filePath" | "contentSha256"> {
+function stripRoleDraft(role: RoleSpec, keepBuiltinSup = false): Omit<RoleSpec, "source" | "filePath" | "contentSha256"> {
+  const omitSup = role.id === "supervisor" && role.source === "builtin" && !keepBuiltinSup;
   return {
     id: role.id, name: role.name, description: role.description,
-    ...(role.model ? { model: role.model } : {}), ...(role.thinking ? { thinking: role.thinking } : {}),
+    ...(!omitSup && role.model !== undefined ? { model: role.model } : {}),
+    ...(!omitSup && role.thinking !== undefined ? { thinking: role.thinking } : {}),
     stance: role.stance, method: [...role.method],
     permissions: {
       ...(role.permissions.tools ? { tools: [...role.permissions.tools] } : {}),
@@ -76,45 +41,48 @@ function stripRoleDraft(role: RoleSpec): Omit<RoleSpec, "source" | "filePath" | 
   };
 }
 
-function parseGlobInput(raw: string): string[] | undefined {
-  const t = raw.trim();
-  if (t === "*" || t.toLowerCase() === "all" || t.toLowerCase() === "unrestricted") return undefined;
-  if (!t || t.toLowerCase() === "none" || t === "[]") return [];
-  return t.split(",").map((part) => part.trim()).filter(Boolean);
+export function parseWritableGlobInput(raw: string): string[] | undefined {
+  const t = raw.trim(), low = t.toLowerCase();
+  if (t === "*" || t === "**" || low === "all" || low === "unrestricted") return undefined;
+  return !t || low === "none" || t === "[]" || low === "readonly" ? [] : splitBraceSafeGlobs(t);
+}
+
+export function parseProtectedGlobInput(raw: string): string[] | undefined {
+  const t = raw.trim(), low = t.toLowerCase();
+  if (!t || low === "none" || t === "[]") return undefined;
+  if (t === "*" || t === "**" || low === "all") return ["**"];
+  const items = splitBraceSafeGlobs(t);
+  return items.length > 0 ? items : undefined;
 }
 
 async function pickScope(ui: any, defaultScope: "global" | "project"): Promise<"global" | "project" | null> {
-  const choice = await ui.select("保存位置 (Save scope)", [
-    defaultScope === "project" ? "project (.omp/roles)" : "global (~/.omp/enhance/roles)",
-    defaultScope === "project" ? "global (~/.omp/enhance/roles)" : "project (.omp/roles)",
-  ], { outline: true });
+  const opts = defaultScope === "project" ? ["project (.omp/roles)", "global (~/.omp/enhance/roles)"] : ["global (~/.omp/enhance/roles)", "project (.omp/roles)"];
+  const choice = await ui.select("保存位置 (Save scope)", opts, { outline: true });
   return choice ? (choice.startsWith("project") ? "project" : "global") : null;
 }
 
-async function pickRoleModel(current: string | undefined, deps: RoleStudioDeps): Promise<string | undefined | null> {
+async function pickRoleIdFromList(ui: any, title: string, list: readonly RoleSpec[]): Promise<string | undefined> {
+  const picked: string | undefined = await ui.select(title, list.map((r) => `${r.id} [${r.source}] — ${r.description || r.name}`), { outline: true });
+  return picked?.split(" [", 1)[0]?.trim() || undefined;
+}
+
+async function pickRoleModel(current: string | undefined, deps: RoleStudioDeps): Promise<string | null> {
   const ui = deps.ctx?.ui;
-  const discovered: string[] = (Array.isArray(deps.ctx?.models?.list?.()) ? deps.ctx.models.list() : [])
-    .flatMap((m: any) => (m?.provider && m?.id ? [`${m.provider}/${m.id}`] : []));
+  const discovered: string[] = (Array.isArray(deps.ctx?.models?.list?.()) ? deps.ctx.models.list() : []).flatMap((m: any) => (m?.provider && m?.id ? [`${m.provider}/${m.id}`] : []));
   const choices = [...new Set([...PINNED_MODELS, ...discovered]), "Custom model / role alias..."];
-  const picked: string | undefined = await ui.select("Select Role Model", choices, {
-    outline: true, initialIndex: Math.max(0, choices.indexOf(current ?? "inherit")),
-  });
+  const picked: string | undefined = await ui.select("Select Role Model", choices, { outline: true, initialIndex: Math.max(0, choices.indexOf(current ?? "inherit")) });
   if (!picked) return null;
-  if (picked === "Custom model / role alias...") {
-    const custom = await ui.input("Model ID or @role alias (e.g. @advisor, provider/model)", current ?? "");
-    if (custom === undefined) return null;
-    const trimmed = String(custom).trim();
-    return !trimmed || trimmed === "inherit" ? undefined : trimmed;
-  }
-  return picked === "inherit" ? undefined : picked;
+  if (picked !== "Custom model / role alias...") return picked;
+  const custom = await ui.input("Model ID or @role alias (e.g. @advisor, provider/model)", current ?? "");
+  return custom === undefined ? null : (String(custom).trim() || "inherit");
 }
 
 async function pickRoleTools(role: RoleSpec, deps: RoleStudioDeps): Promise<string[] | undefined | null> {
   const ui = deps.ctx?.ui, companion = new Set<string>(COMPANION_TOOL_NAMES);
-  const hostTools: string[] = [...new Set<string>(
-    (deps.pi?.getAllTools?.() ?? []).map((t: any) => String(t?.name ?? "")).filter((n: string) => Boolean(n) && !companion.has(n)),
-  )].sort();
-  if (hostTools.length === 0) hostTools.push("read", "grep", "glob", "find", "lsp", "edit", "write", "bash", "task", "wait");
+  const discovered = (deps.pi?.getAllTools?.() ?? [])
+    .map((t: any) => String(t?.name ?? "")).filter((n: string) => Boolean(n) && !companion.has(n));
+  const existing = (role.permissions.tools ?? []).filter((n) => Boolean(n) && !companion.has(n));
+  const hostTools = [...new Set<string>([...(discovered.length > 0 ? discovered : FALLBACK_TOOLS), ...existing])].sort();
   const selected = new Set<string>(role.permissions.tools ?? hostTools);
   let cursor = 0;
 
@@ -123,10 +91,8 @@ async function pickRoleTools(role: RoleSpec, deps: RoleStudioDeps): Promise<stri
       const fg = (c: string, s: string): string => (typeof theme?.fg === "function" ? theme.fg(c, s) : s);
       let focused = true;
       return {
-        get focused() { return focused; },
-        set focused(v: boolean) { focused = v; },
-        capturesInput() { return true; },
-        invalidate() {},
+        get focused() { return focused; }, set focused(v: boolean) { focused = v; },
+        capturesInput() { return true; }, invalidate() {},
         handleInput(data: string) {
           const key = parseOverlayKey(data, kb);
           if (!key) return;
@@ -143,17 +109,21 @@ async function pickRoleTools(role: RoleSpec, deps: RoleStudioDeps): Promise<stri
           }
         },
         render(width: number): string[] {
-          const inner = Math.max(24, width - 4);
+          const inner = Math.max(24, width - 4), win = computeScrollWindow(hostTools.length, cursor, Math.max(6, (process.stdout?.rows ?? 28) - 8));
           const lines = [fg("border", `╭─ ${padCell(`工具权限 · ${role.id} (已勾选 ${selected.size}/${hostTools.length})`, inner - 2)} ─╮`)];
-          for (let i = 0; i < hostTools.length; i++) {
+          if (win.hasAbove) lines.push(`${fg("border", "│")} ${fg("dim", padCell(`↑ 上方还有 ${win.start} 项`, inner))} ${fg("border", "│")}`);
+          for (let i = win.start; i < win.end; i++) {
             const name = hostTools[i]!, on = selected.has(name), cur = i === cursor;
             const row = `${cur ? "▸" : " "} [${on ? "✓" : " "}] ${name}`;
             const styled = cur ? fg("accent", padCell(row, inner)) : on ? fg("success", padCell(row, inner)) : padCell(row, inner);
             lines.push(`${fg("border", "│")} ${styled} ${fg("border", "│")}`);
           }
-          lines.push(fg("border", `├─${"─".repeat(inner)}─┤`));
-          lines.push(`${fg("border", "│")} ${fg("dim", padCell("Space 勾选/取消 · Enter 保存 · a 不限制 · z 全禁 · Esc 返回", inner))} ${fg("border", "│")}`);
-          lines.push(fg("border", `╰─${"─".repeat(inner)}─╯`));
+          if (win.hasBelow) lines.push(`${fg("border", "│")} ${fg("dim", padCell(`↓ 下方还有 ${hostTools.length - win.end} 项`, inner))} ${fg("border", "│")}`);
+          lines.push(
+            fg("border", `├─${"─".repeat(inner)}─┤`),
+            `${fg("border", "│")} ${fg("dim", padCell("Space 勾选/取消 · Enter 保存 · a 不限制 · z 全禁 · Esc 返回", inner))} ${fg("border", "│")}`,
+            fg("border", `╰─${"─".repeat(inner)}─╯`),
+          );
           return lines;
         },
       };
@@ -176,57 +146,39 @@ async function pickRoleTools(role: RoleSpec, deps: RoleStudioDeps): Promise<stri
   }
 }
 
-export async function openCreateRoleWizard(
-  deps: RoleStudioDeps, defaultScope: "global" | "project" = "global",
-): Promise<string | null> {
-  const ui = deps.ctx?.ui;
-  const id = String((await ui.input("新建角色 ID (字母、数字、_ 或 -)", "")) ?? "").trim();
+export async function openCreateRoleWizard(deps: RoleStudioDeps, defaultScope: "global" | "project" = "global"): Promise<string | null> {
+  const ui = deps.ctx?.ui, id = String((await ui.input("新建角色 ID (字母、数字、_ 或 -)", "")) ?? "").trim();
   if (!id) return null;
   const rawDesc = await ui.input(`"${id}" 的一句话描述`, id);
   if (rawDesc === undefined) return null;
   const scope = await pickScope(ui, defaultScope);
   if (!scope) return null;
-  const modeChoice = await ui.select("权限预设 (Permission preset)", [
-    "writable (允许修改工作区文件)", "readonly (纯只读验证，受保护路径 **)",
-  ], { outline: true });
+  const modeChoice = await ui.select("权限预设 (Permission preset)", ["writable (允许修改工作区文件)", "readonly (纯只读验证，受保护路径 **)"], { outline: true });
   if (!modeChoice) return null;
-  const model = await pickRoleModel("inherit", deps);
-  if (model === null) return null;
+  const pickedModel = await pickRoleModel("inherit", deps);
+  if (pickedModel === null) return null;
   try {
     const created = scaffoldRoleFile({
       id, description: String(rawDesc).trim() || id, targetDir: targetDirFor(deps, scope),
-      readOnly: modeChoice.startsWith("readonly"), model,
+      globalRolesDir: deps.globalRolesDir, readOnly: modeChoice.startsWith("readonly"), model: pickedModel === "inherit" ? undefined : pickedModel,
     });
-    deps.refreshRoles();
-    ui.notify?.(`Created role "${created.role.id}" [${created.source}]`, "info");
+    deps.refreshRoles(); ui.notify?.(`Created role "${created.role.id}" [${created.source}]`, "info");
     return created.role.id;
-  } catch (err) {
-    ui.notify?.(err instanceof Error ? err.message : String(err), "warning");
-    return null;
-  }
+  } catch (err) { ui.notify?.(err instanceof Error ? err.message : String(err), "warning"); return null; }
 }
 
-export async function openCloneRoleWizard(
-  sourceRole: RoleSpec, deps: RoleStudioDeps, defaultScope: "global" | "project" = "global",
-): Promise<string | null> {
-  const ui = deps.ctx?.ui;
-  const newId = String((await ui.input(`基于 "${sourceRole.id}" 拷贝的新角色 ID`, `${sourceRole.id}-copy`)) ?? "").trim();
+export async function openCloneRoleWizard(sourceRole: RoleSpec, deps: RoleStudioDeps, defaultScope: "global" | "project" = "global"): Promise<string | null> {
+  const ui = deps.ctx?.ui, newId = String((await ui.input(`基于 "${sourceRole.id}" 拷贝的新角色 ID`, `${sourceRole.id}-copy`)) ?? "").trim();
   if (!newId) return null;
   const rawDesc = await ui.input(`"${newId}" 的一句话描述`, sourceRole.description || sourceRole.name);
   if (rawDesc === undefined) return null;
   const scope = await pickScope(ui, defaultScope);
   if (!scope) return null;
   try {
-    const cloned = cloneRoleSpec({
-      sourceRole, newId, description: String(rawDesc).trim(), targetDir: targetDirFor(deps, scope),
-    });
-    deps.refreshRoles();
-    ui.notify?.(`Copied "${sourceRole.id}" → "${cloned.role.id}" [${cloned.source}]`, "info");
+    const cloned = cloneRoleSpec({ sourceRole, newId, description: String(rawDesc).trim(), targetDir: targetDirFor(deps, scope), globalRolesDir: deps.globalRolesDir });
+    deps.refreshRoles(); ui.notify?.(`Copied "${sourceRole.id}" → "${cloned.role.id}" [${cloned.source}]`, "info");
     return cloned.role.id;
-  } catch (err) {
-    ui.notify?.(err instanceof Error ? err.message : String(err), "warning");
-    return null;
-  }
+  } catch (err) { ui.notify?.(err instanceof Error ? err.message : String(err), "warning"); return null; }
 }
 
 async function confirmAndDeleteRole(roleId: string, deps: RoleStudioDeps): Promise<boolean> {
@@ -235,14 +187,12 @@ async function confirmAndDeleteRole(roleId: string, deps: RoleStudioDeps): Promi
     ui.notify?.(`内置默认角色 "${roleId}" 不可删除（若修改过可在编辑页重置默认）`, "warning");
     return false;
   }
-  const ok = (await ui.confirm?.("删除自定义角色", `确定永久删除自定义角色 "${roleId}" 吗？`)) ?? true;
-  if (!ok) return false;
+  if ((await ui.confirm?.("删除自定义角色", `确定永久删除自定义角色 "${roleId}" 吗？`)) !== true) return false;
   deleteCustomRole({ id: roleId, cwd: deps.cwd, globalRolesDir: deps.globalRolesDir, builtinRolesDir: deps.builtinRolesDir });
   const roles = deps.refreshRoles();
   if (deps.getActiveRoleId() === roleId) {
     const pref = deps.getSettings?.().defaultRole;
-    const next = pref === null ? null : (pref && roles.has(pref) ? pref : (roles.has("general") ? "general" : null));
-    await deps.activateRole(next);
+    await deps.activateRole(pref === null ? null : (pref && roles.has(pref) ? pref : (roles.has("general") ? "general" : null)));
   }
   ui.notify?.(`Deleted role "${roleId}"`, "info");
   return true;
@@ -255,44 +205,50 @@ export async function openRoleEditor(roleId: string, deps: RoleStudioDeps, initi
   while (true) {
     const role = deps.refreshRoles().get(currentId);
     if (!role) return;
-    const builtin = hasBuiltinRole(role.id, deps.builtinRolesDir);
+    const settings = deps.getSettings?.() ?? DEFAULT_ENHANCE_SETTINGS;
+    const builtin = hasBuiltinRole(role.id, deps.builtinRolesDir), isSup = role.id === "supervisor";
+    const modelLabel = isSup && (role.source === "builtin" || role.model === undefined)
+      ? `${settings.supervisorModel} (via /settings)` : (role.model ?? "inherit");
+    const thinkingLabel = isSup && (role.source === "builtin" || role.thinking === undefined)
+      ? `${settings.supervisorThinking} (via /settings)` : (role.thinking ?? "inherit");
     const items = [
       deps.getActiveRoleId() === role.id ? `Active in session (${role.id})` : `Activate "${role.id}" in current session`,
-      `Model: ${role.model ?? "inherit"}`,
-      `Thinking: ${role.thinking ?? "inherit"}`,
+      `Model: ${modelLabel}`, `Thinking: ${thinkingLabel}`,
       `Allowed tools: ${role.permissions.tools ? `[${role.permissions.tools.join(", ") || "none"}]` : "unrestricted"}`,
       `Writable globs: ${role.permissions.writable ? `[${role.permissions.writable.join(", ") || "readonly"}]` : "unrestricted"}`,
       `Protected globs: ${role.permissions.protected?.length ? `[${role.permissions.protected.join(", ")}]` : "none"}`,
       `Require tool evidence: ${role.exit.requireToolEvidence}`,
-      "Edit full role YAML...",
-      "Copy as new role...",
-      `Save scope (Copy-on-Write): ${scope}`,
+      "Edit full role YAML...", "Copy as new role...", `Save scope (Copy-on-Write): ${scope}`,
       ...(builtin && role.source !== "builtin" ? [`Reset ${role.source} override`] : []),
-      ...(!builtin ? ["Delete custom role"] : []),
-      "← Back",
+      ...(!builtin ? ["Delete custom role"] : []), "← Back",
     ];
     const choice: string | undefined = await ui.select(
       `Role Studio · ${role.id} [${role.source}] — ${role.description || role.name}`, items, { outline: true },
     );
     if (!choice || choice === "← Back") return;
     const persist = (fn: (draft: ReturnType<typeof stripRoleDraft>) => void): void => {
-      const draft = stripRoleDraft(role); fn(draft);
-      saveRoleSpec(draft, targetDirFor(deps, scope)); deps.refreshRoles();
+      const draft = stripRoleDraft(role, false); fn(draft);
+      saveRoleSpec(draft, targetDirFor(deps, scope), { globalRolesDir: deps.globalRolesDir });
+      deps.refreshRoles();
+      if (role.source === "project" && scope === "global") {
+        ui.notify?.(`Saved to global scope, but project override (.omp/roles/${role.id}.yaml) still takes precedence.`, "warning");
+      }
     };
     if (choice.startsWith("Activate ")) {
       await deps.activateRole(role.id); ui.notify?.(`Activated role "${role.id}"`, "info");
     } else if (choice.startsWith("Model:")) {
-      const picked = await pickRoleModel(role.model, deps);
+      const picked = await pickRoleModel(isSup && role.source === "builtin" ? settings.supervisorModel : role.model, deps);
       if (picked !== null) {
-        persist((d) => { if (picked) d.model = picked; else delete d.model; });
+        persist((d) => { if (picked === "inherit") { if (isSup) d.model = "inherit"; else delete d.model; } else d.model = picked; });
         if (deps.getActiveRoleId() === role.id) await deps.activateRole(role.id);
       }
     } else if (choice.startsWith("Thinking:")) {
+      const curThink = isSup && role.source === "builtin" ? settings.supervisorThinking : (role.thinking ?? "inherit");
       const picked: string | undefined = await ui.select("Select Thinking Level", [...ROLE_THINKING_LEVELS], {
-        outline: true, initialIndex: Math.max(0, ROLE_THINKING_LEVELS.indexOf(role.thinking ?? "inherit")),
+        outline: true, initialIndex: Math.max(0, ROLE_THINKING_LEVELS.indexOf(curThink)),
       });
       if (picked) {
-        persist((d) => { if (picked === "inherit") delete d.thinking; else d.thinking = picked as RoleThinkingLevel; });
+        persist((d) => { if (picked === "inherit") { if (isSup) d.thinking = "inherit"; else delete d.thinking; } else d.thinking = picked as RoleThinkingLevel; });
         if (deps.getActiveRoleId() === role.id) await deps.activateRole(role.id);
       }
     } else if (choice.startsWith("Allowed tools:")) {
@@ -305,26 +261,28 @@ export async function openRoleEditor(roleId: string, deps: RoleStudioDeps, initi
       const cur = role.permissions.writable === undefined ? "*" : (role.permissions.writable.join(", ") || "none");
       const raw = await ui.input("Writable globs ('*' = all, 'none' = read-only, or comma-separated)", cur);
       if (raw !== undefined) {
-        const parsed = parseGlobInput(String(raw));
+        const parsed = parseWritableGlobInput(String(raw));
         persist((d) => { if (parsed === undefined) delete d.permissions.writable; else d.permissions.writable = parsed; });
       }
     } else if (choice.startsWith("Protected globs:")) {
-      const raw = await ui.input("Protected globs ('none' or comma-separated)", role.permissions.protected?.join(", ") || "none");
+      const raw = await ui.input("Protected globs ('*' = all, 'none' = none, or comma-separated)", role.permissions.protected?.join(", ") || "none");
       if (raw !== undefined) {
-        const parsed = parseGlobInput(String(raw));
+        const parsed = parseProtectedGlobInput(String(raw));
         persist((d) => { if (!parsed?.length) delete d.permissions.protected; else d.permissions.protected = parsed; });
       }
     } else if (choice.startsWith("Require tool evidence:")) {
       persist((d) => { d.exit.requireToolEvidence = !role.exit.requireToolEvidence; });
     } else if (choice === "Edit full role YAML...") {
-      let draftYaml = serializeRoleYaml(stripRoleDraft(role));
+      let draftYaml = role.source === scope && existsSync(role.filePath)
+        ? readFileSync(role.filePath, "utf8") : serializeRoleYaml(stripRoleDraft(role, false));
       while (true) {
         const edited = await ui.editor(`YAML · ${role.id}.yaml (${scope})`, draftYaml);
         if (edited === undefined) break;
         draftYaml = String(edited);
         try {
           const outDir = targetDirFor(deps, scope), outPath = path.join(outDir, `${role.id}.yaml`);
-          saveRoleSpec(stripRoleDraft(parseRoleYaml(draftYaml, scope, outPath)), outDir);
+          parseRoleYaml(draftYaml, scope, outPath);
+          mkdirSync(outDir, { recursive: true }); resetRoleOverride({ id: role.id, targetDir: outDir });
           writeFileSync(outPath, draftYaml.endsWith("\n") ? draftYaml : `${draftYaml}\n`, "utf8");
           deps.refreshRoles();
           if (deps.getActiveRoleId() === role.id) await deps.activateRole(role.id);
@@ -333,17 +291,17 @@ export async function openRoleEditor(roleId: string, deps: RoleStudioDeps, initi
       }
     } else if (choice === "Copy as new role...") {
       const clonedId = await openCloneRoleWizard(role, deps, scope);
-      if (clonedId) {
-        currentId = clonedId;
-        scope = deps.getRoles().get(clonedId)?.source === "project" ? "project" : "global";
-      }
+      if (clonedId) { currentId = clonedId; scope = deps.getRoles().get(clonedId)?.source === "project" ? "project" : "global"; }
     } else if (choice.startsWith("Save scope")) {
       scope = scope === "global" ? "project" : "global";
     } else if (choice.startsWith("Reset ")) {
       const resetScope = role.source === "project" ? "project" : "global";
-      if ((await ui.confirm?.("Reset Role Override", `Delete ${resetScope} override for "${role.id}"?`)) ?? true) {
+      if ((await ui.confirm?.("Reset Role Override", `Delete ${resetScope} override for "${role.id}"?`)) === true) {
         resetRoleOverride({ id: role.id, targetDir: targetDirFor(deps, resetScope) });
-        if (!deps.refreshRoles().has(role.id)) return;
+        const refreshed = deps.refreshRoles().get(role.id);
+        if (!refreshed) return;
+        scope = refreshed.source === "project" ? "project" : "global";
+        if (deps.getActiveRoleId() === role.id) await deps.activateRole(role.id);
       }
     } else if (choice === "Delete custom role") {
       if (await confirmAndDeleteRole(role.id, deps)) return;
@@ -355,8 +313,28 @@ type ActionKind = "new" | "copy-pick" | "edit-pick" | "delete-pick" | "off" | "c
 type NavEntry = { kind: "role"; role: RoleSpec; label: string } | { kind: ActionKind; label: string; detail: string };
 type OverlayAction =
   | { act: "activate" | "edit" | "copy" | "delete" | "handoff"; roleId: string }
-  | { act: Exclude<ActionKind, "close"> }
-  | undefined;
+  | { act: Exclude<ActionKind, "close"> } | undefined;
+
+function buildStudioDetailRows(cur: NavEntry, settings: EnhanceSettings, builtinDir?: string): Array<{ text: string; style?: "head" | "accent" }> {
+  if (cur.kind !== "role") {
+    return [{ text: cur.label, style: "head" }, { text: "" }, { text: cur.detail }, { text: "" }, { text: "按 Enter 执行此操作，或按 Esc 退出。", style: "accent" }];
+  }
+  const sel = cur.role, builtin = hasBuiltinRole(sel.id, builtinDir), isSup = sel.id === "supervisor";
+  const effModel = isSup && (sel.source === "builtin" || sel.model === undefined) ? `${settings.supervisorModel} (via /settings)` : (sel.model ?? "inherit (session model)");
+  const effThink = isSup && (sel.source === "builtin" || sel.thinking === undefined) ? `${settings.supervisorThinking} (via /settings)` : (sel.thinking ?? "inherit");
+  const subRule = sel.permissions.writable !== undefined || (sel.permissions.protected?.length ?? 0) > 0 ? `read-only (${READONLY_SUBAGENTS.join(", ")})` : "all OMP subagents";
+  return [
+    { text: `${sel.id} — ${sel.name} [${sel.source}${builtin ? " · 内置保护" : " · 自定义"}]`, style: "head" },
+    { text: sel.description || "(no description)" },
+    { text: `Model: ${effModel} · Thinking: ${effThink}` },
+    { text: `Tools: ${sel.permissions.tools ? (sel.permissions.tools.join(", ") || "none") : "unrestricted"}` },
+    { text: `Subagents: ${subRule}` },
+    { text: `Writable: ${sel.permissions.writable ? (sel.permissions.writable.join(", ") || "read-only []") : "*"} · Protected: ${sel.permissions.protected?.join(", ") || "none"}` },
+    { text: `Stance: ${sel.stance.trim().replace(/\s+/g, " ")}` },
+    ...sel.method.slice(0, 2).map((m, idx) => ({ text: `${idx + 1}. ${m}` })),
+    { text: `操作: Enter 切换 · e/→ 修改 · c 拷贝${builtin ? "" : " · d 删除"} · h 交接`, style: "accent" },
+  ];
+}
 
 export async function openRoleStudioHome(deps: RoleStudioDeps): Promise<void> {
   const ui = deps.ctx?.ui;
@@ -384,10 +362,8 @@ export async function openRoleStudioHome(deps: RoleStudioDeps): Promise<void> {
         const bold = (s: string): string => (typeof theme?.bold === "function" ? theme.bold(s) : s);
         let focused = true;
         return {
-          get focused() { return focused; },
-          set focused(v: boolean) { focused = v; },
-          capturesInput() { return true; },
-          invalidate() {},
+          get focused() { return focused; }, set focused(v: boolean) { focused = v; },
+          capturesInput() { return true; }, invalidate() {},
           handleInput(data: string) {
             const key = parseOverlayKey(data, kb);
             if (!key) return;
@@ -404,109 +380,51 @@ export async function openRoleStudioHome(deps: RoleStudioDeps): Promise<void> {
               if (key === "d" || key === "D" || key === "backspace") return done({ act: "delete", roleId: cur.role.id });
               if (key === "h" || key === "H") return done({ act: "handoff", roleId: cur.role.id });
             } else if (key === "enter" || key === "right") {
-              if (cur.kind === "close") return done(undefined);
-              return done({ act: cur.kind });
+              return done(cur.kind === "close" ? undefined : { act: cur.kind });
             } else if (key === "c" || key === "C") return done({ act: "copy-pick" });
             else if (key === "e" || key === "E") return done({ act: "edit-pick" });
             else if ((key === "d" || key === "D") && customRoles.length > 0) return done({ act: "delete-pick" });
           },
           render(width: number): string[] {
-            const inner = Math.max(44, width - 4);
-            const leftW = Math.min(26, Math.max(20, Math.floor(inner * 0.32))), rightW = Math.max(18, inner - leftW - 3);
-            const cur = entries[cursor]!;
-            let rightRows: Array<{ text: string; style?: "head" | "accent" }>;
-            if (cur.kind === "role") {
-              const sel = cur.role, builtin = hasBuiltinRole(sel.id, deps.builtinRolesDir);
-              const effModel = sel.id === "supervisor" && sel.source === "builtin"
-                ? `${settings.supervisorModel} (via /settings)` : (sel.model ?? "inherit (session model)");
-              const subRule = sel.permissions.writable !== undefined || (sel.permissions.protected?.length ?? 0) > 0
-                ? `read-only (${READONLY_SUBAGENTS.join(", ")})` : "all OMP subagents";
-              rightRows = [
-                { text: `${sel.id} — ${sel.name} [${sel.source}${builtin ? " · 内置保护" : " · 自定义"}]`, style: "head" },
-                { text: sel.description || "(no description)" },
-                { text: `Model: ${effModel} · Thinking: ${sel.thinking ?? "inherit"}` },
-                { text: `Tools: ${sel.permissions.tools ? (sel.permissions.tools.join(", ") || "none") : "unrestricted"}` },
-                { text: `Subagents: ${subRule}` },
-                { text: `Writable: ${sel.permissions.writable ? (sel.permissions.writable.join(", ") || "read-only []") : "*"} · Protected: ${sel.permissions.protected?.join(", ") || "none"}` },
-                { text: `Stance: ${sel.stance.trim().replace(/\s+/g, " ")}` },
-                ...sel.method.slice(0, 2).map((m, idx) => ({ text: `${idx + 1}. ${m}` })),
-                { text: `操作: Enter 切换 · e/→ 修改 · c 拷贝${builtin ? "" : " · d 删除"} · h 交接`, style: "accent" },
-              ];
-            } else {
-              rightRows = [
-                { text: cur.label, style: "head" }, { text: "" }, { text: cur.detail }, { text: "" },
-                { text: "按 Enter 执行此操作，或按 Esc 退出。", style: "accent" },
-              ];
-            }
-            const rowCount = Math.max(entries.length, rightRows.length);
+            const inner = Math.max(44, width - 4), leftW = Math.min(26, Math.max(20, Math.floor(inner * 0.32))), rightW = Math.max(18, inner - leftW - 3);
+            const rightRows = buildStudioDetailRows(entries[cursor]!, settings, deps.builtinRolesDir);
+            const win = computeScrollWindow(entries.length, cursor, Math.max(10, (process.stdout?.rows ?? 30) - 8));
+            const visibleEntries = entries.slice(win.start, win.end), rowCount = Math.max(visibleEntries.length, rightRows.length);
             const out = [fg("border", `╭─ ${padCell(`OMP Enhance · Roles  [当前: ${activeId ?? "off"}]`, inner - 2)} ─╮`)];
-            for (let i = 0; i < rowCount; i++) {
-              const item = entries[i], rRow = rightRows[i];
-              const leftRaw = item ? `${i === cursor ? "▸" : " "}${item.label}` : "";
-              const leftCell = i === cursor ? fg("accent", bold(padCell(leftRaw, leftW)))
+            for (let r = 0; r < rowCount; r++) {
+              const absIdx = win.start + r, item = r < visibleEntries.length ? visibleEntries[r] : undefined, rRow = rightRows[r];
+              const leftRaw = item ? `${absIdx === cursor ? "▸" : " "}${item.label}` : "";
+              const leftCell = item && absIdx === cursor ? fg("accent", bold(padCell(leftRaw, leftW)))
                 : (item?.kind === "role" && activeId === item.role.id ? fg("success", padCell(leftRaw, leftW)) : padCell(leftRaw, leftW));
               const rPadded = padCell(rRow?.text ?? "", rightW);
-              const rightCell = rRow?.style === "head" ? fg("accent", bold(rPadded))
-                : (rRow?.style === "accent" ? fg("accent", rPadded) : rPadded);
+              const rightCell = rRow?.style === "head" ? fg("accent", bold(rPadded)) : (rRow?.style === "accent" ? fg("accent", rPadded) : rPadded);
               out.push(`${fg("border", "│")} ${leftCell} ${fg("border", "│")} ${rightCell} ${fg("border", "│")}`);
             }
-            out.push(fg("border", `├─${"─".repeat(inner)}─┤`));
-            out.push(`${fg("border", "│")} ${fg("dim", padCell("↑/↓ 选择 · Enter 确认 · e 修改 · c 拷贝 · d 删除 · n 新建 · Esc 退出", inner))} ${fg("border", "│")}`);
-            out.push(fg("border", `╰─${"─".repeat(inner)}─╯`));
+            out.push(fg("border", `├─${"─".repeat(inner)}─┤`), `${fg("border", "│")} ${fg("dim", padCell("↑/↓ 选择 · Enter 确认 · e 修改 · c 拷贝 · d 删除 · n 新建 · Esc 退出", inner))} ${fg("border", "│")}`, fg("border", `╰─${"─".repeat(inner)}─╯`));
             return out;
           },
         };
       }, { overlay: true });
 
       if (!action) return;
-      if (action.act === "activate") {
-        await deps.activateRole(action.roleId); ui.notify?.(`Session role: ${action.roleId}`, "info"); return;
-      }
-      if (action.act === "off") {
-        await deps.activateRole(null); ui.notify?.("Role conditioning disabled", "info"); return;
-      }
+      if (action.act === "activate") { await deps.activateRole(action.roleId); ui.notify?.(`Session role: ${action.roleId}`, "info"); return; }
+      if (action.act === "off") { await deps.activateRole(null); ui.notify?.("Role conditioning disabled", "info"); return; }
       if (action.act === "handoff") { await deps.runHandoff?.(action.roleId); return; }
       if (action.act === "edit") await openRoleEditor(action.roleId, deps);
-      else if (action.act === "copy") {
-        const src = deps.getRoles().get(action.roleId);
-        const clonedId = src ? await openCloneRoleWizard(src, deps) : null;
-        if (clonedId) {
-          await openRoleEditor(clonedId, deps);
-          cursor = Math.max(0, [...deps.getRoles().keys()].sort().indexOf(clonedId));
-        }
-      } else if (action.act === "delete") {
-        await confirmAndDeleteRole(action.roleId, deps);
-      } else if (action.act === "copy-pick") {
-        const picked: string | undefined = await ui.select(
-          "选择作为拷贝模板的角色 (Select source role to copy)",
-          roles.map((r) => `${r.id} [${r.source}] — ${r.description || r.name}`), { outline: true },
-        );
-        const src = picked ? deps.getRoles().get(picked.split(" [", 1)[0]?.trim() ?? "") : undefined;
-        const clonedId = src ? await openCloneRoleWizard(src, deps) : null;
-        if (clonedId) {
-          await openRoleEditor(clonedId, deps);
-          cursor = Math.max(0, [...deps.getRoles().keys()].sort().indexOf(clonedId));
-        }
-      } else if (action.act === "edit-pick") {
-        const picked: string | undefined = await ui.select(
-          "选择要修改的角色 (Select role to edit)",
-          roles.map((r) => `${r.id} [${r.source}] — ${r.description || r.name}`), { outline: true },
-        );
-        const id = picked?.split(" [", 1)[0]?.trim();
+      else if (action.act === "copy" || action.act === "copy-pick") {
+        const srcId = action.act === "copy" ? action.roleId : await pickRoleIdFromList(ui, "选择作为拷贝模板的角色 (Select source role to copy)", roles);
+        const clonedId = srcId && deps.getRoles().get(srcId) ? await openCloneRoleWizard(deps.getRoles().get(srcId)!, deps) : null;
+        if (clonedId) { await openRoleEditor(clonedId, deps); cursor = Math.max(0, [...deps.getRoles().keys()].sort().indexOf(clonedId)); }
+      } else if (action.act === "delete") await confirmAndDeleteRole(action.roleId, deps);
+      else if (action.act === "edit-pick") {
+        const id = await pickRoleIdFromList(ui, "选择要修改的角色 (Select role to edit)", roles);
         if (id && deps.getRoles().has(id)) await openRoleEditor(id, deps);
       } else if (action.act === "delete-pick") {
-        const picked: string | undefined = await ui.select(
-          "选择要删除的自定义角色 (Select custom role to delete)",
-          customRoles.map((r) => `${r.id} [${r.source}] — ${r.description || r.name}`), { outline: true },
-        );
-        const id = picked?.split(" [", 1)[0]?.trim();
+        const id = await pickRoleIdFromList(ui, "选择要删除的自定义角色 (Select custom role to delete)", customRoles);
         if (id) await confirmAndDeleteRole(id, deps);
       } else if (action.act === "new") {
         const createdId = await openCreateRoleWizard(deps);
-        if (createdId) {
-          await openRoleEditor(createdId, deps);
-          cursor = Math.max(0, [...deps.getRoles().keys()].sort().indexOf(createdId));
-        }
+        if (createdId) { await openRoleEditor(createdId, deps); cursor = Math.max(0, [...deps.getRoles().keys()].sort().indexOf(createdId)); }
       }
     }
   }
@@ -521,14 +439,8 @@ export async function openRoleStudioHome(deps: RoleStudioDeps): Promise<void> {
     options.push("+ Create new role...", ...(activeId ? ["Disable active role (/role off)"] : []));
     const picked: string | undefined = await ui.select(`OMP Enhance · Role Studio (active: ${activeId ?? "off"})`, options, { outline: true });
     if (!picked) return;
-    if (picked === "+ Create new role...") {
-      const createdId = await openCreateRoleWizard(deps);
-      if (createdId) await openRoleEditor(createdId, deps);
-    } else if (picked.startsWith("Disable active role")) {
-      await deps.activateRole(null); ui.notify?.("Role conditioning disabled", "info");
-    } else {
-      const targetId = roleMap.get(picked);
-      if (targetId) await openRoleEditor(targetId, deps);
-    }
+    if (picked === "+ Create new role...") { const id = await openCreateRoleWizard(deps); if (id) await openRoleEditor(id, deps); }
+    else if (picked.startsWith("Disable active role")) { await deps.activateRole(null); ui.notify?.("Role conditioning disabled", "info"); }
+    else { const id = roleMap.get(picked); if (id) await openRoleEditor(id, deps); }
   }
 }

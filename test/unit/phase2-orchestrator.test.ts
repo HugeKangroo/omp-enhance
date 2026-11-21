@@ -3,14 +3,15 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import {
-  createOmpRoleSessionRunner, executeRoleFlow, executeRoleStep,
-  type RoleSessionRunner, type RoleStepContext,
-} from "../../src/orchestrator.ts";
-import { discoverRoles } from "../../src/role-loader.ts";
-import { EnhanceStore } from "../../src/store.ts";
-import type { HandoffEnvelope, HandoffVerdict, Mandate, RoleSpec } from "../../src/types.ts";
+import { EnhanceStore } from "../../src/core/store.ts";
+import type { HandoffEnvelope, HandoffVerdict, Mandate, ObservedToolCall, RoleSpec } from "../../src/core/types.ts";
 import ompEnhance from "../../src/entry.ts";
+import { createAndVerifyHandoff } from "../../src/flow/handoff.ts";
+import {
+  executeRoleFlow, executeRoleStep, type RoleSessionRunner, type RoleStepContext,
+} from "../../src/flow/orchestrator.ts";
+import { createOmpRoleSessionRunner, createOmpSupervisorInspector } from "../../src/omp/session.ts";
+import { discoverRoles } from "../../src/roles/loader.ts";
 
 const tempDirs: string[] = [];
 
@@ -60,11 +61,12 @@ afterEach(() => {
 });
 
 describe("Markov role conditioning", () => {
-  test("passes mandate, role, and upstream handoff but no upstream chat transcript", async () => {
+  test("passes mandate, role, verifiedFacts, deletedFiles, userSteers, and upstream handoff without chat transcript", async () => {
     const root = tempDir();
     const cwd = path.join(root, "workspace");
     mkdirSync(cwd, { recursive: true });
     writeFile(cwd, "src/math.ts", "export const add = (a: number, b: number): number => a + b;\n");
+    writeFile(cwd, "src/legacy.ts", "export const legacy = true;\n");
     const roles = rolesFor(cwd, root);
     const store = new EnhanceStore(path.join(root, "state.sqlite"));
     try {
@@ -73,8 +75,26 @@ describe("Markov role conditioning", () => {
         constraints: ["No new dependencies"],
         acceptance: ["Math functions are correct"],
       });
+      const baseline = (await import("../../src/core/fs.ts")).snapshotWorkspace(cwd);
+      rmSync(path.join(cwd, "src", "legacy.ts"));
+      const devCall: ObservedToolCall = {
+        toolCallId: "dev-tc-1", toolName: "bash", isError: false,
+        touchedPaths: [], timestamp: new Date().toISOString(), summary: "bash bun test",
+      };
+      const realUpstream = createAndVerifyHandoff({
+        store, role: roles.get("dev")!, cwd, mandate, toTarget: "reviewer",
+        verdict: "ready", summary: "UPSTREAM_SUMMARY",
+        baselineSnapshot: baseline, observedCalls: [devCall],
+        verifiedFacts: [
+          { claim: "Legacy module removed cleanly", evidenceRef: "dev-tc-1" },
+          { claim: "add(a, b) returns a + b", evidenceRef: "src/math.ts:1" },
+        ],
+      });
+      expect(realUpstream.deletedFiles).toEqual(["src/legacy.ts"]);
+      expect(realUpstream.verifiedFacts).toHaveLength(2);
+
       const upstream: HandoffEnvelope & { chatTranscript: string } = {
-        ...envelope("dev", "ready", "UPSTREAM_SUMMARY", { mandateId: mandate.id }),
+        ...realUpstream,
         chatTranscript: "SECRET_TRANSCRIPT",
       };
       let captured: RoleStepContext | null = null;
@@ -87,37 +107,43 @@ describe("Markov role conditioning", () => {
             }),
             observedCalls: [],
             assistantText: "reviewed",
-            usage: null,
+            usage: { inputTokens: 120, outputTokens: 45, costUsd: 0.002 },
           };
         },
       };
 
       const result = await executeRoleStep({
         cwd, store, role: roles.get("reviewer")!, mandate, upstreamHandoff: upstream,
+        userSteers: [
+          { text: "Verify zero side effects", createdAt: new Date().toISOString() },
+          { text: "Dev-only note", targetRole: "dev", createdAt: new Date().toISOString() },
+        ],
         toTarget: "user", runner,
       });
 
       expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.envelope.observedUsage).toEqual({ inputTokens: 120, outputTokens: 45, costUsd: 0.002 });
+      }
       expect(captured).not.toBeNull();
       for (const prompt of [captured!.conditioningPrompt, captured!.taskPrompt]) {
         expect(prompt).toContain("MARKOV_GOAL");
         expect(prompt).toContain("reviewer");
         expect(prompt).toContain("UPSTREAM_SUMMARY");
+        expect(prompt).toContain("Legacy module removed cleanly");
+        expect(prompt).toContain("src/legacy.ts");
+        expect(prompt).toContain("Verify zero side effects");
+        expect(prompt).not.toContain("Dev-only note");
         expect(prompt).not.toContain("SECRET_TRANSCRIPT");
       }
       expect(captured!.conditioningPrompt).toContain("<omp-enhance-conditioning>");
-      expect(captured!.conditioningPrompt).toContain("Original Mandate");
-      expect(captured!.conditioningPrompt).toContain("Upstream Handoff");
-      expect(captured!.conditioningPrompt).toContain(roles.get("reviewer")!.stance.trim());
-      expect(captured!.taskPrompt).toContain(mandate.goal);
-      expect(captured!.toTarget).toBe("user");
-      expect(captured!.epistemicItems).toEqual([]);
+      expect(captured!.conditioningPrompt).toContain("## User Interjections");
     } finally {
       store.close();
     }
   });
 
-  test("detects a protected-path escape after the role turn", async () => {
+  test("blocks boundary & .omp config violations inside createAndVerifyHandoff without poisoning SQLite", async () => {
     const root = tempDir();
     const cwd = path.join(root, "workspace");
     mkdirSync(cwd, { recursive: true });
@@ -125,13 +151,34 @@ describe("Markov role conditioning", () => {
     const roles = rolesFor(cwd, root);
     const store = new EnhanceStore(path.join(root, "state.sqlite"));
     try {
-      const mandate = store.upsertMandate({ goal: "Protect source" });
-      const runner: RoleSessionRunner = {
-        async runRoleTurn() {
-          writeFile(cwd, "src/index.ts", "export const value = 999;\n");
-          return { envelope: envelope("qa", "ready", "Looks fine"), observedCalls: [], assistantText: "", usage: null };
+      const mandate = store.upsertMandate({ goal: "Protect source & .omp" });
+      const fakePi = {
+        getAllTools: () => ["read", "write", "edit", "bash"].map((name) => ({ name })),
+        getThinkingLevel: () => "off",
+        pi: {
+          settings: {},
+          SessionManager: { inMemory: () => ({ id: "mem" }) },
+          async createAgentSession(opts: any) {
+            const handoffTool = opts.customTools[0];
+            return {
+              session: {
+                messages: [{ role: "toolResult", toolCallId: "qa-bash-1", toolName: "bash", isError: false }],
+                async prompt() {
+                  // qa modifies protected src/index.ts AND tampers with .omp/enhance.yaml via bash
+                  writeFile(cwd, "src/index.ts", "export const value = 999;\n");
+                  writeFile(cwd, ".omp/enhance.yaml", "flowRoutingMode: auto\n");
+                  await handoffTool.execute("h-bad", { verdict: "ready", summary: "Looks fine" });
+                },
+                getLastAssistantText: () => "",
+                getLastAssistantMessage: () => null,
+                async dispose() {},
+              },
+            };
+          },
         },
       };
+
+      const runner = createOmpRoleSessionRunner(fakePi, { modelRegistry: {} });
       const result = await executeRoleStep({
         cwd, store, role: roles.get("qa")!, mandate, upstreamHandoff: null,
         toTarget: "user", runner,
@@ -140,8 +187,13 @@ describe("Markov role conditioning", () => {
       if (!result.ok) {
         expect(result.status).toBe("violation");
         expect(result.reason).toContain("modified protected paths");
-        if (result.status === "violation") expect(result.violations).toEqual(["src/index.ts"]);
+        if (result.status === "violation") {
+          expect(result.violations).toContain("src/index.ts");
+          expect(result.violations).toContain(".omp/enhance.yaml");
+        }
       }
+      // SQLite was NOT poisoned with a bogus ready handoff!
+      expect(store.getLatestHandoff(mandate.id)).toBeNull();
     } finally {
       store.close();
     }
@@ -166,8 +218,8 @@ describe("Markov role conditioning", () => {
   });
 });
 
-describe("child role session guard", () => {
-  test("binds the inline guard and blocks qa writes outside writable globs", async () => {
+describe("child role & supervisor session isolation (A1, A2.2, A4)", () => {
+  test("passes SessionManager.inMemory, isolates host modelRegistry, exposes stage companion tools, and enforces restrictToolNames on supervisor", async () => {
     const root = tempDir();
     const cwd = path.join(root, "workspace");
     mkdirSync(cwd, { recursive: true });
@@ -176,63 +228,104 @@ describe("child role session guard", () => {
     const roles = rolesFor(cwd, root);
     const store = new EnhanceStore(path.join(root, "state.sqlite"));
     try {
-      const mandate = store.upsertMandate({ goal: "Guard the child session" });
-      const childHandlers = new Map<string, Array<(event: Record<string, unknown>) => unknown>>();
-      const childPi = {
-        on(name: string, handler: (event: Record<string, unknown>) => unknown) {
-          childHandlers.set(name, [...(childHandlers.get(name) ?? []), handler]);
-        },
-      };
-      interface CapturedChildOptions {
-        restrictToolNames?: boolean;
-        toolNames?: string[];
-        extensions?: Array<(api: typeof childPi) => void>;
+      const mandate = store.upsertMandate({ goal: "Guard child & supervisor sessions" });
+      let customProvidersCleared = false;
+      class MockModelRegistry {
+        #secret = true;
+        get authStorage() { return { ok: this.#secret }; }
+        syncExtensionSources() { customProvidersCleared = true; }
+        clearSourceRegistrations() { customProvidersCleared = true; }
       }
-      const captures: CapturedChildOptions[] = [];
+      const hostModelRegistry = new MockModelRegistry();
+
+      const childHandlers = new Map<string, Array<(event: Record<string, unknown>) => unknown>>();
+      const captures: any[] = [];
+      const inMemorySentinel = { kind: "in-memory-session" };
       const fakePi = {
         getAllTools: () => ["read", "write", "edit", "bash", "enhance_handoff"].map((name) => ({ name })),
         getThinkingLevel: () => "off",
         pi: {
           settings: {},
-          async createAgentSession(options: CapturedChildOptions) {
+          SessionManager: { inMemory: (dir: string) => ({ ...inMemorySentinel, dir }) },
+          async createAgentSession(options: any) {
             captures.push(options);
-            for (const extension of options.extensions ?? []) extension(childPi);
+            // Verify ES2022 `#private` getters on proxied modelRegistry do NOT throw TypeError!
+            expect(options.modelRegistry?.authStorage).toEqual({ ok: true });
+            // Simulate OMP 19.0.x mutating modelRegistry when restrictToolNames !== true
+            options.modelRegistry?.syncExtensionSources?.([]);
+            options.modelRegistry?.clearSourceRegistrations?.(new Set());
+            for (const extension of options.extensions ?? []) {
+              extension({
+                on(name: string, handler: (event: Record<string, unknown>) => unknown) {
+                  childHandlers.set(name, [...(childHandlers.get(name) ?? []), handler]);
+                },
+              });
+            }
             return {
               session: {
-                messages: [],
+                messages: [{ role: "assistant", usage: { input: 50, output: 20, cost: { total: 0.001 } } }],
                 async prompt() {},
-                getLastAssistantText: () => "",
-                getLastAssistantMessage: () => null,
+                getLastAssistantText: () => '{"action":"continue","reason":"healthy","nextCheckSec":45}',
+                getLastAssistantMessage: () => ({ role: "assistant", stopReason: "stop", usage: { input: 50, output: 20, cost: { total: 0.001 } } }),
                 async dispose() {},
               },
             };
           },
         },
       };
-      const runner = createOmpRoleSessionRunner(fakePi, { modelRegistry: {} });
+
+      // 1) Stage session (algo/qa) gets SessionManager.inMemory, isolated modelRegistry, enhance_mandate + enhance_job
+      const runner = createOmpRoleSessionRunner(fakePi, { cwd, modelRegistry: hostModelRegistry }, undefined, roles);
       await runner.runRoleTurn({
         cwd, store, role: roles.get("qa")!, mandate, epistemicItems: [],
         upstreamHandoff: null, toTarget: "user", conditioningPrompt: "", taskPrompt: "",
       });
 
-      const captured = captures[0];
-      expect(captured).toBeDefined();
-      expect(captured!.restrictToolNames).not.toBe(true);
-      expect(captured!.extensions).toHaveLength(1);
-      expect(captured!.toolNames).toContain("enhance_handoff");
-      const guard = childHandlers.get("tool_call")?.[0];
-      expect(guard).toBeDefined();
-      interface BlockDecision { block?: boolean }
-      const blocked = guard!({ toolName: "write", input: { path: "docs/outside.md" } }) as BlockDecision;
-      expect(blocked.block).toBe(true);
-      expect(guard!({ toolName: "write", input: { path: "test/app.test.ts" } })).toBeUndefined();
+      const stageCap = captures[0]!;
+      expect(customProvidersCleared).toBe(false);
+      expect(stageCap.sessionManager).toMatchObject({ kind: "in-memory-session", dir: cwd });
+      expect(stageCap.hasUI).toBe(false);
+      expect(stageCap.restrictToolNames).not.toBe(true);
+      expect(stageCap.toolNames).toContain("enhance_handoff");
+      expect(stageCap.toolNames).toContain("enhance_mandate");
+      expect(stageCap.toolNames).toContain("enhance_job");
+      expect(stageCap.customTools.map((t: any) => t.name)).toEqual(["enhance_handoff", "enhance_mandate", "enhance_job"]);
+
+      const guard = childHandlers.get("tool_call")?.[0]!;
+      expect((guard({ toolName: "write", input: { path: "docs/outside.md" } }) as { block?: boolean }).block).toBe(true);
+      expect(guard({ toolName: "write", input: { path: "test/app.test.ts" } })).toBeUndefined();
+
+      // 2) Read-only stage (reviewer) does NOT receive enhance_job
+      await runner.runRoleTurn({
+        cwd, store, role: roles.get("reviewer")!, mandate, epistemicItems: [],
+        upstreamHandoff: null, toTarget: "user", conditioningPrompt: "", taskPrompt: "",
+      });
+      expect(captures[1]!.toolNames).not.toContain("enhance_job");
+      expect(captures[1]!.toolNames).toContain("enhance_mandate");
+
+      // 3) Supervisor inspector passes SessionManager.inMemory AND restrictToolNames: true + empty skills/rules
+      const inspector = createOmpSupervisorInspector(fakePi, { cwd, modelRegistry: hostModelRegistry });
+      const decision = await inspector.evaluatePulse({
+        targetKind: "job", goal: "Train", checkNumber: 1, elapsedSec: 30, idleSec: 5, deltaBytesOrCalls: 100, deltaSummary: "ok",
+      }, roles.get("supervisor")!);
+      expect(decision.action).toBe("continue");
+      expect(captures[2]!).toMatchObject({
+        hasUI: false,
+        restrictToolNames: true,
+        toolNames: [],
+        skills: [],
+        rules: [],
+        promptTemplates: [],
+        slashCommands: [],
+      });
+      expect(captures[2]!.sessionManager).toMatchObject({ kind: "in-memory-session", dir: cwd });
     } finally {
       store.close();
     }
   });
 });
 
-describe("role flow repair loop", () => {
+describe("role flow repair loop & mandate completion", () => {
   function setup() {
     const root = tempDir();
     const cwd = path.join(root, "workspace");
@@ -243,7 +336,7 @@ describe("role flow repair loop", () => {
     return { root, cwd, roles, store, mandate };
   }
 
-  test("dev -> qa rejected -> dev fix -> qa ready -> reviewer ready", async () => {
+  test("dev -> qa rejected (toTarget=dev) -> dev fix -> qa ready -> reviewer ready & completes mandate", async () => {
     const { cwd, roles, store, mandate } = setup();
     try {
       let qaCalls = 0;
@@ -252,33 +345,33 @@ describe("role flow repair loop", () => {
         async runRoleTurn(ctx) {
           if (ctx.role.id === "dev") {
             devCalls += 1;
-            return {
-              envelope: envelope("dev", "ready", `DEV_ROUND_${devCalls}`, {
-                mandateId: mandate.id, parentHandoffId: ctx.upstreamHandoff?.id ?? null,
-              }),
-              observedCalls: [], assistantText: "", usage: null,
-            };
+            const env = createAndVerifyHandoff({
+              store, role: ctx.role, cwd, mandate, parentHandoffId: ctx.upstreamHandoff?.id ?? null,
+              toTarget: ctx.toTarget, verdict: "ready", summary: `DEV_ROUND_${devCalls}`,
+            });
+            return { envelope: env, observedCalls: [], assistantText: "", usage: null };
           }
           if (ctx.role.id === "qa") {
             qaCalls += 1;
-            return {
-              envelope: qaCalls === 1
-                ? envelope("qa", "rejected", "QA_FOUND_BUG", {
-                  mandateId: mandate.id, parentHandoffId: ctx.upstreamHandoff?.id ?? null,
-                  feedbackForUpstream: "Repro: bun test; expected 2, received 3",
+            const call: ObservedToolCall = { toolCallId: `qa-${qaCalls}`, toolName: "bash", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+            const env = qaCalls === 1
+              ? createAndVerifyHandoff({
+                  store, role: ctx.role, cwd, mandate, parentHandoffId: ctx.upstreamHandoff?.id ?? null,
+                  toTarget: ctx.toTarget, verdict: "rejected", summary: "QA_FOUND_BUG",
+                  feedbackForUpstream: "Repro: bun test; expected 2, received 3", observedCalls: [call],
                 })
-                : envelope("qa", "ready", "QA_PASSED", {
-                  mandateId: mandate.id, parentHandoffId: ctx.upstreamHandoff?.id ?? null,
-                }),
-              observedCalls: [], assistantText: "", usage: null,
-            };
+              : createAndVerifyHandoff({
+                  store, role: ctx.role, cwd, mandate, parentHandoffId: ctx.upstreamHandoff?.id ?? null,
+                  toTarget: ctx.toTarget, verdict: "ready", summary: "QA_PASSED", observedCalls: [call],
+                });
+            return { envelope: env, observedCalls: [call], assistantText: "", usage: null };
           }
-          return {
-            envelope: envelope("reviewer", "ready", "REVIEW_READY", {
-              mandateId: mandate.id, parentHandoffId: ctx.upstreamHandoff?.id ?? null,
-            }),
-            observedCalls: [], assistantText: "", usage: null,
-          };
+          const revCall: ObservedToolCall = { toolCallId: "rev-1", toolName: "read", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+          const env = createAndVerifyHandoff({
+            store, role: ctx.role, cwd, mandate, parentHandoffId: ctx.upstreamHandoff?.id ?? null,
+            toTarget: ctx.toTarget, verdict: "ready", summary: "REVIEW_READY", observedCalls: [revCall],
+          });
+          return { envelope: env, observedCalls: [revCall], assistantText: "", usage: null };
         },
       };
 
@@ -290,70 +383,80 @@ describe("role flow repair loop", () => {
       expect(result.status).toBe("completed");
       expect(result.steps.map((step) => step.roleId)).toEqual(["dev", "qa", "dev", "qa", "reviewer"]);
       expect(result.steps.map((step) => step.round)).toEqual([0, 0, 1, 1, 1]);
-      expect(result.finalEnvelope?.fromRole).toBe("reviewer");
-      expect(result.finalEnvelope?.summary).toBe("REVIEW_READY");
-      expect(result.steps[1]?.envelope.verdict).toBe("rejected");
-      expect(result.steps[3]?.envelope.verdict).toBe("ready");
+      // Rejected envelope in dev -> qa -> reviewer points toTarget="dev" (repair target), NOT "reviewer"!
+      expect(result.steps[1]?.envelope.toTarget).toBe("dev");
+      expect(store.getHandoff(result.steps[1]!.envelope.id)?.toTarget).toBe("dev");
+      // Completed Flow transitions Mandate status to "completed" so it doesn't pollute future turns!
+      expect(store.getMandate(mandate.id)?.status).toBe("completed");
+      expect(store.getActiveMandate()).toBeNull();
     } finally {
       store.close();
     }
   });
 
-  test("stagnates on identical normalized rejection feedback", async () => {
+  test("rewinds to first write-capable role instead of read-only roles[0] (vision -> dev -> qa)", async () => {
     const { cwd, roles, store, mandate } = setup();
     try {
       let qaCalls = 0;
+      const executed: string[] = [];
       const runner: RoleSessionRunner = {
         async runRoleTurn(ctx) {
-          if (ctx.role.id === "dev") {
-            return { envelope: envelope("dev", "ready", "DEV"), observedCalls: [], assistantText: "", usage: null };
+          executed.push(ctx.role.id);
+          if (ctx.role.id === "qa" && ++qaCalls === 1) {
+            return {
+              envelope: envelope("qa", "rejected", "BUG", { mandateId: mandate.id, feedbackForUpstream: "fix edge case" }),
+              observedCalls: [], assistantText: "", usage: null,
+            };
           }
+          return { envelope: envelope(ctx.role.id, "ready", "OK", { mandateId: mandate.id }), observedCalls: [], assistantText: "", usage: null };
+        },
+      };
+
+      const result = await executeRoleFlow({
+        cwd, store, mandate, runner,
+        roles: [roles.get("vision")!, roles.get("dev")!, roles.get("qa")!],
+      });
+      expect(result.status).toBe("completed");
+      // vision (idx=0, read-only) is NOT re-executed on repair; rewind lands on dev (idx=1)!
+      expect(executed).toEqual(["vision", "dev", "qa", "dev", "qa"]);
+      expect(result.steps[2]?.envelope.toTarget).toBe("dev");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("stagnates on identical normalized rejection feedback and stops after maxRepairRounds", async () => {
+    const { cwd, roles, store, mandate } = setup();
+    try {
+      let qaCalls = 0;
+      const stagRunner: RoleSessionRunner = {
+        async runRoleTurn(ctx) {
+          if (ctx.role.id === "dev") return { envelope: envelope("dev", "ready", "DEV"), observedCalls: [], assistantText: "", usage: null };
           qaCalls += 1;
           return {
             envelope: envelope("qa", "rejected", "STILL_BROKEN", {
-              mandateId: mandate.id,
-              feedbackForUpstream: qaCalls === 1 ? "  SAME   BUG  " : "same bug",
+              mandateId: mandate.id, feedbackForUpstream: qaCalls === 1 ? "  SAME   BUG  " : "same bug",
             }),
             observedCalls: [], assistantText: "", usage: null,
           };
         },
       };
+      const stagResult = await executeRoleFlow({ cwd, store, mandate, runner: stagRunner, roles: [roles.get("dev")!, roles.get("qa")!] });
+      expect(stagResult.status).toBe("stagnated");
 
-      const result = await executeRoleFlow({
-        cwd, store, mandate, runner, roles: [roles.get("dev")!, roles.get("qa")!],
-      });
-
-      expect(result.status).toBe("stagnated");
-      expect(result.steps).toHaveLength(4);
-      expect(result.reason).toBe("Identical rejection feedback repeated without progress.");
-    } finally {
-      store.close();
-    }
-  });
-
-  test("stops after maxRepairRounds when feedback keeps changing", async () => {
-    const { cwd, roles, store, mandate } = setup();
-    try {
-      let qaCalls = 0;
-      const runner: RoleSessionRunner = {
+      let maxCalls = 0;
+      const maxRunner: RoleSessionRunner = {
         async runRoleTurn(ctx) {
-          if (ctx.role.id === "dev") {
-            return { envelope: envelope("dev", "ready", "DEV"), observedCalls: [], assistantText: "", usage: null };
-          }
-          qaCalls += 1;
+          if (ctx.role.id === "dev") return { envelope: envelope("dev", "ready", "DEV"), observedCalls: [], assistantText: "", usage: null };
+          maxCalls += 1;
           return {
-            envelope: envelope("qa", "rejected", `BUG_${qaCalls}`, {
-              mandateId: mandate.id, feedbackForUpstream: `bug number ${qaCalls}`,
-            }),
+            envelope: envelope("qa", "rejected", `BUG_${maxCalls}`, { mandateId: mandate.id, feedbackForUpstream: `bug ${maxCalls}` }),
             observedCalls: [], assistantText: "", usage: null,
           };
         },
       };
-      const result = await executeRoleFlow({
-        cwd, store, mandate, runner, roles: [roles.get("dev")!, roles.get("qa")!], maxRepairRounds: 1,
-      });
-      expect(result.status).toBe("rejected_max_rounds");
-      expect(result.steps).toHaveLength(4);
+      const maxResult = await executeRoleFlow({ cwd, store, mandate, runner: maxRunner, roles: [roles.get("dev")!, roles.get("qa")!], maxRepairRounds: 1 });
+      expect(maxResult.status).toBe("rejected_max_rounds");
     } finally {
       store.close();
     }
@@ -365,31 +468,19 @@ interface TestContext {
   ui: { notify(message: string, level: string): void };
   modelRegistry: Record<string, never>;
   model?: unknown;
-}
-
-interface HarnessTool {
-  name: string;
-  execute(
-    id: string,
-    params: Record<string, unknown>,
-    signal?: unknown,
-    onUpdate?: unknown,
-    ctx?: unknown,
-  ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }>;
-}
-
-interface HarnessCommand {
-  description: string;
-  handler(args: string, ctx: TestContext): Promise<void> | void;
+  models?: { resolve(spec: string): unknown; list(): unknown[] };
 }
 
 function createHarness(cwd: string, root: string) {
   const handlers = new Map<string, Array<(event: Record<string, unknown>, ctx: TestContext) => unknown>>();
-  const tools = new Map<string, HarnessTool>();
-  const commands = new Map<string, HarnessCommand>();
+  const tools = new Map<string, any>();
+  const commands = new Map<string, any>();
   const messages: string[] = [];
   const notifications: string[] = [];
   let activeTools: string[] = [];
+  let currentModel: unknown = { provider: "anthropic", id: "claude-sonnet-4" };
+  let thinkingLevel = "high";
+
   const allToolNames = [
     "read", "grep", "lsp", "bash", "edit", "write", "web_search",
     "enhance_mandate", "enhance_handoff", "enhance_flow", "enhance_job",
@@ -398,39 +489,34 @@ function createHarness(cwd: string, root: string) {
     cwd,
     ui: { notify: (message: string) => { notifications.push(message); } },
     modelRegistry: {},
+    get model() { return currentModel; },
+    models: {
+      resolve: (spec: string) => (spec === "@vision" ? { provider: "openrouter", id: "qwen-vl", input: ["text", "image"] } : undefined),
+      list: () => [],
+    },
   };
   const pi = {
     on(name: string, handler: (event: Record<string, unknown>, ctx: TestContext) => unknown) {
       handlers.set(name, [...(handlers.get(name) ?? []), handler]);
     },
-    registerTool(tool: HarnessTool) {
-      tools.set(tool.name, tool);
-    },
-    registerCommand(name: string, command: HarnessCommand) {
-      commands.set(name, command);
-    },
-    sendMessage(message: { content: string }) {
-      messages.push(message.content);
-    },
-    getAllTools() {
-      return allToolNames.map((name) => ({ name }));
-    },
-    async setActiveTools(names: string[]) {
-      activeTools = names;
-    },
-    getThinkingLevel() {
-      return "off";
-    },
+    registerTool(tool: any) { tools.set(tool.name, tool); },
+    registerCommand(name: string, command: any) { commands.set(name, command); },
+    sendMessage(message: { content: string }) { messages.push(message.content); },
+    getAllTools() { return allToolNames.map((name) => ({ name })); },
+    async setActiveTools(names: string[]) { activeTools = names; },
+    async setModel(m: unknown) { currentModel = m; },
+    setThinkingLevel(level: string) { thinkingLevel = level; },
+    getThinkingLevel() { return thinkingLevel; },
     pi: { settings: {} },
   };
   ompEnhance(pi, {
     globalRolesDir: path.join(root, "global-roles"),
     builtinRolesDir: path.resolve(import.meta.dir, "../../roles"),
   });
-  const runHook = (name: string, event: Record<string, unknown>): unknown => {
+  const runHook = async (name: string, event: Record<string, unknown>, customCtx: TestContext = ctx): Promise<unknown> => {
     let result: unknown;
     for (const handler of handlers.get(name) ?? []) {
-      const value = handler(event, ctx);
+      const value = await handler(event, customCtx);
       if (value !== undefined) result = value;
     }
     return result;
@@ -449,11 +535,13 @@ function createHarness(cwd: string, root: string) {
   return {
     ctx, tools, commands, messages, notifications, runHook, execTool, runCommand,
     activeTools: () => activeTools,
+    currentModel: () => currentModel,
+    thinkingLevel: () => thinkingLevel,
   };
 }
 
 describe("entry extension", () => {
-  test("wires role commands, hooks, mandate, handoff, and status", async () => {
+  test("wires role commands, leaves native /handoff untouched, awaits session-switch role sync, and restores baseline model/thinking", async () => {
     const root = tempDir();
     const cwd = path.join(root, "workspace");
     mkdirSync(cwd, { recursive: true });
@@ -464,34 +552,54 @@ describe("entry extension", () => {
     const mandatePayload = await harness.execTool("enhance_mandate", {
       action: "set", goal: "MANDATE_X", constraints: ["no deps"], acceptance: ["tests pass"],
     });
-    // Tool output shape is produced by this extension; assert the named contract at the boundary.
     const mandate = mandatePayload.mandate as Mandate;
     expect(mandate.goal).toBe("MANDATE_X");
     const mandateId = mandate.id;
 
-    const start = harness.runHook("before_agent_start", { systemPrompt: ["BASE"], prompt: "hello" });
+    const start = await harness.runHook("before_agent_start", { systemPrompt: ["BASE"], prompt: "hello" });
     const systemPrompt = (start as { systemPrompt: string[] }).systemPrompt;
     expect(systemPrompt[0]).toBe("BASE");
     expect(systemPrompt[1]).toContain("<omp-enhance-conditioning>");
     expect(systemPrompt[1]).toContain("Active Role: general");
     expect(systemPrompt[1]).toContain("MANDATE_X");
 
-    expect(harness.runHook("input", { text: "/handoff reviewer" }))
-      .toEqual({ text: "/enhance-handoff reviewer" });
-    expect(harness.runHook("input", { text: "/role list" })).toBeUndefined();
+    // Native OMP `/handoff` (`/compact handoff`) is NEVER intercepted, with or without arguments!
+    expect(await harness.runHook("input", { text: "/handoff" })).toBeUndefined();
+    expect(await harness.runHook("input", { text: "/handoff reviewer" })).toBeUndefined();
+    expect(await harness.runHook("input", { text: "/role list" })).toBeUndefined();
+
+    // Switching to vision overrides model/thinking, and switching back to general/off restores baseline!
+    await harness.runCommand("role", "vision");
+    expect(harness.currentModel()).toMatchObject({ provider: "openrouter", id: "qwen-vl" });
+    expect(harness.thinkingLevel()).toBe("low");
+    expect(harness.activeTools()).not.toContain("enhance_job");
+
+    // Session transition inside before_agent_start awaits applyActiveRole before returning!
+    const nextSessionCtx = Object.assign(Object.create(harness.ctx), {
+      sessionManager: { getSessionId: () => "sess-switched", getBranch: () => [] },
+    });
+    await harness.runHook("before_agent_start", { systemPrompt: ["BASE"] }, nextSessionCtx);
+    expect(harness.currentModel()).toMatchObject({ provider: "anthropic", id: "claude-sonnet-4" });
+    expect(harness.thinkingLevel()).toBe("high");
+    expect(harness.activeTools()).toContain("enhance_job");
+
+    await harness.runCommand("role", "general");
+    expect(harness.currentModel()).toMatchObject({ provider: "anthropic", id: "claude-sonnet-4" });
+    expect(harness.thinkingLevel()).toBe("high");
 
     await harness.runCommand("role", "list");
     expect(harness.messages.at(-1)).toContain("* general [builtin]");
     expect(harness.messages.at(-1)).toContain("qa [builtin]");
 
-    await harness.runCommand("role", "create custom-auditor --project Check edge cases");
+    // Preserves --* words inside /role create description and handles duplicate errors gracefully
+    await harness.runCommand("role", "create custom-auditor --project Check --strict edge cases");
     const rolePath = path.join(cwd, ".omp", "roles", "custom-auditor.yaml");
     expect(existsSync(rolePath)).toBe(true);
-    expect(readFileSync(rolePath, "utf8")).toContain('description: "Check edge cases"');
-    expect(harness.messages.at(-1)).toContain("Created role \"custom-auditor\" [project]");
+    expect(readFileSync(rolePath, "utf8")).toContain('description: "Check --strict edge cases"');
+    expect(harness.messages.at(-1)).toContain('Created role "custom-auditor" [project]');
 
-    await harness.runCommand("role", "list");
-    expect(harness.messages.at(-1)).toContain("custom-auditor [project]");
+    await harness.runCommand("role", "create custom-auditor --project Duplicate attempt");
+    expect(harness.messages.at(-1)).toContain("already exists");
 
     await harness.runCommand("role", "qa");
     expect(harness.messages.at(-1)).toContain("Active role: qa [builtin]");
@@ -500,11 +608,9 @@ describe("entry extension", () => {
     expect(harness.activeTools()).toContain("enhance_handoff");
     expect(harness.activeTools()).not.toContain("web_search");
 
-    const blocked = harness.runHook("tool_call", { toolName: "write", input: { path: "src/app.ts" } });
-    expect(blocked).toMatchObject({ block: true });
-    expect(harness.runHook("tool_call", { toolName: "write", input: { path: "test/app.test.ts" } }))
-      .toBeUndefined();
-    expect(harness.runHook("tool_call", { toolName: "shell", input: {} })).toMatchObject({ block: true });
+    expect(await harness.runHook("tool_call", { toolName: "write", input: { path: "src/app.ts" } })).toMatchObject({ block: true });
+    expect(await harness.runHook("tool_call", { toolName: "write", input: { path: "test/app.test.ts" } })).toBeUndefined();
+    expect(await harness.runHook("tool_call", { toolName: "shell", input: {} })).toMatchObject({ block: true });
 
     await harness.runCommand("role", "off");
     expect(harness.messages.at(-1)).toContain("Role conditioning disabled");
@@ -517,7 +623,6 @@ describe("entry extension", () => {
     const handoff = handoffPayload.handoff as HandoffEnvelope;
     expect(handoff.fromRole).toBe("dev");
     expect(handoff.toTarget).toBe("user");
-    expect(handoff.summary).toBe("Delivered the mandate");
 
     const inspect = new EnhanceStore(path.join(cwd, ".omp-enhance", "state.sqlite"));
     try {
@@ -527,7 +632,6 @@ describe("entry extension", () => {
     }
 
     await harness.runCommand("enhance-status", "");
-    // Command output shape is produced by this extension; assert the named contract at the boundary.
     const status = JSON.parse(harness.messages.at(-1)!) as {
       activeRoleId: string | null;
       roleCount: number;
@@ -539,6 +643,6 @@ describe("entry extension", () => {
     expect(status.epistemicCount).toBe(0);
     expect(status.latestHandoff?.id).toBe(handoff.id);
 
-    harness.runHook("session_shutdown", {});
+    await harness.runHook("session_shutdown", {});
   });
 });

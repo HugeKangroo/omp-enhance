@@ -16,7 +16,7 @@ method:
   - 将核查结果整理为高信噪比的结构化观察事实与未明疑点，调用 enhance_handoff 附真实 read 调用证据返回
 
 permissions:
-  tools: [read, glob]
+  tools: [read, glob, find]
   writable: []
   protected: ["**"]
 

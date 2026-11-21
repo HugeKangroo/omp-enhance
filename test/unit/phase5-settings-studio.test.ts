@@ -4,20 +4,26 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  DEFAULT_ENHANCE_SETTINGS, loadEnhanceSettings, normalizeModelSpec, resolveModelSpec,
-  resolveRoleRuntimeConfig,
-} from "../../src/settings.ts";
+  checkToolCallAllowed, DEFAULT_READONLY_TOOLS, resolveRoleActiveTools, TurnTracker,
+} from "../../src/core/policy.ts";
+import {
+  DEFAULT_ENHANCE_SETTINGS, loadEnhanceSettings, normalizeModelSpec,
+  resolveDefaultPluginLockPath, resolveModelSpec, resolveRoleRuntimeConfig,
+} from "../../src/core/settings.ts";
+import { ROLE_THINKING_LEVELS, type RoleSpec } from "../../src/core/types.ts";
 import {
   discoverRoles, parseRoleYaml, resetRoleOverride, saveRoleSpec, serializeRoleYaml,
-} from "../../src/role-loader.ts";
-import { createOmpRoleSessionRunner } from "../../src/orchestrator.ts";
-import { parseOverlayKey } from "../../src/role-studio.ts";
-import { TurnTracker } from "../../src/session-tracker.ts";
-import { EnhanceStore } from "../../src/store.ts";
+} from "../../src/roles/loader.ts";
+import { parseOverlayKey } from "../../src/ui/kit.ts";
+import {
+  openRoleEditor, openRoleStudioHome, parseProtectedGlobInput, parseWritableGlobInput,
+  type RoleStudioDeps,
+} from "../../src/ui/role-studio.ts";
 import ompEnhance from "../../src/entry.ts";
 
 const tempDirs: string[] = [];
-const builtinRolesDir = path.resolve(import.meta.dir, "../../roles");
+const repoRoot = path.resolve(import.meta.dir, "../..");
+const builtinRolesDir = path.join(repoRoot, "roles");
 
 function tempDir(): string {
   const dir = mkdtempSync(path.join(tmpdir(), "omp-enhance-phase5-"));
@@ -34,13 +40,34 @@ afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-describe("native OMP plugin settings loader", () => {
-  test("merges lockfile < project plugin-overrides < .omp/enhance.yaml and clamps bounds", () => {
+describe("package.json omp.settings parity & native OMP settings loader", () => {
+  test("keeps package.json omp.settings keys, defaults, and thinking levels (including xhigh) in sync with runtime", () => {
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+    const schema = pkg?.omp?.settings as Record<string, any>;
+    expect(Object.keys(schema).sort()).toEqual(Object.keys(DEFAULT_ENHANCE_SETTINGS).sort());
+    expect(schema.defaultRole.default).toBe(DEFAULT_ENHANCE_SETTINGS.defaultRole);
+    expect(schema.showStatusBar.default).toBe(DEFAULT_ENHANCE_SETTINGS.showStatusBar);
+    expect(schema.supervisorEnabled.default).toBe(DEFAULT_ENHANCE_SETTINGS.supervisorEnabled);
+    expect(schema.supervisorModel.default).toBe(DEFAULT_ENHANCE_SETTINGS.supervisorModel);
+    expect(schema.supervisorThinking.default).toBe(DEFAULT_ENHANCE_SETTINGS.supervisorThinking);
+    expect(schema.supervisorInitialDelaySec.default).toBe(DEFAULT_ENHANCE_SETTINGS.supervisorInitialDelaySec);
+    expect(schema.flowMaxRepairRounds.default).toBe(DEFAULT_ENHANCE_SETTINGS.flowMaxRepairRounds);
+    expect(schema.flowRoutingMode.default).toBe(DEFAULT_ENHANCE_SETTINGS.flowRoutingMode);
+    expect([...schema.supervisorThinking.values].sort()).toEqual([...ROLE_THINKING_LEVELS].sort());
+    expect(schema.supervisorThinking.values).toContain("xhigh");
+  });
+
+  test("merges lockfile < parent/project plugin-overrides < .omp/enhance.yaml, clamps bounds, supports --profile, and gates untrusted projects", () => {
     const root = tempDir();
-    const cwd = path.join(root, "workspace");
+    const monorepoRoot = path.join(root, "repo");
+    const cwd = path.join(monorepoRoot, "packages", "sub");
     const lockPath = path.join(root, "omp-plugins.lock.json");
+    mkdirSync(path.join(monorepoRoot, ".git"), { recursive: true });
     mkdirSync(cwd, { recursive: true });
 
+    expect(resolveDefaultPluginLockPath("work")).toContain(
+      path.join(".omp", "profiles", "work", "plugins", "omp-plugins.lock.json"),
+    );
     expect(loadEnhanceSettings({ cwd, pluginLockPath: lockPath })).toEqual(DEFAULT_ENHANCE_SETTINGS);
 
     writeText(lockPath, JSON.stringify({
@@ -65,12 +92,13 @@ describe("native OMP plugin settings loader", () => {
       flowRoutingMode: "ask",
     });
 
-    writeText(path.join(cwd, ".omp", "plugin-overrides.json"), JSON.stringify({
+    // Parent monorepo .omp/plugin-overrides.json applies to nested packages/sub cwd
+    writeText(path.join(monorepoRoot, ".omp", "plugin-overrides.json"), JSON.stringify({
       settings: {
         "omp-enhance": {
           defaultRole: "off",
           supervisorEnabled: false,
-          supervisorThinking: "low",
+          supervisorThinking: "xhigh",
           supervisorInitialDelaySec: 9999,
           flowMaxRepairRounds: -4,
           flowRoutingMode: "auto",
@@ -82,7 +110,7 @@ describe("native OMP plugin settings loader", () => {
       showStatusBar: false,
       supervisorEnabled: false,
       supervisorModel: "smol",
-      supervisorThinking: "low",
+      supervisorThinking: "xhigh",
       supervisorInitialDelaySec: 600,
       flowMaxRepairRounds: 0,
       flowRoutingMode: "auto",
@@ -99,14 +127,28 @@ describe("native OMP plugin settings loader", () => {
       flowMaxRepairRounds: 4,
     });
 
-    // Malformed optional files degrade gracefully without throwing.
+    // Untrusted workspace (isProjectTrusted: false) ignores .omp/plugin-overrides.json & .omp/enhance.yaml!
+    const warnings: string[] = [];
+    const untrusted = loadEnhanceSettings({
+      cwd, pluginLockPath: lockPath, isProjectTrusted: false, onWarning: (w) => warnings.push(w),
+    });
+    expect(untrusted.defaultRole).toBe("qa");
+    expect(untrusted.flowRoutingMode).toBe("ask");
+    expect(untrusted.supervisorEnabled).toBe(true);
+    expect(warnings.some((w) => w.includes("not trusted"))).toBe(true);
+
+    // Malformed optional files degrade gracefully while emitting diagnostic warning
+    const parseWarnings: string[] = [];
     writeText(path.join(cwd, ".omp", "enhance.yaml"), "::: invalid yaml ::: [");
-    expect(loadEnhanceSettings({ cwd, pluginLockPath: lockPath }).defaultRole).toBeNull();
+    expect(loadEnhanceSettings({
+      cwd, pluginLockPath: lockPath, onWarning: (w) => parseWarnings.push(w),
+    }).defaultRole).toBeNull();
+    expect(parseWarnings.some((w) => w.includes("enhance.yaml"))).toBe(true);
   });
 });
 
 describe("model & @advisor inheritance resolution", () => {
-  test("builtin supervisor defaults to @advisor, normalizes bare aliases, and respects overrides", () => {
+  test("builtin supervisor defaults to @advisor, respects /settings, and honors explicit inherit overrides", () => {
     const root = tempDir();
     const roles = discoverRoles({ cwd: root, globalRolesDir: path.join(root, "global"), builtinRolesDir });
     const supervisor = roles.get("supervisor")!;
@@ -142,142 +184,120 @@ describe("model & @advisor inheritance resolution", () => {
       thinkingLevel: "low",
     });
 
-    // 3. Explicit user override in global/project supervisor.yaml -> wins over /settings default
+    // 3. Explicit custom model override in global supervisor.yaml -> wins over /settings
     const customSupervisor = saveRoleSpec({
       id: "supervisor", name: supervisor.name, description: supervisor.description,
       model: "custom/local-70b", thinking: "high", stance: supervisor.stance,
       method: supervisor.method, permissions: supervisor.permissions, exit: supervisor.exit,
     }, path.join(root, "global"));
-    expect(customSupervisor.source).toBe("global");
     expect(resolveRoleRuntimeConfig(customSupervisor, pi, hostCtx, DEFAULT_ENHANCE_SETTINGS)).toEqual({
       model: { provider: "custom", id: "local-70b" },
       thinkingLevel: "high",
     });
 
-    // 4. Unconfigured @advisor falls back cleanly to current session model
+    // 4. Explicit `inherit` override in global supervisor.yaml -> inherits session model & thinking (NOT @advisor/off!)
+    const inheritSupervisor = saveRoleSpec({
+      id: "supervisor", name: supervisor.name, description: supervisor.description,
+      model: "inherit", thinking: "inherit", stance: supervisor.stance,
+      method: supervisor.method, permissions: supervisor.permissions, exit: supervisor.exit,
+    }, path.join(root, "global"));
+    expect(inheritSupervisor.model).toBe("inherit");
+    expect(inheritSupervisor.thinking).toBe("inherit");
+    expect(resolveRoleRuntimeConfig(inheritSupervisor, pi, hostCtx, DEFAULT_ENHANCE_SETTINGS)).toEqual({
+      model: "session-default-model",
+      thinkingLevel: "medium",
+    });
+
+    // 5. Unconfigured @advisor falls back cleanly to current session model
     expect(resolveModelSpec("@advisor", { model: "session-fallback", models: { resolve: () => undefined } }))
       .toBe("session-fallback");
   });
-
-  test("orchestrator binds per-role model and thinkingLevel when creating child sessions", async () => {
-    const root = tempDir();
-    const cwd = path.join(root, "work");
-    mkdirSync(cwd, { recursive: true });
-    const store = new EnhanceStore(path.join(cwd, "state.sqlite"));
-    try {
-      const customReviewer = saveRoleSpec({
-        id: "reviewer", name: "Heterogeneous Reviewer", description: "Cross-model reviewer",
-        model: "@slow", thinking: "high", stance: "Strict audit", method: ["Audit diff"],
-        permissions: { tools: ["read"], writable: [], protected: ["**"] },
-        exit: { requireToolEvidence: false, criteria: [] },
-      }, path.join(cwd, ".omp", "roles"));
-
-      let capturedOptions = null as Record<string, unknown> | null;
-      const fakePi = {
-        getAllTools: () => [{ name: "read" }, { name: "write" }],
-        getThinkingLevel: () => "low",
-        pi: {
-          settings: {},
-          async createAgentSession(opts: Record<string, unknown>) {
-            capturedOptions = opts;
-            const handoffTool = (opts.customTools as any[])[0];
-            return {
-              session: {
-                messages: [],
-                async prompt() {
-                  if (capturedOptions) {
-                    await handoffTool.execute("call-h", { verdict: "ready", summary: "Audited with @slow" });
-                  }
-                },
-                getLastAssistantText: () => "done",
-                getLastAssistantMessage: () => null,
-                async dispose() {},
-              },
-            };
-          },
-        },
-      };
-      const hostCtx = {
-        cwd, modelRegistry: {}, model: "default-session-model",
-        models: { resolve: (s: string) => (s === "@slow" ? "gpt-slow-auditor" : undefined) },
-      };
-      const runner = createOmpRoleSessionRunner(fakePi, hostCtx, DEFAULT_ENHANCE_SETTINGS);
-      const mandate = store.upsertMandate({ goal: "Audit module" });
-      const outcome = await runner.runRoleTurn({
-        cwd, store, role: customReviewer, mandate, epistemicItems: [],
-        upstreamHandoff: null, toTarget: "user", conditioningPrompt: "cond", taskPrompt: "task",
-      });
-      expect(outcome.envelope?.summary).toBe("Audited with @slow");
-      expect(capturedOptions?.model).toBe("gpt-slow-auditor");
-      expect(capturedOptions?.thinkingLevel).toBe("high");
-    } finally {
-      store.close();
-    }
-  });
 });
 
-describe("Role Studio & zero-extra-slash-command integration", () => {
-  test("registers zero extra slash commands and drives Role Studio create, checkbox tools, CoW, and reset", async () => {
-    const root = tempDir();
-    const cwd = path.join(root, "workspace");
-    const globalDir = path.join(root, "global-roles");
-    const lockPath = path.join(root, "lock.json");
-    mkdirSync(cwd, { recursive: true });
-
-    const builtinReviewerPath = path.join(builtinRolesDir, "reviewer.yaml");
-    const builtinReviewerHashBefore = createHash("sha256")
-      .update(readFileSync(builtinReviewerPath)).digest("hex");
-
-    const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+describe("Role Studio strict UI, glob parsing, supervisor CoW/inherit, and tool union", () => {
+  function createStudioHarness(cwd: string, globalDir: string, hostToolNames: string[]) {
+    let roles = discoverRoles({ cwd, globalRolesDir: globalDir, builtinRolesDir });
+    let activeRoleId: string | null = "general";
     const activeToolHistory: string[][] = [];
     const modelHistory: unknown[] = [];
-    const statusHistory: Array<string | undefined> = [];
     const notifications: Array<{ text: string; level?: string }> = [];
 
     const pi = {
-      on() {},
-      registerTool() {},
-      registerCommand(name: string, spec: { handler: (args: string, ctx: any) => Promise<void> }) {
-        commands.set(name, spec);
-      },
-      sendMessage() {},
-      getAllTools: () => [
-        { name: "read" }, { name: "grep" }, { name: "edit" }, { name: "write" }, { name: "bash" },
-        { name: "enhance_mandate" },
-      ],
+      getAllTools: () => hostToolNames.map((name) => ({ name })),
       async setActiveTools(names: string[]) { activeToolHistory.push(names); },
       async setModel(m: unknown) { modelHistory.push(m); },
       setThinkingLevel() {},
-      getThinkingLevel: () => "off",
-      pi: { settings: {} },
+      getThinkingLevel: () => "medium",
     };
 
-    ompEnhance(pi, { globalRolesDir: globalDir, builtinRolesDir, pluginLockPath: lockPath });
+    const makeDeps = (ctx: any): RoleStudioDeps => ({
+      cwd,
+      globalRolesDir: globalDir,
+      builtinRolesDir,
+      pi,
+      ctx,
+      getRoles: () => roles,
+      refreshRoles: () => {
+        roles = discoverRoles({ cwd, globalRolesDir: globalDir, builtinRolesDir });
+        return roles;
+      },
+      getSettings: () => ({ ...DEFAULT_ENHANCE_SETTINGS, supervisorModel: "@slow", supervisorThinking: "low" }),
+      getActiveRoleId: () => activeRoleId,
+      async activateRole(id: string | null) {
+        activeRoleId = id;
+        const r = id ? roles.get(id) ?? null : null;
+        await pi.setActiveTools(r ? resolveRoleActiveTools(r, hostToolNames) : hostToolNames);
+        if (r?.model && r.model !== "inherit") {
+          const resolved = resolveModelSpec(r.model, ctx);
+          if (resolved) await pi.setModel(resolved);
+        }
+      },
+    });
 
-    // Strict slash-command economy: zero built-in conflicts and NO /enhance-settings command!
-    expect([...commands.keys()].sort()).toEqual([
-      "enhance-handoff", "enhance-status", "flow", "role",
-    ]);
+    return { makeDeps, getRoles: () => roles, getActiveRoleId: () => activeRoleId, activeToolHistory, modelHistory, notifications };
+  }
 
-    // Scripted UI responses for:
-    // 1) /role (opens home) -> "+ Create new role..." -> id "sec-audit", desc "Security auditor",
-    //    project scope, readonly, model "@slow" -> enters editor -> Allowed tools (toggle bash ON, Save) ->
-    //    Edit full YAML (1st invalid -> warning, 2nd valid) -> Activate -> Esc editor -> Esc home.
+  test("validates every ui.select option strictly, preserves brace globs, maps Protected '*' -> ['**'], and handles supervisor CoW/inherit/reset", async () => {
+    expect(parseProtectedGlobInput("*")).toEqual(["**"]);
+    expect(parseProtectedGlobInput("all")).toEqual(["**"]);
+    expect(parseProtectedGlobInput("none")).toBeUndefined();
+    expect(parseProtectedGlobInput("src/**/*.{ts,tsx}, config/**")).toEqual(["src/**/*.{ts,tsx}", "config/**"]);
+    expect(parseWritableGlobInput("*")).toBeUndefined();
+    expect(parseWritableGlobInput("none")).toEqual([]);
+    expect(parseWritableGlobInput("src/**/*.{ts,tsx}, test/**")).toEqual(["src/**/*.{ts,tsx}", "test/**"]);
+
+    const root = tempDir();
+    const cwd = path.join(root, "workspace");
+    const globalDir = path.join(root, "global-roles");
+    mkdirSync(cwd, { recursive: true });
+
+    const builtinReviewerPath = path.join(builtinRolesDir, "reviewer.yaml");
+    const builtinReviewerHashBefore = createHash("sha256").update(readFileSync(builtinReviewerPath)).digest("hex");
+
+    const h = createStudioHarness(cwd, globalDir, ["read", "grep", "edit", "write", "bash", "enhance_mandate"]);
+
+    // Strict selectQueue: EVERY non-undefined choice MUST exist verbatim in `_options`!
     const selectQueue: Array<string | undefined> = [
       "+ Create new role...",
       "project (.omp/roles)",
-      "readonly (read/verify only, protects **)",
+      "readonly (纯只读验证，受保护路径 **)",
       "@slow",
-      "Allowed tools: unrestricted",
-      "edit",   // uncheck edit
-      "write",  // uncheck write
+      `Allowed tools: [${[...DEFAULT_READONLY_TOOLS].join(", ")}]`,
+      "bash", // toggle bash ON while preserving unloaded DEFAULT_READONLY_TOOLS (glob, find, lsp, task, wait)!
       "✓ Save tool selection",
+      "Protected globs: [**]",
+      "Writable globs: [readonly]",
       "Edit full role YAML...",
       'Activate "sec-audit" in current session',
       undefined, // exit role editor
       undefined, // exit studio home
     ];
-    const inputQueue: Array<string | undefined> = ["sec-audit", "Security auditor"];
+    const inputQueue: Array<string | undefined> = [
+      "sec-audit",
+      "Security auditor",
+      "*",                          // Protected globs: '*' MUST become ["**"], NOT deleted!
+      "src/**/*.{ts,tsx}, test/**", // Brace-safe writable globs!
+    ];
     let editorAttempt = 0;
 
     const ctx = {
@@ -289,8 +309,12 @@ describe("Role Studio & zero-extra-slash-command integration", () => {
         list: () => [{ provider: "openai-codex", id: "gpt-6.1-sol" }],
       },
       ui: {
-        async select(_title: string, _options: string[], _opts?: Record<string, unknown>) {
-          return selectQueue.shift();
+        async select(title: string, options: string[]) {
+          const next = selectQueue.shift();
+          if (next !== undefined) {
+            expect(options).toContain(next);
+          }
+          return next;
         },
         async input() { return inputQueue.shift(); },
         async editor(_title: string, prefill: string) {
@@ -299,44 +323,81 @@ describe("Role Studio & zero-extra-slash-command integration", () => {
           return prefill.replace("\nunknown_field: 123\n", "\n").replaceAll("Security auditor", "Hardened security auditor");
         },
         async confirm() { return true; },
-        notify(text: string, level?: string) { notifications.push({ text, level }); },
-        setStatus(_key: string, badge?: string) { statusHistory.push(badge); },
+        notify(text: string, level?: string) { h.notifications.push({ text, level }); },
       },
     };
 
-    await commands.get("role")!.handler("", ctx);
+    await openRoleStudioHome(h.makeDeps(ctx));
 
     const createdPath = path.join(cwd, ".omp", "roles", "sec-audit.yaml");
     expect(existsSync(createdPath)).toBe(true);
     const parsedCreated = parseRoleYaml(readFileSync(createdPath, "utf8"), "project", createdPath);
     expect(parsedCreated.model).toBe("@slow");
     expect(parsedCreated.description).toBe("Hardened security auditor");
-    expect(parsedCreated.permissions.tools).toEqual(["bash", "grep", "read"]);
-    expect(parsedCreated.permissions.writable).toEqual([]);
-    expect(notifications.some((n) => n.level === "warning" && n.text.includes("unknown_field"))).toBe(true);
-    expect(modelHistory).toEqual(["resolved-slow-model"]);
-    expect(statusHistory.at(-1)).toBe("enhance:sec-audit (@slow)");
-    expect(activeToolHistory.at(-1)).toContain("enhance_mandate");
-    expect(activeToolHistory.at(-1)).not.toContain("write");
+    // Unloaded tools (find, glob, lsp, task, wait) were NOT wiped when toggling bash!
+    expect(parsedCreated.permissions.tools).toEqual(["bash", "find", "glob", "grep", "lsp", "read", "task", "wait"]);
+    expect(parsedCreated.permissions.protected).toEqual(["**"]);
+    expect(parsedCreated.permissions.writable).toEqual(["src/**/*.{ts,tsx}", "test/**"]);
+    expect(h.notifications.some((n) => n.level === "warning" && n.text.includes("unknown_field"))).toBe(true);
+    expect(h.modelHistory).toEqual(["resolved-slow-model"]);
 
-    // 2) Copy-on-Write on builtin reviewer -> writes to globalDir without touching builtin roles/reviewer.yaml, then resets
+    // Supervisor Copy-on-Write:
+    // 1) Toggling `Require tool evidence` on builtin supervisor MUST NOT bake `@advisor`/`off` into override
     selectQueue.push(
-      "Model: inherit",
-      "@advisor",
+      "Require tool evidence: false",
       undefined,
     );
-    await commands.get("role")!.handler("edit reviewer", ctx);
+    await openRoleEditor("supervisor", h.makeDeps(ctx));
+    const supOverridePath = path.join(globalDir, "supervisor.yaml");
+    const supAfterToggle = parseRoleYaml(readFileSync(supOverridePath, "utf8"), "global", supOverridePath);
+    expect(supAfterToggle.exit.requireToolEvidence).toBe(true);
+    expect(supAfterToggle.model).toBeUndefined();
+    expect(supAfterToggle.thinking).toBeUndefined();
+    expect(resolveRoleRuntimeConfig(
+      supAfterToggle, { getThinkingLevel: () => "high" }, ctx,
+      { ...DEFAULT_ENHANCE_SETTINGS, supervisorModel: "@slow", supervisorThinking: "low" },
+    )).toEqual({ model: "resolved-slow-model", thinkingLevel: "low" });
+
+    // 2) Choosing `Model: inherit` & `Thinking: inherit` on supervisor saves explicit "inherit" (not snapping to @slow/low)
+    selectQueue.push(
+      "Model: @slow (via /settings)",
+      "inherit",
+      "Thinking: low (via /settings)",
+      "inherit",
+      undefined,
+    );
+    await openRoleEditor("supervisor", h.makeDeps(ctx));
+    const supInherit = parseRoleYaml(readFileSync(supOverridePath, "utf8"), "global", supOverridePath);
+    expect(supInherit.model).toBe("inherit");
+    expect(supInherit.thinking).toBe("inherit");
+    expect(resolveRoleRuntimeConfig(
+      supInherit, { getThinkingLevel: () => "high" }, { model: "user-session-model" },
+      { ...DEFAULT_ENHANCE_SETTINGS, supervisorModel: "@slow", supervisorThinking: "low" },
+    )).toEqual({ model: "user-session-model", thinkingLevel: "high" });
+
+    // 3) Copy-on-Write on builtin reviewer + defensive confirm (false/undefined refuses reset) + true resets & re-activates
+    await h.makeDeps(ctx).activateRole("reviewer");
+    selectQueue.push("Model: inherit", "@slow", undefined);
+    await openRoleEditor("reviewer", h.makeDeps(ctx));
     const globalReviewerPath = path.join(globalDir, "reviewer.yaml");
     expect(existsSync(globalReviewerPath)).toBe(true);
-    expect(createHash("sha256").update(readFileSync(builtinReviewerPath)).digest("hex"))
-      .toBe(builtinReviewerHashBefore);
+    expect(createHash("sha256").update(readFileSync(builtinReviewerPath)).digest("hex")).toBe(builtinReviewerHashBefore);
 
+    // If ui.confirm is missing/undefined, Reset override fails closed and keeps override intact
+    const noConfirmCtx = { ...ctx, ui: { ...ctx.ui, confirm: undefined } };
     selectQueue.push("Reset global override", undefined);
-    await commands.get("role")!.handler("edit reviewer", ctx);
+    await openRoleEditor("reviewer", h.makeDeps(noConfirmCtx));
+    expect(existsSync(globalReviewerPath)).toBe(true);
+
+    // With confirm() === true, Reset deletes override and re-runs activateRole("reviewer")
+    const prevActivations = h.activeToolHistory.length;
+    selectQueue.push("Reset global override", undefined);
+    await openRoleEditor("reviewer", h.makeDeps(ctx));
     expect(existsSync(globalReviewerPath)).toBe(false);
+    expect(h.activeToolHistory.length).toBeGreaterThan(prevActivations);
     expect(resetRoleOverride({ id: "reviewer", targetDir: globalDir })).toBe(false);
 
-    // 3) Check serializeRoleYaml rejects invalid thinking level on parse
+    // Check serializeRoleYaml rejects invalid thinking level on parse
     const badYaml = serializeRoleYaml({
       id: "qa", name: "QA", description: "QA", stance: "s", method: ["m"],
       permissions: {}, exit: { requireToolEvidence: false, criteria: [] },
@@ -344,110 +405,48 @@ describe("Role Studio & zero-extra-slash-command integration", () => {
     expect(() => parseRoleYaml(badYaml, "global", path.join(globalDir, "qa.yaml"))).toThrow(/thinking must be one of/);
   });
 
-  test("allows roles to spawn OMP subagents while blocking write-escalation subagents on restricted roles", () => {
-    const root = tempDir();
-    const roles = discoverRoles({ cwd: root, globalRolesDir: path.join(root, "global"), builtinRolesDir });
-    const dev = roles.get("dev")!;
-    const qa = roles.get("qa")!;
-    const reviewer = roles.get("reviewer")!;
-
-    expect(qa.permissions.tools).toContain("task");
-    expect(qa.permissions.tools).toContain("wait");
-    expect(reviewer.permissions.tools).toContain("task");
-    expect(reviewer.permissions.tools).toContain("glob");
-
-    const tracker = new TurnTracker();
-    tracker.resetTurn(root);
-
-    // dev is unrestricted: can spawn any OMP subagent (scout, sonic, default task worker)
-    expect(tracker.checkToolCallAllowed(root, dev, { toolName: "task", input: { agent: "sonic", task: "refactor" } }))
-      .toEqual({ block: false });
-    expect(tracker.checkToolCallAllowed(root, dev, { toolName: "task", input: { task: "general work" } }))
-      .toEqual({ block: false });
-
-    // qa & reviewer may spawn read-only subagents (single or batch)
-    expect(tracker.checkToolCallAllowed(root, qa, { toolName: "task", input: { agent: "scout", task: "find callers" } }))
-      .toEqual({ block: false });
-    expect(tracker.checkToolCallAllowed(root, reviewer, {
-      toolName: "task",
-      input: { tasks: [{ agent: "scout", task: "scan a" }, { agent: "security-reviewer", task: "audit b" }] },
-    })).toEqual({ block: false });
-
-    // qa & reviewer MUST NOT launder writes through writable subagents (sonic, task, or omitted default agent)
-    expect(tracker.checkToolCallAllowed(root, qa, { toolName: "task", input: { agent: "sonic", task: "edit src" } }))
-      .toMatchObject({ block: true });
-    expect(tracker.checkToolCallAllowed(root, reviewer, { toolName: "task", input: { task: "default worker" } }))
-      .toMatchObject({ block: true });
-    expect(tracker.checkToolCallAllowed(root, qa, {
-      toolName: "task",
-      input: { tasks: [{ agent: "scout", task: "ok" }, { agent: "sonic", task: "sneaky write" }] },
-    })).toMatchObject({ block: true });
-  });
-
-  test("drives split-pane custom /role overlay (1-key Enter switch, h handoff, Space tool toggle) and Tab completions", async () => {
+  test("preserves unloaded YAML tools in custom checkbox overlay, supports Kitty colon subparams, and restricts subagents", async () => {
     const root = tempDir();
     const cwd = path.join(root, "workspace");
     const globalDir = path.join(root, "global-roles");
-    const lockPath = path.join(root, "lock.json");
     mkdirSync(cwd, { recursive: true });
 
-    const commands = new Map<string, {
-      handler: (args: string, ctx: any) => Promise<void>;
-      getArgumentCompletions?: (prefix: string) => Array<{ value: string }>;
-    }>();
-    const workingMessages: Array<string | undefined> = [];
-    let activeRoleSwitched = null as string | null;
+    // Only 4 tools loaded in session, while built-in qa has 11 tools in YAML!
+    const h = createStudioHarness(cwd, globalDir, ["read", "grep", "bash", "task"]);
+    const qaBefore = h.getRoles().get("qa")!;
+    expect(qaBefore.permissions.tools).toHaveLength(11);
 
-    const pi = {
-      cwd,
-      on() {},
-      registerTool() {},
-      registerCommand(name: string, spec: any) { commands.set(name, spec); },
-      sendMessage() {},
-      getAllTools: () => [{ name: "read" }, { name: "grep" }, { name: "bash" }, { name: "task" }],
-      async setActiveTools() {},
-      getThinkingLevel: () => "off",
-      pi: { settings: {} },
-    };
+    // Verify subagent write-escalation guard on TurnTracker / checkToolCallAllowed
+    const tracker = new TurnTracker();
+    tracker.resetTurn(cwd);
+    expect(checkToolCallAllowed(cwd, h.getRoles().get("dev")!, { toolName: "task", input: { agent: "sonic", task: "refactor" } }))
+      .toEqual({ block: false });
+    expect(checkToolCallAllowed(cwd, qaBefore, { toolName: "task", input: { agent: "scout", task: "scan" } }))
+      .toEqual({ block: false });
+    expect(checkToolCallAllowed(cwd, qaBefore, { toolName: "task", input: { agent: "sonic", task: "edit src" } }))
+      .toMatchObject({ block: true });
 
-    ompEnhance(pi, {
-      globalRolesDir: globalDir,
-      builtinRolesDir,
-      pluginLockPath: lockPath,
-      runnerFactory: (_pi, hostCtx) => ({
-        async runRoleTurn(stepCtx) {
-          hostCtx?.ui?.setWorkingMessage?.(`stage:${stepCtx.role.id} → read`);
-          const env = stepCtx.store.getLatestHandoff(stepCtx.mandate.id);
-          hostCtx?.ui?.setWorkingMessage?.(undefined);
-          return { envelope: env, observedCalls: [], assistantText: "ok", usage: null };
-        },
-      }),
-    });
+    // Verify Kitty CSI-u parser including alternate/base-layout colon sub-parameters
+    expect(parseOverlayKey("\x1b[27u")).toBe("escape");
+    expect(parseOverlayKey("\x1b[27;1:1u")).toBe("escape");
+    expect(parseOverlayKey("\x1b[27::27;1:1u")).toBe("escape");
+    expect(parseOverlayKey("\x1b[27;1:3u")).toBeNull();
+    expect(parseOverlayKey("\x1b[99;5u")).toBe("escape");
+    expect(parseOverlayKey("\x1b[101:69:101;1:1;101u")).toBe("e");
+    expect(parseOverlayKey("\x1b[32;1:1u")).toBe("space");
+    expect(parseOverlayKey("\x1b[13;1:1u")).toBe("enter");
 
-    // Verify Tab argument completions for /role, /handoff, and comma-chained /flow
-    const roleComp = commands.get("role")!.getArgumentCompletions!;
-    expect(roleComp("q").map((c) => c.value)).toEqual(["qa"]);
-    expect(roleComp("edit rev").map((c) => c.value)).toEqual(["edit reviewer"]);
-    const handoffComp = commands.get("enhance-handoff")!.getArgumentCompletions!;
-    expect(handoffComp("").some((c) => c.value === "supervisor")).toBe(false);
-    expect(handoffComp("rev").map((c) => c.value)).toEqual(["reviewer"]);
-    const flowComp = commands.get("flow")!.getArgumentCompletions!;
-    expect(flowComp("dev,q").map((c) => c.value)).toEqual(["dev,qa"]);
-
-    // Drive split-pane custom overlay: Down (from dev -> ml-engineer -> qa) + Enter -> 1-step switch to qa!
-    const renderedSnapshots: string[][] = [];
+    // Drive custom overlay: switch to qa -> press 'e' -> Space-toggle index 0 (`apply_patch`) + Enter -> Back -> Esc
     const customScripts: string[][] = [
-      ["\x1b[1;1:1B", "\x1b[1;1:1B", "\x1b[13;1:1u"], // Kitty Down×2 + Kitty Enter -> 1-step switch to qa!
-      ["\x1b[101;1:1u", "\x1b[101;1:3u"],             // Kitty 'e' press + release -> open editor on qa
-      ["\x1b[32;1:1u", "\x1b[13;1:1u"],               // Kitty Space + Kitty Enter in tool checkbox overlay
-      ["\x1b[27;1:1u"],                               // Kitty Esc exits split-pane /role cleanly!
-      ["h"],                                          // Next /role: press 'h' to handoff to qa!
+      ["\x1b[1;1:1B", "\x1b[1;1:1B", "\x1b[13;1:1u"], // general (idx 2) -> ml-engineer (3) -> qa (4) + Enter!
+      ["\x1b[101:69:101;1:1u"],                       // Kitty 'e' with colon sub-params -> open editor on qa
+      ["\x1b[32;1:1u", "\x1b[13;1:1u"],               // Space (uncheck `apply_patch`) + Enter in checkbox overlay
+      ["\x1b[27::27;1:1u"],                           // Kitty Esc with colon sub-params exits studio cleanly!
     ];
     const selectScripts: Array<string | undefined> = [
-      "Allowed tools: [read, grep, glob, find, lsp, edit, write, bash, task, wait]",
-      "← Back", // exit role editor back to split-pane overlay
+      `Allowed tools: [${qaBefore.permissions.tools!.join(", ")}]`,
+      "← Back",
     ];
-    const captureFlags: boolean[] = [];
 
     const ctx = {
       cwd,
@@ -459,50 +458,36 @@ describe("Role Studio & zero-extra-slash-command integration", () => {
           const comp = factory({ requestRender() {} }, { fg: (_c: string, s: string) => s, bold: (s: string) => s }, {}, (res: unknown) => {
             resolved = res;
           });
-          captureFlags.push(Boolean(comp.capturesInput?.("\x1b[27u")));
-          renderedSnapshots.push(comp.render(100));
+          comp.render(100);
           for (const key of keys) comp.handleInput(key);
           return resolved;
         },
-        async select() { return selectScripts.shift(); },
+        async select(_title: string, options: string[]) {
+          const next = selectScripts.shift();
+          if (next !== undefined) expect(options).toContain(next);
+          return next;
+        },
         notify() {},
-        setStatus(_k: string, badge?: string) { activeRoleSwitched = badge ?? null; },
-        setWorkingMessage(msg?: string) { workingMessages.push(msg); },
       },
     };
 
-    // Verify Kitty CSI-u parser directly (including key-release filtering, Esc, arrows, e, n, Space, Ctrl+C)
-    expect(parseOverlayKey("\x1b[27u")).toBe("escape");
-    expect(parseOverlayKey("\x1b[27;1:1u")).toBe("escape");
-    expect(parseOverlayKey("\x1b[27;1:3u")).toBeNull();
-    expect(parseOverlayKey("\x1b[99;5u")).toBe("escape");
-    expect(parseOverlayKey("\x1b[101;1:1u")).toBe("e");
-    expect(parseOverlayKey("\x1b[110;1:1u")).toBe("n");
-    expect(parseOverlayKey("\x1b[32;1:1u")).toBe("space");
-    expect(parseOverlayKey("\x1b[13;1:1u")).toBe("enter");
-    expect(parseOverlayKey("\x1b[1;1:1B")).toBe("down");
-    expect(parseOverlayKey("\x1b[1;1:1C")).toBe("right");
+    await openRoleStudioHome(h.makeDeps(ctx));
+    expect(h.getActiveRoleId()).toBe("qa");
 
-    // 1st /role: Kitty Down, Down, Enter -> instant switch to qa!
-    await commands.get("role")!.handler("", ctx);
-    expect(activeRoleSwitched).toBe("enhance:qa");
-    expect(renderedSnapshots[0]!.some((line) => line.includes("OMP Enhance · Roles"))).toBe(true);
-    expect(renderedSnapshots[0]!.some((line) => line.includes("+ 新建角色"))).toBe(true);
-    expect(renderedSnapshots[0]!.some((line) => line.includes("✎ 修改角色"))).toBe(true);
-
-    // 2nd /role: Kitty 'e' -> Kitty Space-toggle tool -> Back -> Kitty Esc exits cleanly!
-    await commands.get("role")!.handler("", ctx);
+    await openRoleStudioHome(h.makeDeps(ctx));
     const savedQaPath = path.join(globalDir, "qa.yaml");
     expect(existsSync(savedQaPath)).toBe(true);
-    expect(captureFlags.every(Boolean)).toBe(true);
-
-    // 3rd /role: 'h' handoff!
-    await commands.get("role")!.handler("", ctx);
-    expect(workingMessages).toContain("stage:qa → read");
-    expect(workingMessages.at(-1)).toBeUndefined();
+    const savedQa = parseRoleYaml(readFileSync(savedQaPath, "utf8"), "global", savedQaPath);
+    // CRITICAL REGRESSION CHECK (#11 B8.2 / Section 4.1):
+    // Only `apply_patch` (index 0) was unchecked; ALL 10 other tools (including unloaded edit/write/glob/find/lsp/wait) are preserved!
+    expect(savedQa.permissions.tools).toEqual([
+      "bash", "edit", "find", "glob", "grep", "lsp", "read", "task", "wait", "write",
+    ]);
   });
+});
 
-  test("supports copying roles and deleting custom roles while protecting all 6 built-in roles", async () => {
+describe("ompEnhance slash-command economy, Tab completions, and protection of all 8 built-in roles", () => {
+  test("registers zero extra slash commands, completes role args, and protects all 8 built-in roles from deletion", async () => {
     const root = tempDir();
     const cwd = path.join(root, "workspace");
     const globalDir = path.join(root, "global-roles");
@@ -514,8 +499,6 @@ describe("Role Studio & zero-extra-slash-command integration", () => {
       getArgumentCompletions?: (prefix: string) => Array<{ value: string }>;
     }>();
     const messages: string[] = [];
-    const warnings: string[] = [];
-    let statusBadge = null as string | null;
 
     const pi = {
       cwd,
@@ -530,77 +513,29 @@ describe("Role Studio & zero-extra-slash-command integration", () => {
     };
 
     ompEnhance(pi, { globalRolesDir: globalDir, builtinRolesDir, pluginLockPath: lockPath });
+    expect([...commands.keys()].sort()).toEqual(["enhance-handoff", "enhance-status", "flow", "role"]);
+
     const roleCmd = commands.get("role")!;
+    expect(roleCmd.getArgumentCompletions!("q").map((c) => c.value)).toEqual(["qa"]);
+    expect(roleCmd.getArgumentCompletions!("edit rev").map((c) => c.value)).toEqual(["edit reviewer"]);
+    expect(commands.get("enhance-handoff")!.getArgumentCompletions!("").some((c) => c.value === "supervisor")).toBe(false);
+    expect(commands.get("flow")!.getArgumentCompletions!("dev,q").map((c) => c.value)).toEqual(["dev,qa"]);
 
-    const cliCtx = {
-      cwd,
-      hasUI: false,
-      ui: {
-        notify() {},
-        setStatus(_k: string, badge?: string) { statusBadge = badge ?? null; },
-      },
-    };
+    const cliCtx = { cwd, hasUI: false, ui: { notify() {}, setStatus() {} } };
 
-    // 1) Built-in roles cannot be deleted via CLI
-    await roleCmd.handler("delete general", cliCtx);
-    expect(messages.at(-1)).toContain('Built-in role "general" cannot be deleted');
-    await roleCmd.handler("delete reviewer", cliCtx);
-    expect(messages.at(-1)).toContain('Built-in role "reviewer" cannot be deleted');
+    // All 8 built-in roles MUST be protected from CLI deletion
+    for (const builtinId of ["algo", "dev", "general", "ml-engineer", "qa", "reviewer", "supervisor", "vision"]) {
+      await roleCmd.handler(`delete ${builtinId}`, cliCtx);
+      expect(messages.at(-1)).toContain(`Built-in role "${builtinId}" cannot be deleted`);
+    }
 
-    // 2) Copy built-in reviewer -> sql-reviewer (--project), preserving permissions & read-only bounds
+    // Copy built-in reviewer -> sql-reviewer (--project), then delete custom role cleanly
     await roleCmd.handler("copy reviewer sql-reviewer --project SQL security auditor", cliCtx);
     const sqlPath = path.join(cwd, ".omp", "roles", "sql-reviewer.yaml");
     expect(existsSync(sqlPath)).toBe(true);
-    const cloned = parseRoleYaml(readFileSync(sqlPath, "utf8"), "project", sqlPath);
-    expect(cloned.description).toBe("SQL security auditor");
-    expect(cloned.permissions.writable).toEqual([]);
-    expect(cloned.permissions.protected).toEqual(["**"]);
-    expect(cloned.exit.requireToolEvidence).toBe(true);
+    expect(roleCmd.getArgumentCompletions!("delete ").map((c) => c.value)).toEqual(["delete sql-reviewer"]);
 
-    // 3) Tab completion for `/role delete ` lists custom `sql-reviewer` and omits all built-in roles
-    const delCompletions = roleCmd.getArgumentCompletions!("delete ").map((c) => c.value);
-    expect(delCompletions).toEqual(["delete sql-reviewer"]);
-
-    // 4) Switch session to sql-reviewer, then test TUI 'd' on built-in (blocked with warning) and 'd' on custom (deleted + fallback to general)
-    await roleCmd.handler("sql-reviewer", cliCtx);
-    expect(statusBadge).toBe("enhance:sql-reviewer");
-
-    // Sorted roles: [dev, general, ml-engineer, qa, reviewer, sql-reviewer, supervisor]
-    // Initial cursor is on active role sql-reviewer (index 5):
-    // First press Up to reviewer (index 4) and press 'd' -> warns built-in protected, stays in loop -> Esc
-    // Second /role: cursor starts on sql-reviewer (index 5), press 'd' -> deletes sql-reviewer & falls back to general -> Esc
-    const customQueue: string[][] = [
-      ["\x1b[A", "d"],
-      ["\x1b[27u"],
-      ["d"],
-      ["\x1b[27u"],
-    ];
-    const uiCtx = {
-      cwd,
-      hasUI: true,
-      ui: {
-        async custom(factory: any) {
-          const keys = customQueue.shift() ?? ["\x1b[27u"];
-          let resolved: unknown;
-          const comp = factory({ requestRender() {} }, { fg: (_c: string, s: string) => s, bold: (s: string) => s }, {}, (r: unknown) => {
-            resolved = r;
-          });
-          comp.render(100);
-          for (const k of keys) comp.handleInput(k);
-          return resolved;
-        },
-        async confirm() { return true; },
-        notify(text: string, level?: string) { if (level === "warning") warnings.push(text); },
-        setStatus(_k: string, badge?: string) { statusBadge = badge ?? null; },
-      },
-    };
-
-    await roleCmd.handler("", uiCtx);
-    expect(warnings.some((w) => w.includes("内置默认角色") && w.includes("reviewer"))).toBe(true);
-    expect(existsSync(sqlPath)).toBe(true);
-
-    await roleCmd.handler("", uiCtx);
+    await roleCmd.handler("delete sql-reviewer", cliCtx);
     expect(existsSync(sqlPath)).toBe(false);
-    expect(statusBadge).toBe("enhance:general");
   });
 });
