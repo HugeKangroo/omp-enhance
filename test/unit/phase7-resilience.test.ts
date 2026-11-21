@@ -391,4 +391,118 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
 
     await h.emit("session_shutdown", {}, ctx);
   });
+
+  test("handles session_switch / session_branch / session_tree without __default__ bleed, avoids redundant setActiveTools in before_agent_start, and preserves manual /model switches", async () => {
+    const cwd = makeTempDir("p7-lifecycle");
+    const globalDir = makeTempDir("p7-lifecycle-global");
+    const lockPath = path.join(makeTempDir("p7-lifecycle-lock"), "omp-plugins.lock.json");
+    writeText(lockPath, JSON.stringify({ settings: { "omp-enhance": { defaultRole: "general" } } }));
+
+    let setActiveToolsCalls = 0;
+    let activeTools: string[] = [];
+    let currentModel: any = { provider: "deepseek", id: "deepseek-flash" };
+    let thinkingLevel = "max";
+    let activeBranch: any[] = [];
+    let currentSessionId = "sess-a";
+
+    const handlers = new Map<string, Array<(ev: any, ctx: any) => any>>();
+    const commands = new Map<string, any>();
+    const tools = new Map<string, any>();
+    const sentMessages: any[] = [];
+
+    const pi: any = {
+      cwd,
+      on(ev: string, fn: (e: any, c: any) => any) { handlers.set(ev, [...(handlers.get(ev) ?? []), fn]); },
+      registerTool(t: any) { tools.set(t.name, t); },
+      registerCommand(n: string, c: any) { commands.set(n, c); },
+      registerMessageRenderer() {},
+      getAllTools: () => ["read", "grep", "edit", "write", "bash", "task"].map((name) => ({ name })),
+      async setActiveTools(names: string[]) { setActiveToolsCalls += 1; activeTools = names; },
+      async setModel(m: any) { currentModel = m; },
+      setThinkingLevel(lvl: string) { thinkingLevel = lvl; },
+      getThinkingLevel: () => thinkingLevel,
+      sendMessage(msg: any) { sentMessages.push(msg); },
+      appendEntry(customType: string, data: unknown) {
+        activeBranch.push({ id: `e-${activeBranch.length + 1}`, type: "custom", customType, data });
+      },
+      pi: { settings: {} },
+    };
+
+    ompEnhance(pi, { builtinRolesDir, globalRolesDir: globalDir, pluginLockPath: lockPath });
+
+    const emit = async (name: string, ev: any, c: any) => {
+      let last: any;
+      for (const fn of handlers.get(name) ?? []) last = await fn(ev, c);
+      return last;
+    };
+
+    const makeCtx = (sid: string, branchGetter: () => any[]) => ({
+      cwd,
+      hasUI: true,
+      get model() { return currentModel; },
+      models: {
+        resolve: (spec: string) => (spec === "@vision" ? { provider: "openrouter", id: "qwen-vl", input: ["text", "image"] } : undefined),
+        list: () => [],
+      },
+      sessionManager: { getSessionId: () => sid, getBranch: branchGetter },
+      ui: { setStatus() {}, setWidget() {}, notify() {} },
+    });
+
+    const ctxA = makeCtx("sess-a", () => activeBranch);
+    await emit("session_start", {}, ctxA);
+    const callsAfterStart = setActiveToolsCalls;
+    expect(callsAfterStart).toBe(1);
+
+    // 1) before_agent_start when session & branch have NOT changed makes ZERO redundant setActiveTools calls!
+    await emit("before_agent_start", { systemPrompt: ["Base"] }, ctxA);
+    expect(setActiveToolsCalls).toBe(callsAfterStart);
+
+    // 2) Switch to vision in sess-a; verify brand-new sess-c sees NO "__default__" bleed even before session_switch!
+    await commands.get("role")!.handler("vision", ctxA);
+    expect(currentModel).toMatchObject({ provider: "openrouter", id: "qwen-vl" });
+    expect(thinkingLevel).toBe("low");
+
+    const ctxUnseen = makeCtx("sess-unseen", () => []);
+    sentMessages.length = 0;
+    await commands.get("enhance-status")!.handler("", ctxUnseen);
+    expect(JSON.parse(sentMessages.at(-1)!.content).activeRoleId).toBe("general");
+    expect(sentMessages.at(-1)!.excludeFromContext).toBe(true);
+
+    // 3) User manually switches /model & thinking while in vision -> switching back to general preserves user's manual choice!
+    currentModel = { provider: "openai-codex", id: "gpt-6.1-sol" };
+    thinkingLevel = "max";
+    await commands.get("role")!.handler("general", ctxA);
+    expect(currentModel).toMatchObject({ provider: "openai-codex", id: "gpt-6.1-sol" });
+    expect(thinkingLevel).toBe("max");
+
+    // 4) /tree navigation within the SAME sessionId ("sess-a") switches branches immediately via session_tree!
+    const ancestorBranch: any[] = [];
+    const qaBranch = [{ id: "qa-1", type: "custom", customType: "omp-enhance-role", data: { roleId: "qa" } }];
+    activeBranch = qaBranch;
+    await emit("session_tree", {}, ctxA);
+    sentMessages.length = 0;
+    await commands.get("enhance-status")!.handler("", ctxA);
+    expect(JSON.parse(sentMessages.at(-1)!.content).activeRoleId).toBe("qa");
+    const callsAfterTree = setActiveToolsCalls;
+    await emit("before_agent_start", { systemPrompt: ["Base"] }, ctxA);
+    expect(setActiveToolsCalls).toBe(callsAfterTree);
+
+    activeBranch = ancestorBranch;
+    await emit("session_tree", {}, ctxA);
+    sentMessages.length = 0;
+    await commands.get("enhance-status")!.handler("", ctxA);
+    expect(JSON.parse(sentMessages.at(-1)!.content).activeRoleId).toBe("general");
+
+    // 5) session_switch (/new) to sess-b resets role/model/thinking immediately while idle!
+    await commands.get("role")!.handler("vision", ctxA);
+    expect(currentModel).toMatchObject({ provider: "openrouter", id: "qwen-vl" });
+    currentSessionId = "sess-b";
+    const ctxB = makeCtx(currentSessionId, () => []);
+    await emit("session_switch", {}, ctxB);
+    expect(currentModel).toMatchObject({ provider: "openai-codex", id: "gpt-6.1-sol" });
+    expect(thinkingLevel).toBe("max");
+    expect(activeTools).toContain("enhance_job");
+
+    await emit("session_shutdown", {}, ctxB);
+  });
 });

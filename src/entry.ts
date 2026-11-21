@@ -1,15 +1,24 @@
 import path from "node:path";
 import {
-  loadEnhanceSettings, modelSupportsVision, resolveDefaultGlobalRolesDir, resolveModelSpec,
+  loadEnhanceSettings,
+  modelSupportsVision,
+  resolveDefaultGlobalRolesDir,
+  resolveModelSpec,
 } from "./core/settings.ts";
 import type { RoleSessionRunner } from "./flow/orchestrator.ts";
 import { reconcileJobs } from "./jobs/runner.ts";
 import { registerEnhanceCommands } from "./omp/commands.ts";
-import {
-  createManagedWorkspace, defaultRoleId, isProjectTrusted, readSessionRoleOverride,
-  sessionKey, turnFailedOrAborted, type ManagedWorkspace,
-} from "./omp/session.ts";
+import { turnFailedOrAborted } from "./omp/session.ts";
 import { registerEnhanceTools } from "./omp/tools.ts";
+import {
+  branchOverrideSignature,
+  createManagedWorkspace,
+  defaultRoleId,
+  isProjectTrusted,
+  readSessionRoleOverride,
+  sessionKey,
+  type ManagedWorkspace,
+} from "./omp/workspace.ts";
 import { renderConditioningBlock } from "./roles/conditioning.ts";
 import { registerRoomMessageRenderer } from "./ui/flow-room.ts";
 
@@ -52,16 +61,12 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
     return undefined;
   });
 
-  pi.on("session_start", async (_ev: any, ctx: any) => {
-    try {
-      const ws = getWorkspace(ctx); ws.refresh(ctx);
-      const prevSid = ws.lastSessionId, sid = sessionKey(ctx);
-      ws.trackers.reset(sid, ws.cwd);
-      const ov = readSessionRoleOverride(ctx, ws.roles);
-      const next = ov.found ? ov.roleId : (prevSid !== undefined ? defaultRoleId(ws.roles, ws.settings) : ws.getSessionRoleId(ctx));
-      await ws.applyActiveRole(next, ctx, false);
-    } catch {}
-  });
+  const onSessionLifecycle = async (_ev: any, ctx: any): Promise<void> => {
+    try { await getWorkspace(ctx).syncSessionLifecycle(ctx); } catch {}
+  };
+  for (const lifecycleEvent of ["session_start", "session_switch", "session_branch", "session_tree"] as const) {
+    pi.on(lifecycleEvent, onSessionLifecycle);
+  }
 
   pi.on("session_shutdown", () => {
     for (const ws of workspaces.values()) {
@@ -78,19 +83,29 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
       const ws = getWorkspace(ctx);
       reconcileJobs(ws.store); ws.refresh(ctx);
       const sid = sessionKey(ctx);
-      if (sid !== ws.lastSessionId) {
-        const prevSid = ws.lastSessionId;
+      const curBranchSig = branchOverrideSignature(ctx);
+      if (ws.lastSessionId === undefined) {
         const ov = readSessionRoleOverride(ctx, ws.roles);
-        const next = ov.found ? ov.roleId : (prevSid !== undefined ? defaultRoleId(ws.roles, ws.settings) : ws.getSessionRoleId(ctx));
+        await ws.applyActiveRole(ov.found ? ov.roleId : ws.getSessionRoleId(ctx), ctx, false);
+      } else if (sid !== ws.lastSessionId || curBranchSig !== ws.lastBranchOverrideSig) {
         ws.trackers.reset(sid, ws.cwd);
+        const ov = readSessionRoleOverride(ctx, ws.roles);
+        const next = ov.found
+          ? ov.roleId
+          : ws.rolesBySession.has(sid)
+            ? ws.rolesBySession.get(sid)!
+            : defaultRoleId(ws.roles, ws.settings);
         await ws.applyActiveRole(next, ctx, false);
+      } else {
+        ws.baselines.reconcileManualChanges(pi, ctx);
       }
       ws.syncStatusBar(ctx);
       ws.trackers.get(sid).beginTurn(ws.cwd, true);
       const role = ws.getActiveRole(ctx);
       if (!role) return;
       const mandate = ws.store.getActiveMandate({ sessionId: sid });
-      const effectiveModel = role.model && role.model !== "inherit" ? resolveModelSpec(role.model, ctx) : ctx?.model;
+      const effectiveModel =
+        role.model && role.model !== "inherit" ? resolveModelSpec(role.model, ctx, pi) : ctx?.model;
       const block = renderConditioningBlock({
         role, mandate, epistemicItems: mandate ? ws.store.listEpistemicItems(mandate.id) : [],
         upstreamHandoff: mandate ? ws.store.getLatestHandoff(mandate.id) : null,
@@ -102,7 +117,11 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
   });
 
   pi.on("agent_end", (event: any, ctx: any) => {
-    try { if (!turnFailedOrAborted(event)) getWorkspace(ctx).trackers.get(sessionKey(ctx)).completeTurn(); } catch {}
+    try {
+      const tracker = getWorkspace(ctx).trackers.get(sessionKey(ctx));
+      if (turnFailedOrAborted(event)) tracker.markTurnFailed();
+      else tracker.completeTurn();
+    } catch {}
   });
 
   pi.on("tool_call", (event: any, ctx: any) => {
@@ -110,9 +129,18 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
       const ws = getWorkspace(ctx), tracker = ws.trackers.get(sessionKey(ctx));
       const toolName = event?.toolName ?? event?.name ?? "", input = event?.input ?? event?.args;
       const decision = tracker.checkToolCallAllowed(ws.cwd, ws.getActiveRole(ctx), { toolName, input }, ws.roles);
-      if (!decision.block) tracker.recordToolExecutionStart(toolName, input);
       return decision.block ? decision : undefined;
     } catch { return undefined; }
+  });
+
+  pi.on("tool_execution_start", (event: any, ctx: any) => {
+    try {
+      const ws = getWorkspace(ctx);
+      ws.trackers.get(sessionKey(ctx)).recordToolExecutionStart(
+        event?.toolName ?? event?.name ?? "",
+        event?.args ?? event?.input,
+      );
+    } catch {}
   });
 
   pi.on("tool_execution_end", (event: any, ctx: any) => {
@@ -120,7 +148,7 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
       const ws = getWorkspace(ctx);
       ws.trackers.get(sessionKey(ctx)).recordToolExecutionEnd(ws.cwd, {
         toolCallId: event?.toolCallId ?? event?.id ?? "call", toolName: event?.toolName ?? event?.name ?? "unknown",
-        args: event?.args ?? event?.input, isError: Boolean(event?.isError ?? event?.result?.isError),
+        args: event?.args ?? event?.input, isError: Boolean(evHasError(event)),
       });
     } catch {}
   });
@@ -130,4 +158,8 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
     globalRolesDir: options.globalRolesDir ?? resolveDefaultGlobalRolesDir(),
     builtinRolesDir: options.builtinRolesDir,
   });
+}
+
+function evHasError(event: any): boolean {
+  return Boolean(event?.isError ?? event?.result?.isError);
 }

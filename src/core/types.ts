@@ -15,6 +15,8 @@ export const ROLE_THINKING_LEVELS = [
   "medium",
   "high",
   "xhigh",
+  "max",
+  "auto",
 ] as const;
 
 export type RoleThinkingLevel = (typeof ROLE_THINKING_LEVELS)[number];
@@ -201,6 +203,10 @@ export interface SupervisorPulse {
   idleSec: number;
   deltaBytesOrCalls: number;
   deltaSummary: string;
+  roleId?: string;
+  readOnly?: boolean;
+  allowedTools?: string[];
+  activeAsyncJobs?: number;
   activeTool?: SupervisorActiveTool | null;
   priorDecisions?: SupervisorPriorDecision[];
 }

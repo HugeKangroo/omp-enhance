@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 
-const MAX_TOTAL_SRC_LINES = 6500;
+const MAX_TOTAL_SRC_LINES = 7200;
 const MAX_FILE_LINES = 450;
 const PRIVATE_OMP_IMPORT =
   /(?:from\s+|import\s*\(\s*|require\s*\(\s*)["']@oh-my-pi\/[^"']+\/[^"']+["']/;

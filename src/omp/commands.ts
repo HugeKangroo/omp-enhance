@@ -84,8 +84,8 @@ export function registerEnhanceCommands(
           toTarget: target.id,
           verdict: "ready",
           summary: "Automatic workspace snapshot handoff",
-          baselineSnapshot: tracker.getBaselineSnapshot(),
-          baselineConfigSnapshot: tracker.getBaselineConfigSnapshot(),
+          baselineSnapshot: tracker.getBaselineSnapshot(ws.cwd),
+          baselineConfigSnapshot: tracker.getBaselineConfigSnapshot(ws.cwd),
           observedCalls: tracker.getObservedCalls(),
         });
       const result = await executeRoleStep({

@@ -31,7 +31,7 @@ flowchart TB
 
     subgraph Layers["omp-enhance 单向分层内核 (src/)"]
         Entry["src/entry.ts (薄入口协调器)"]
-        OMP["src/omp/{session,tools,commands}.ts (OMP SDK / 工具 / 命令适配层)"]
+        OMP["src/omp/{workspace,session,tools,commands}.ts (OMP SDK / 工具 / 命令适配层)"]
         UI["src/ui/{kit,role-studio,flow-room}.ts (ANSI 安全 TUI 组件与双栏检查器)"]
         Flow["src/flow/{tracker,handoff,state,orchestrator}.ts (马尔可夫交接与协同状态机)"]
         Jobs["src/jobs/{runner,supervisor}.ts (防 PID 复用后台长作业与自适应巡检)"]
@@ -63,13 +63,13 @@ flowchart TB
 | `src/core/types.ts` | 全系统唯一共享纯数据类型契约 | 零外部模块依赖与运行时副作用 |
 | `src/core/fs.ts` | 遵循 `.gitignore` 的增量元数据缓存 `sha256` 快照、符号链接真实路径校验与 `.omp/` 配置完整性封印 | 跳过超大二进制与虚拟环境目录，杜绝阻塞主线程 |
 | `src/core/store.ts` | `bun:sqlite` WAL + `busy_timeout = 5000` 6 张表事务存储、外键级联、会话/流程级 `Mandate` 作用域与进程启动指纹校验 | 关闭后拒绝幽灵重开覆写检查点 |
-| `src/core/policy.ts` | 工具激活集合计算、伴随工具防提权校验、`write`/`edit`/`apply_patch` 闭环守卫与 `TurnTracker` | 前台与子会话共享单一权限真源 |
-| `src/core/settings.ts` | 读取 OMP 原生插件设置（支持 `--profile` 与父目录覆盖，受 `isProjectTrusted` 门禁保护）及模型/用量归一化 | 与系统内置 `/settings → Plugins` 无缝互通 |
-| `src/roles/{serializer,loader,conditioning}.ts` | 无损 YAML 序列化（`|2` 缩进与标量防强转）、单文件故障隔离加载、防标签逃逸条件块渲染 | 单个损坏 YAML 绝不拖垮宿主钩子 |
-| `src/jobs/{runner,supervisor}.ts` | 环境变量隔离的原子 `.exit` 后台作业执行、防 PID 复用信号终止（`SIGTERM → SIGKILL` 升级）、尾部定位日志读取与竞态安全自适应巡检 | 仅依赖 `core/`，与宿主 SDK 解耦 |
+| `src/core/policy.ts` | 工具激活集合计算、伴随工具防提权校验、`write`/`edit`/`apply_patch`/`ast_edit` 闭环守卫与惰性 `TurnTracker` | 前台与子会话共享单一权限真源，启动零磁盘阻塞 |
+| `src/core/settings.ts` | 读取 OMP 原生插件设置（支持 `--profile` 与父目录覆盖，受 `isProjectTrusted` 门禁保护）、`@<role>:thinking` 后缀解析（含 `max`/`auto`）及用量归一化 | 与系统内置 `/settings → Plugins` 无缝互通 |
+| `src/roles/{serializer,loader,conditioning}.ts` | 无损 YAML 序列化（`|2` 缩进与标量防强转）、单文件故障隔离加载（支持符号链接角色文件）、防标签逃逸条件块渲染 | 单个损坏 YAML 绝不拖垮宿主钩子 |
+| `src/jobs/{runner,supervisor}.ts` | 环境变量隔离的原子 `.exit` 后台作业执行、防 PID 复用批量信号终止（`SIGTERM → SIGKILL` 升级）、尾部定位日志读取与竞态安全自适应巡检 | 仅依赖 `core/`，与宿主 SDK 解耦 |
 | `src/flow/{tracker,handoff,state,orchestrator}.ts` | 落库前读写边界封印校验（`BoundaryViolationError`）、带属主 PID 保护的 `FlowRoomManager` 纯状态机与多角色返修编排 | 违约状态禁止写入脏交接包或断点续跑 |
 | `src/ui/{kit,role-studio,flow-room}.ts` | Kitty CSI-u 键盘解析、ANSI 安全截断折行、带滚动视窗的 Role Studio 与 `/flow` 双栏群聊检查器 | 纯 UI 渲染，不含 SQLite 或子进程逻辑 |
-| `src/omp/{session,tools,commands}.ts` & `src/entry.ts` | 封装 `SessionManager.inMemory` 隔离会话派生、会话模型基线还原、带 `AbortSignal` 透传的 4 个工具与斜杠命令 | 零 `@oh-my-pi/` 私有子路径导入；不覆盖原生 `/handoff` |
+| `src/omp/{workspace,session,tools,commands}.ts` & `src/entry.ts` | 封装 `SessionManager.inMemory` 子任务隔离会话派生、会话模型基线还原、带 `AbortSignal` 透传的 4 个工具与斜杠命令 | 零 `@oh-my-pi/` 私有子路径导入；不覆盖原生 `/handoff` |
 
 ---
 
@@ -94,9 +94,10 @@ flowchart TB
 | --- | --- |
 | `targetKind` | `job`（后台进程组）或 `role_session`（隔离角色子会话） |
 | `goal` | 原始任务或 `Mandate.goal` |
-| `checkNumber` / `elapsedSec` / `idleSec` | 第几次巡检、真实总耗时（已运行作业按 `job.startedAt` 计算）、距最近增量输出或活跃工具的静默时长 |
+| `checkNumber` / `elapsedSec` / `idleSec` | 第几次巡检、真实总耗时（已运行作业按 `job.startedAt` 计算）、距最近增量输出、活跃工具或后台异步任务的静默时长 |
 | `deltaBytesOrCalls` / `deltaSummary` | 本周期新增日志字节或已完成工具调用数；日志尾部包裹在 `untrusted_log_tail: <<<...>>>` 定界符内防止提示词注入 |
-| `activeTool` / `priorDecisions` | 当前正在执行的长耗时工具及耗时（防止正常长测试被误判为空转），以及最近 5 次巡检裁决历史（防止无记忆重复 `steer`） |
+| `roleId` / `readOnly` / `allowedTools` | 角色子会话的身份与工具边界元数据（对只读或无 `bash` 阶段严禁误导执行 Shell 命令） |
+| `activeTool` / `activeAsyncJobs` / `priorDecisions` | 当前正在执行的长耗时工具、OMP 原生后台异步任务数（`bg_*` 运行期计为活跃进展），以及最近 5 次巡检裁决历史（防止无记忆重复 `steer`） |
 
 监督模型严格输出单个 JSON 对象（支持平衡花括号扫描提取）：
 

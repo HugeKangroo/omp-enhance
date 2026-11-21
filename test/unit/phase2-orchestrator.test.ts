@@ -10,7 +10,13 @@ import { createAndVerifyHandoff } from "../../src/flow/handoff.ts";
 import {
   executeRoleFlow, executeRoleStep, type RoleSessionRunner, type RoleStepContext,
 } from "../../src/flow/orchestrator.ts";
-import { createOmpRoleSessionRunner, createOmpSupervisorInspector } from "../../src/omp/session.ts";
+import {
+  countActiveAsyncJobs,
+  createChildSettingsProxy,
+  createOmpRoleSessionRunner,
+  createOmpSupervisorInspector,
+} from "../../src/omp/session.ts";
+import { schemaKit } from "../../src/omp/tools.ts";
 import { discoverRoles } from "../../src/roles/loader.ts";
 
 const tempDirs: string[] = [];
@@ -88,10 +94,31 @@ describe("Markov role conditioning", () => {
         verifiedFacts: [
           { claim: "Legacy module removed cleanly", evidenceRef: "dev-tc-1" },
           { claim: "add(a, b) returns a + b", evidenceRef: "src/math.ts:1" },
+          { claim: "raw selector supported", evidenceRef: "src/math.ts:1-1:raw" },
+          { claim: "summary selector supported", evidenceRef: "src/math.ts:summary" },
+          { claim: "parenthetical note supported", evidenceRef: "src/math.ts:1 (raw read; 60B)" },
+          { claim: "em-dash note supported", evidenceRef: "src/math.ts:1 — `export const add`" },
+          { claim: "semicolon note supported", evidenceRef: "src/math.ts:1; directory listing" },
+          { claim: "workspace root dir supported", evidenceRef: "." },
+          { claim: "src directory prefix supported", evidenceRef: "src/" },
         ],
       });
       expect(realUpstream.deletedFiles).toEqual(["src/legacy.ts"]);
-      expect(realUpstream.verifiedFacts).toHaveLength(2);
+      expect(realUpstream.verifiedFacts).toHaveLength(9);
+      expect(() =>
+        createAndVerifyHandoff({
+          store, role: roles.get("dev")!, cwd, mandate, toTarget: "reviewer",
+          verdict: "ready", summary: "BAD_DB_REF", observedCalls: [devCall],
+          verifiedFacts: [{ claim: "internal sqlite", evidenceRef: ".omp-enhance/state.sqlite" }],
+        }),
+      ).toThrow(/Unverified verifiedFacts evidenceRef/);
+      expect(() =>
+        createAndVerifyHandoff({
+          store, role: roles.get("dev")!, cwd, mandate, toTarget: "reviewer",
+          verdict: "ready", summary: "BAD_DIR_REF", observedCalls: [devCall],
+          verifiedFacts: [{ claim: "missing dir", evidenceRef: "nonexistent-dir/" }],
+        }),
+      ).toThrow(/Unverified verifiedFacts evidenceRef/);
 
       const upstream: HandoffEnvelope & { chatTranscript: string } = {
         ...realUpstream,
@@ -138,6 +165,9 @@ describe("Markov role conditioning", () => {
       }
       expect(captured!.conditioningPrompt).toContain("<omp-enhance-conditioning>");
       expect(captured!.conditioningPrompt).toContain("## User Interjections");
+      expect(captured!.taskPrompt).toContain("Verification mode: static/read-only source inspection");
+      expect(captured!.taskPrompt).toContain("do NOT attempt shell execution or spawn subagents for shell access");
+      expect(captured!.taskPrompt).toContain("do NOT read or grep .omp-enhance/state.sqlite directly");
     } finally {
       store.close();
     }
@@ -218,8 +248,8 @@ describe("Markov role conditioning", () => {
   });
 });
 
-describe("child role & supervisor session isolation (A1, A2.2, A4)", () => {
-  test("passes SessionManager.inMemory, isolates host modelRegistry, exposes stage companion tools, and enforces restrictToolNames on supervisor", async () => {
+describe("child role & supervisor session isolation (F-A1, F-A2, F-A4, F-A6, F-C2)", () => {
+  test("passes sub-session identity, child settings overlay/proxy, preloadedPreparedExtensions with restrictToolNames: true, pulse metadata, and stage abort job cleanup", async () => {
     const root = tempDir();
     const cwd = path.join(root, "workspace");
     mkdirSync(cwd, { recursive: true });
@@ -236,7 +266,24 @@ describe("child role & supervisor session isolation (A1, A2.2, A4)", () => {
         syncExtensionSources() { customProvidersCleared = true; }
         clearSourceRegistrations() { customProvidersCleared = true; }
       }
+      class MockOmpSettings {
+        #secret = "settings-ok";
+        overrides: Record<string, unknown>;
+        constructor(overrides: Record<string, unknown> = {}) { this.overrides = overrides; }
+        get secret() { return this.#secret; }
+        overlay(patch: Record<string, unknown>) { return new MockOmpSettings({ ...this.overrides, ...patch }); }
+      }
       const hostModelRegistry = new MockModelRegistry();
+      const hostSettings = new MockOmpSettings({ "advisor.enabled": true, "memory.backend": "local" });
+
+      // Verify plain-object fallback proxy also disables advisor/memory/autolearn cleanly
+      const plainWrapped = createChildSettingsProxy({ advisor: { enabled: true, model: "x" }, memory: { backend: "local", enabled: true }, autolearn: { enabled: true } });
+      expect(plainWrapped.advisor).toEqual({ enabled: false, model: "x" });
+      expect(plainWrapped.memory).toEqual({ backend: "off", enabled: false });
+      expect(plainWrapped.autolearn).toEqual({ enabled: false });
+      expect(plainWrapped.get("advisor.enabled")).toBe(false);
+      expect(plainWrapped.get("memory.backend")).toBe("off");
+      expect(countActiveAsyncJobs({ getAsyncJobSnapshot: () => ({ running: [{ id: "bg_1" }, { id: "bg_2" }] }) })).toBe(2);
 
       const childHandlers = new Map<string, Array<(event: Record<string, unknown>) => unknown>>();
       const captures: any[] = [];
@@ -245,16 +292,20 @@ describe("child role & supervisor session isolation (A1, A2.2, A4)", () => {
         getAllTools: () => ["read", "write", "edit", "bash", "enhance_handoff"].map((name) => ({ name })),
         getThinkingLevel: () => "off",
         pi: {
-          settings: {},
+          settings: hostSettings,
           SessionManager: { inMemory: (dir: string) => ({ ...inMemorySentinel, dir }) },
           async createAgentSession(options: any) {
             captures.push(options);
-            // Verify ES2022 `#private` getters on proxied modelRegistry do NOT throw TypeError!
             expect(options.modelRegistry?.authStorage).toEqual({ ok: true });
-            // Simulate OMP 19.0.x mutating modelRegistry when restrictToolNames !== true
+            expect(options.settings?.secret).toBe("settings-ok");
+            expect(options.settings?.overrides).toMatchObject({ "advisor.enabled": false, "memory.backend": "off" });
             options.modelRegistry?.syncExtensionSources?.([]);
             options.modelRegistry?.clearSourceRegistrations?.(new Set());
-            for (const extension of options.extensions ?? []) {
+            // Mirror OMP 19.0.1 sdk.ts: when restrictToolNames === true, t.extensions is skipped and ONLY preloadedPreparedExtensions bind!
+            const factories = options.restrictToolNames
+              ? (options.preloadedPreparedExtensions ?? []).map((e: any) => e.factory)
+              : (options.extensions ?? []);
+            for (const extension of factories) {
               extension({
                 on(name: string, handler: (event: Record<string, unknown>) => unknown) {
                   childHandlers.set(name, [...(childHandlers.get(name) ?? []), handler]);
@@ -264,6 +315,7 @@ describe("child role & supervisor session isolation (A1, A2.2, A4)", () => {
             return {
               session: {
                 messages: [{ role: "assistant", usage: { input: 50, output: 20, cost: { total: 0.001 } } }],
+                getAsyncJobSnapshot: () => ({ running: [{ id: "bg_3" }] }),
                 async prompt() {},
                 getLastAssistantText: () => '{"action":"continue","reason":"healthy","nextCheckSec":45}',
                 getLastAssistantMessage: () => ({ role: "assistant", stopReason: "stop", usage: { input: 50, output: 20, cost: { total: 0.001 } } }),
@@ -274,36 +326,105 @@ describe("child role & supervisor session isolation (A1, A2.2, A4)", () => {
         },
       };
 
-      // 1) Stage session (algo/qa) gets SessionManager.inMemory, isolated modelRegistry, enhance_mandate + enhance_job
+      // 1) Stage session (qa) gets sub-session identity, restrictToolNames: true, autoApprove: true, enableMemory: false, and preloadedPreparedExtensions
       const runner = createOmpRoleSessionRunner(fakePi, { cwd, modelRegistry: hostModelRegistry }, undefined, roles);
       await runner.runRoleTurn({
         cwd, store, role: roles.get("qa")!, mandate, epistemicItems: [],
-        upstreamHandoff: null, toTarget: "user", conditioningPrompt: "", taskPrompt: "",
+        upstreamHandoff: null, toTarget: "user", conditioningPrompt: "", taskPrompt: "", stageId: "qa-r0",
       });
 
       const stageCap = captures[0]!;
       expect(customProvidersCleared).toBe(false);
       expect(stageCap.sessionManager).toMatchObject({ kind: "in-memory-session", dir: cwd });
+      expect(stageCap.agentId).toBe("enhance-stage-qa-r0");
+      expect(stageCap.parentTaskPrefix).toBe("enhance-stage-qa-r0");
+      expect(stageCap.taskDepth).toBe(1);
       expect(stageCap.hasUI).toBe(false);
-      expect(stageCap.restrictToolNames).not.toBe(true);
+      expect(stageCap.autoApprove).toBe(true);
+      expect(stageCap.enableMemory).toBe(false);
+      expect(stageCap.restrictToolNames).toBe(true);
+      expect(stageCap.allowRestrictedCustomTools).toBe(true);
       expect(stageCap.toolNames).toContain("enhance_handoff");
       expect(stageCap.toolNames).toContain("enhance_mandate");
       expect(stageCap.toolNames).toContain("enhance_job");
       expect(stageCap.customTools.map((t: any) => t.name)).toEqual(["enhance_handoff", "enhance_mandate", "enhance_job"]);
+      // F-A6: pure protocol tools omit approval: "write", while enhance_job retains approval: "exec"
+      expect(stageCap.customTools[0]!.approval).toBeUndefined();
+      expect(stageCap.customTools[1]!.approval).toBeUndefined();
+      expect(stageCap.customTools[2]!.approval).toBe("exec");
 
       const guard = childHandlers.get("tool_call")?.[0]!;
       expect((guard({ toolName: "write", input: { path: "docs/outside.md" } }) as { block?: boolean }).block).toBe(true);
       expect(guard({ toolName: "write", input: { path: "test/app.test.ts" } })).toBeUndefined();
+      expect(childHandlers.get("tool_execution_start")).toHaveLength(1);
 
-      // 2) Read-only stage (reviewer) does NOT receive enhance_job
+      // 2) Read-only stage (reviewer) forwards roleId/readOnly/allowedTools/activeAsyncJobs in supervisor pulse!
+      const seenPulses: any[] = [];
       await runner.runRoleTurn({
         cwd, store, role: roles.get("reviewer")!, mandate, epistemicItems: [],
         upstreamHandoff: null, toTarget: "user", conditioningPrompt: "", taskPrompt: "",
+        supervisor: {
+          role: roles.get("supervisor")!,
+          initialDelayMs: 5,
+          inspector: {
+            async evaluatePulse(pulse) {
+              seenPulses.push(pulse);
+              return { action: "abort", reason: "test abort", nextCheckSec: 30 };
+            },
+          },
+        },
       });
       expect(captures[1]!.toolNames).not.toContain("enhance_job");
       expect(captures[1]!.toolNames).toContain("enhance_mandate");
 
-      // 3) Supervisor inspector passes SessionManager.inMemory AND restrictToolNames: true + empty skills/rules
+      // 3) Stage-started enhance_job(action="start") is automatically cancelled if stage aborts (F-C2)!
+      let startedJobId = "";
+      const abortingPi = {
+        ...fakePi,
+        pi: {
+          ...fakePi.pi,
+          async createAgentSession(options: any) {
+            const jobTool = options.customTools.find((t: any) => t.name === "enhance_job");
+            return {
+              session: {
+                messages: [],
+                getAsyncJobSnapshot: () => ({ running: [{ id: "bg_9" }] }),
+                async prompt() {
+                  const res = await jobTool.execute("jb-1", { action: "start", command: "sleep 30" });
+                  startedJobId = JSON.parse(res.content[0].text).job.jobId;
+                  await Bun.sleep(40);
+                },
+                getLastAssistantText: () => "",
+                getLastAssistantMessage: () => null,
+                async dispose() {},
+              },
+            };
+          },
+        },
+      };
+      const abortRunner = createOmpRoleSessionRunner(abortingPi, { cwd, modelRegistry: hostModelRegistry }, undefined, roles);
+      const abortOutcome = await abortRunner.runRoleTurn({
+        cwd, store, role: roles.get("qa")!, mandate, epistemicItems: [],
+        upstreamHandoff: null, toTarget: "user", conditioningPrompt: "", taskPrompt: "",
+        supervisor: {
+          role: roles.get("supervisor")!,
+          initialDelayMs: 10,
+          inspector: {
+            async evaluatePulse(pulse) {
+              seenPulses.push(pulse);
+              return { action: "abort", reason: "stage stuck", nextCheckSec: 30 };
+            },
+          },
+        },
+      });
+      expect(abortOutcome.abortedBySupervisor?.reason).toBe("stage stuck");
+      expect(startedJobId).not.toBe("");
+      expect(store.getJob(startedJobId)?.status).toBe("cancelled");
+      const qaPulse = seenPulses.find((p) => p.roleId === "qa");
+      expect(qaPulse).toMatchObject({ roleId: "qa", readOnly: false, activeAsyncJobs: 1 });
+      expect(qaPulse.allowedTools).toContain("bash");
+
+      // 4) Supervisor inspector passes sub-session identity, autoApprove: true, enableMemory: false, and restrictToolNames: true
       const inspector = createOmpSupervisorInspector(fakePi, { cwd, modelRegistry: hostModelRegistry });
       const decision = await inspector.evaluatePulse({
         targetKind: "job", goal: "Train", checkNumber: 1, elapsedSec: 30, idleSec: 5, deltaBytesOrCalls: 100, deltaSummary: "ok",
@@ -311,6 +432,9 @@ describe("child role & supervisor session isolation (A1, A2.2, A4)", () => {
       expect(decision.action).toBe("continue");
       expect(captures[2]!).toMatchObject({
         hasUI: false,
+        autoApprove: true,
+        enableMemory: false,
+        taskDepth: 1,
         restrictToolNames: true,
         toolNames: [],
         skills: [],
@@ -318,6 +442,8 @@ describe("child role & supervisor session isolation (A1, A2.2, A4)", () => {
         promptTemplates: [],
         slashCommands: [],
       });
+      expect(String(captures[2]!.agentId)).toStartWith("enhance-sup-1-");
+      expect(captures[2]!.parentTaskPrefix).toBe(captures[2]!.agentId);
       expect(captures[2]!.sessionManager).toMatchObject({ kind: "in-memory-session", dir: cwd });
     } finally {
       store.close();
@@ -476,16 +602,20 @@ function createHarness(cwd: string, root: string) {
   const tools = new Map<string, any>();
   const commands = new Map<string, any>();
   const messages: string[] = [];
+  const rawMessages: Array<{ content: string; excludeFromContext?: boolean }> = [];
   const notifications: string[] = [];
   let activeTools: string[] = [];
   let currentModel: unknown = { provider: "anthropic", id: "claude-sonnet-4" };
   let thinkingLevel = "high";
+  const branchEntries: unknown[] = [
+    { type: "message", message: { role: "assistant", usage: { input: 240, output: 80, cost: { total: 0.004 } } } },
+  ];
 
   const allToolNames = [
     "read", "grep", "lsp", "bash", "edit", "write", "web_search",
     "enhance_mandate", "enhance_handoff", "enhance_flow", "enhance_job",
   ];
-  const ctx: TestContext = {
+  const ctx: TestContext & { sessionManager?: { getBranch(): unknown[] } } = {
     cwd,
     ui: { notify: (message: string) => { notifications.push(message); } },
     modelRegistry: {},
@@ -494,6 +624,7 @@ function createHarness(cwd: string, root: string) {
       resolve: (spec: string) => (spec === "@vision" ? { provider: "openrouter", id: "qwen-vl", input: ["text", "image"] } : undefined),
       list: () => [],
     },
+    sessionManager: { getBranch: () => branchEntries },
   };
   const pi = {
     on(name: string, handler: (event: Record<string, unknown>, ctx: TestContext) => unknown) {
@@ -501,7 +632,10 @@ function createHarness(cwd: string, root: string) {
     },
     registerTool(tool: any) { tools.set(tool.name, tool); },
     registerCommand(name: string, command: any) { commands.set(name, command); },
-    sendMessage(message: { content: string }) { messages.push(message.content); },
+    sendMessage(message: { content: string; excludeFromContext?: boolean }) {
+      messages.push(message.content);
+      rawMessages.push(message);
+    },
     getAllTools() { return allToolNames.map((name) => ({ name })); },
     async setActiveTools(names: string[]) { activeTools = names; },
     async setModel(m: unknown) { currentModel = m; },
@@ -533,7 +667,7 @@ function createHarness(cwd: string, root: string) {
     await command.handler(args, ctx);
   };
   return {
-    ctx, tools, commands, messages, notifications, runHook, execTool, runCommand,
+    ctx, tools, commands, messages, rawMessages, notifications, runHook, execTool, runCommand,
     activeTools: () => activeTools,
     currentModel: () => currentModel,
     thinkingLevel: () => thinkingLevel,
@@ -617,12 +751,32 @@ describe("entry extension", () => {
     expect(harness.activeTools()).toContain("web_search");
 
     await harness.runCommand("role", "dev");
+    // F-A6 & F-A9: protocol tools omit approval: "write", schemaKit enforces additionalProperties: false
+    expect(harness.tools.get("enhance_mandate")!.approval).toBeUndefined();
+    expect(harness.tools.get("enhance_handoff")!.approval).toBeUndefined();
+    expect(harness.tools.get("enhance_flow")!.approval).toBe("exec");
+    expect(harness.tools.get("enhance_job")!.approval).toBe("exec");
+    let capturedObjOpts: unknown = null;
+    const kit = schemaKit({
+      typebox: {
+        Type: {
+          String: () => ({ type: "string" }),
+          Optional: (v: unknown) => ({ opt: v }),
+          Object: (props: unknown, opts: unknown) => { capturedObjOpts = opts; return { props, opts }; },
+        },
+      },
+    });
+    kit.obj({ verdict: kit.str() }, ["verdict"]);
+    expect(capturedObjOpts).toEqual({ additionalProperties: false });
+
     const handoffPayload = await harness.execTool("enhance_handoff", {
       verdict: "ready", summary: "Delivered the mandate",
     });
     const handoff = handoffPayload.handoff as HandoffEnvelope;
     expect(handoff.fromRole).toBe("dev");
     expect(handoff.toTarget).toBe("user");
+    // F-A9: foreground enhance_handoff extracts observedUsage from sessionManager.getBranch()!
+    expect(handoff.observedUsage).toEqual({ inputTokens: 240, outputTokens: 80, costUsd: 0.004 });
 
     const inspect = new EnhanceStore(path.join(cwd, ".omp-enhance", "state.sqlite"));
     try {
@@ -632,6 +786,7 @@ describe("entry extension", () => {
     }
 
     await harness.runCommand("enhance-status", "");
+    expect(harness.rawMessages.at(-1)?.excludeFromContext).toBe(true);
     const status = JSON.parse(harness.messages.at(-1)!) as {
       activeRoleId: string | null;
       roleCount: number;

@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
@@ -310,6 +311,38 @@ describe("EnhanceStore", () => {
       store.close();
     }
   });
+
+  test("reads legacy 5-table state.sqlite read-only without dirtying WAL, and migrates columns before creating indexes on write", () => {
+    const legacyDir = tempDir();
+    const dbPath = path.join(legacyDir, "legacy-state.sqlite");
+    const raw = new Database(dbPath);
+    raw.exec(`
+      CREATE TABLE mandates (id TEXT PRIMARY KEY, rev INTEGER NOT NULL, goal TEXT NOT NULL, constraints TEXT NOT NULL, acceptance TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE epistemic_items (id TEXT PRIMARY KEY, mandate_id TEXT NOT NULL, kind TEXT NOT NULL, statement TEXT NOT NULL, evidence_ref TEXT, verification_plan TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE artifacts (artifact_id INTEGER PRIMARY KEY AUTOINCREMENT, mandate_id TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL, byte_size INTEGER NOT NULL, role TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE handoffs (id TEXT PRIMARY KEY, mandate_id TEXT NOT NULL, mandate_rev INTEGER NOT NULL, parent_handoff_id TEXT, from_role TEXT NOT NULL, to_target TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL, artifacts TEXT NOT NULL, verified_facts TEXT NOT NULL, open_risks TEXT NOT NULL, feedback_for_upstream TEXT, observed_usage TEXT, created_at TEXT NOT NULL);
+      CREATE TABLE jobs (job_id TEXT PRIMARY KEY, mandate_id TEXT, hypothesis_id TEXT, command TEXT NOT NULL, cwd TEXT NOT NULL, pid INTEGER NOT NULL, pgid INTEGER NOT NULL, log_path TEXT NOT NULL, exit_file_path TEXT NOT NULL, status TEXT NOT NULL, exit_code INTEGER, started_at TEXT NOT NULL, ended_at TEXT);
+      INSERT INTO mandates VALUES ('m-legacy', 1, 'Legacy goal', '[]', '[]', 'active', '2026-11-19T00:00:00.000Z', '2026-11-19T00:00:00.000Z');
+    `);
+    raw.close();
+
+    const store = new EnhanceStore(dbPath);
+    try {
+      // Read-only startup queries on legacy schema (no flow_runs table, no session_id/flow_id columns) succeed with 0 WAL writes
+      expect(store.getLatestFlowCheckpoint()).toBeNull();
+      expect(store.getFlowCheckpoint("f-none")).toBeNull();
+      expect(store.getActiveMandate({ sessionId: "sess-x" })?.id).toBe("m-legacy");
+      expect(store.getActiveMandate({ flowId: "flow-x" })).toBeNull();
+      expect(existsSync(`${dbPath}-wal`)).toBe(false);
+
+      // First write upgrades schema: SCHEMA_TABLES -> migrateSchema -> SCHEMA_INDEXES (idx_mandates_session, idx_mandates_flow)
+      const created = store.upsertMandate({ goal: "Post-migration mandate", sessionId: "sess-x" });
+      expect(created.sessionId).toBe("sess-x");
+      expect(store.getActiveMandate({ sessionId: "sess-x" })?.id).toBe(created.id);
+    } finally {
+      store.close();
+    }
+  });
 });
 
 describe("roles loader, serializer, and conditioning", () => {
@@ -362,6 +395,21 @@ describe("roles loader, serializer, and conditioning", () => {
     expect(untrusted.roles.get("qa")?.source).toBe("global");
     expect(untrusted.roles.get("qa")?.name).toBe("Global QA");
     expect(untrusted.diagnostics.some((d) => d.source === "project")).toBe(true);
+
+    // Symlinked .yaml role file loads cleanly while directory/broken symlinks are safely ignored
+    const externalDir = path.join(root, "external-roles");
+    mkdirSync(externalDir, { recursive: true });
+    writeFile(externalDir, "linked-auditor.yaml", "id: linked-auditor\nname: Linked Auditor\nthinking: max\nstance: Follow proof\nmethod:\n  - inspect\n");
+    mkdirSync(path.join(externalDir, "subdir.yaml"), { recursive: true });
+    symlinkSync(path.join(externalDir, "linked-auditor.yaml"), path.join(globalDir, "linked-auditor.yaml"));
+    symlinkSync(path.join(externalDir, "subdir.yaml"), path.join(globalDir, "subdir.yaml"));
+    symlinkSync(path.join(externalDir, "missing.yaml"), path.join(globalDir, "dangling.yaml"));
+
+    const withSymlinks = discoverRolesWithDiagnostics({ cwd, globalRolesDir: globalDir, isProjectTrusted: true });
+    expect(withSymlinks.roles.get("linked-auditor")?.name).toBe("Linked Auditor");
+    expect(withSymlinks.roles.get("linked-auditor")?.thinking).toBe("max");
+    expect(withSymlinks.roles.has("subdir")).toBe(false);
+    expect(withSymlinks.roles.has("dangling")).toBe(false);
   });
 
   test("round-trips numeric/boolean IDs, leading-indent stance, and removes shadowed .yml files", () => {
@@ -585,6 +633,53 @@ describe("policy & TurnTracker", () => {
       .toMatchObject({ block: true });
     expect(tracker.checkToolCallAllowed(cwd, reviewer, { toolName: "read", input: { path: "src/app.ts" } }))
       .toEqual({ block: false });
+
+    // ast_edit, learn, memory_edit, retain, manage_skill, context_notes, new_context blocked on read-only roles
+    const customReadonly = parseRoleYaml(
+      "id: ro-open\nname: RO Open\nstance: Read only\nmethod:\n  - read\npermissions:\n  writable: []\n  protected: [\"**\"]\n",
+      "project", path.join(cwd, "ro-open.yaml"),
+    );
+    for (const mutTool of ["ast_edit", "learn", "memory_edit", "retain", "manage_skill", "context_notes", "new_context"]) {
+      expect(resolveRoleActiveTools(customReadonly, ["read", mutTool], "stage")).toEqual(["read", "enhance_handoff", "enhance_mandate"]);
+      expect(tracker.checkToolCallAllowed(cwd, customReadonly, { toolName: mutTool, input: { paths: ["test/app.test.ts"] } }))
+        .toMatchObject({ block: true });
+    }
+
+    // Bounded write role with ast_edit permitted: validates path/paths/files/glob & blocks root/protected/symlink escapes
+    const qaAst = { ...qa, permissions: { ...qa.permissions, tools: [...(qa.permissions.tools ?? []), "ast_edit"] } };
+    mkdirSync(path.join(cwd, "tests"), { recursive: true });
+    writeFile(cwd, "tests/clean.test.ts", "expect(1).toBe(1);\n");
+    expect(tracker.checkToolCallAllowed(cwd, qaAst, { toolName: "ast_edit", input: { ops: [] } })).toMatchObject({ block: true });
+    expect(tracker.checkToolCallAllowed(cwd, qaAst, { toolName: "ast_edit", input: { path: "." } })).toMatchObject({ block: true });
+    expect(tracker.checkToolCallAllowed(cwd, qaAst, { toolName: "ast_edit", input: { glob: "**/*.test.ts" } })).toMatchObject({ block: true });
+    expect(tracker.checkToolCallAllowed(cwd, qaAst, { toolName: "ast_edit", input: { paths: ["src/**/*.ts"] } })).toMatchObject({ block: true });
+    // test/ contains symlink sneaky-src -> ../src, so globbing test/** must fail closed!
+    expect(tracker.checkToolCallAllowed(cwd, qaAst, { toolName: "ast_edit", input: { paths: ["test/**/*.ts"] } })).toMatchObject({ block: true });
+    // Clean tests/** directory and direct test file path succeed
+    expect(tracker.checkToolCallAllowed(cwd, qaAst, { toolName: "ast_edit", input: { paths: ["tests/**/*.ts"] } })).toEqual({ block: false });
+    expect(tracker.checkToolCallAllowed(cwd, qaAst, { toolName: "ast_edit", input: { path: "tests", glob: "*.test.ts" } })).toEqual({ block: false });
+    expect(tracker.checkToolCallAllowed(cwd, qaAst, { toolName: "ast_edit", input: { files: ["test/app.test.ts"] } })).toEqual({ block: false });
+  });
+
+  test("TurnTracker.resetTurn is lazy (zero pre-turn snapshot freezing) while computing on demand and snapshotting at beginTurn", () => {
+    const cwd = tempDir();
+    writeFile(cwd, "src/main.ts", "export const v = 1;\n");
+
+    const tracker = new TurnTracker();
+    tracker.resetTurn(cwd);
+    // User edits file AFTER session_start resetTurn() and BEFORE Turn 1 beginTurn()
+    writeFile(cwd, "src/main.ts", "export const v = 2;\n");
+    tracker.beginTurn(cwd, true);
+
+    // Baseline reflects v = 2 (Turn 1 start), NOT stale v = 1 from boot!
+    const snap = tracker.getBaselineSnapshot();
+    expect(snap?.get("src/main.ts")?.sha256).toBe(createHash("sha256").update("export const v = 2;\n").digest("hex"));
+
+    // On-demand fallback when getBaselineSnapshot() is called directly after resetTurn() without beginTurn()
+    const lazyTracker = new TurnTracker();
+    lazyTracker.resetTurn(cwd);
+    expect(lazyTracker.getBaselineSnapshot()?.has("src/main.ts")).toBe(true);
+    expect(lazyTracker.getBaselineConfigSnapshot()).not.toBeNull();
   });
 
   test("records calls, active in-flight tool, extracted paths, and stage/foreground active tools", () => {

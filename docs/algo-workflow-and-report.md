@@ -31,7 +31,7 @@ algo_work/
     └── ...                       # 最优 Keep 实验件的推理入口与模型/参数副本
 ```
 
-长耗时训练或超参搜索无论在主会话（`/role algo`）还是隔离阶段（`/flow`、`/enhance-handoff algo`、`@algo`）中，均可直接调用 `enhance_job`（`start` / `watch`）在后台进程组中运行并自适应止损，使用 `enhance_mandate` 在认知黑板登记假设与已核验指标证据。
+长耗时训练或超参搜索无论在主会话（`/role algo`）还是隔离阶段（`/flow`、`/enhance-handoff algo`、`@algo`）中，均可调用 `enhance_job`（`start` / `watch`：支持跨会话持久化、`@advisor` 巡检止损，且阶段被中止时自动清理残留后台进程组）或 OMP 原生 `bash` 后台异步任务（`bg_*`，自动计入 `SupervisorPulse.activeAsyncJobs` 活跃进展），并使用 `enhance_mandate` 在认知黑板登记假设与已核验指标证据。
 
 ---
 

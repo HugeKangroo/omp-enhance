@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import type {
   ArtifactRecord, BackgroundJob, EpistemicItem, EpistemicKind, EpistemicStatus,
@@ -60,42 +60,25 @@ export function isProcessAliveWithToken(pid: number, expectedToken?: string | nu
   return !expectedToken || captureProcessStartToken(pid) === expectedToken;
 }
 
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS mandates (id TEXT PRIMARY KEY, rev INTEGER NOT NULL, goal TEXT NOT NULL,
-  constraints TEXT NOT NULL, acceptance TEXT NOT NULL, status TEXT NOT NULL, session_id TEXT, flow_id TEXT,
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS epistemic_items (id TEXT PRIMARY KEY,
-  mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
-  kind TEXT NOT NULL CHECK (kind IN ('fact', 'hypothesis', 'inquiry', 'decision')), statement TEXT NOT NULL,
-  evidence_ref TEXT, verification_plan TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL,
-  CHECK (kind != 'fact' OR (evidence_ref IS NOT NULL AND length(trim(evidence_ref)) > 0)));
-CREATE TABLE IF NOT EXISTS artifacts (artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
-  path TEXT NOT NULL, sha256 TEXT NOT NULL, byte_size INTEGER NOT NULL, role TEXT NOT NULL,
-  created_at TEXT NOT NULL, UNIQUE (mandate_id, path, sha256));
-CREATE TABLE IF NOT EXISTS handoffs (id TEXT PRIMARY KEY,
-  mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
-  mandate_rev INTEGER NOT NULL, parent_handoff_id TEXT, from_role TEXT NOT NULL, to_target TEXT NOT NULL,
-  verdict TEXT NOT NULL, summary TEXT NOT NULL, artifacts TEXT NOT NULL, deleted_files TEXT,
-  verified_facts TEXT NOT NULL, open_risks TEXT NOT NULL, feedback_for_upstream TEXT,
-  observed_usage TEXT, created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS jobs (job_id TEXT PRIMARY KEY,
-  mandate_id TEXT REFERENCES mandates(id) ON DELETE SET NULL, hypothesis_id TEXT,
-  command TEXT NOT NULL, cwd TEXT NOT NULL, pid INTEGER NOT NULL, pgid INTEGER NOT NULL,
-  owner_pid INTEGER, process_start_token TEXT, log_path TEXT NOT NULL, exit_file_path TEXT NOT NULL,
-  status TEXT NOT NULL, exit_code INTEGER, started_at TEXT NOT NULL, ended_at TEXT);
-CREATE TABLE IF NOT EXISTS flow_runs (flow_id TEXT PRIMARY KEY,
-  mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE, goal TEXT NOT NULL,
-  role_chain TEXT NOT NULL, status TEXT NOT NULL, current_index INTEGER NOT NULL, repair_round INTEGER NOT NULL,
-  last_handoff_id TEXT, max_repair_rounds INTEGER NOT NULL, snapshot_json TEXT NOT NULL,
-  owner_pid INTEGER, owner_start_token TEXT, next_stage_seq INTEGER, last_rejection_sig TEXT,
-  user_steers TEXT, updated_at TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS idx_mandates_status_updated ON mandates(status, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_epistemic_mandate ON epistemic_items(mandate_id, created_at ASC);
-CREATE INDEX IF NOT EXISTS idx_artifacts_mandate_path ON artifacts(mandate_id, path ASC);
-CREATE INDEX IF NOT EXISTS idx_handoffs_mandate_created ON handoffs(mandate_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_jobs_status_started ON jobs(status, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_flow_runs_updated ON flow_runs(updated_at DESC);`;
+const SCHEMA_TABLES = [
+  "CREATE TABLE IF NOT EXISTS mandates (id TEXT PRIMARY KEY, rev INTEGER NOT NULL, goal TEXT NOT NULL, constraints TEXT NOT NULL, acceptance TEXT NOT NULL, status TEXT NOT NULL, session_id TEXT, flow_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
+  "CREATE TABLE IF NOT EXISTS epistemic_items (id TEXT PRIMARY KEY, mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE, kind TEXT NOT NULL CHECK (kind IN ('fact', 'hypothesis', 'inquiry', 'decision')), statement TEXT NOT NULL, evidence_ref TEXT, verification_plan TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, CHECK (kind != 'fact' OR (evidence_ref IS NOT NULL AND length(trim(evidence_ref)) > 0)));",
+  "CREATE TABLE IF NOT EXISTS artifacts (artifact_id INTEGER PRIMARY KEY AUTOINCREMENT, mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE, path TEXT NOT NULL, sha256 TEXT NOT NULL, byte_size INTEGER NOT NULL, role TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE (mandate_id, path, sha256));",
+  "CREATE TABLE IF NOT EXISTS handoffs (id TEXT PRIMARY KEY, mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE, mandate_rev INTEGER NOT NULL, parent_handoff_id TEXT, from_role TEXT NOT NULL, to_target TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL, artifacts TEXT NOT NULL, deleted_files TEXT, verified_facts TEXT NOT NULL, open_risks TEXT NOT NULL, feedback_for_upstream TEXT, observed_usage TEXT, created_at TEXT NOT NULL);",
+  "CREATE TABLE IF NOT EXISTS jobs (job_id TEXT PRIMARY KEY, mandate_id TEXT REFERENCES mandates(id) ON DELETE SET NULL, hypothesis_id TEXT, command TEXT NOT NULL, cwd TEXT NOT NULL, pid INTEGER NOT NULL, pgid INTEGER NOT NULL, owner_pid INTEGER, process_start_token TEXT, log_path TEXT NOT NULL, exit_file_path TEXT NOT NULL, status TEXT NOT NULL, exit_code INTEGER, started_at TEXT NOT NULL, ended_at TEXT);",
+  "CREATE TABLE IF NOT EXISTS flow_runs (flow_id TEXT PRIMARY KEY, mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE, goal TEXT NOT NULL, role_chain TEXT NOT NULL, status TEXT NOT NULL, current_index INTEGER NOT NULL, repair_round INTEGER NOT NULL, last_handoff_id TEXT, max_repair_rounds INTEGER NOT NULL, snapshot_json TEXT NOT NULL, owner_pid INTEGER, owner_start_token TEXT, next_stage_seq INTEGER, last_rejection_sig TEXT, user_steers TEXT, updated_at TEXT NOT NULL);",
+].join("\n");
+
+const SCHEMA_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_mandates_status_updated ON mandates(status, updated_at DESC);",
+  "CREATE INDEX IF NOT EXISTS idx_mandates_session ON mandates(session_id, status, updated_at DESC);",
+  "CREATE INDEX IF NOT EXISTS idx_mandates_flow ON mandates(flow_id, status, updated_at DESC);",
+  "CREATE INDEX IF NOT EXISTS idx_epistemic_mandate ON epistemic_items(mandate_id, created_at ASC);",
+  "CREATE INDEX IF NOT EXISTS idx_artifacts_mandate_path ON artifacts(mandate_id, path ASC);",
+  "CREATE INDEX IF NOT EXISTS idx_handoffs_mandate_created ON handoffs(mandate_id, created_at DESC);",
+  "CREATE INDEX IF NOT EXISTS idx_jobs_status_started ON jobs(status, started_at DESC);",
+  "CREATE INDEX IF NOT EXISTS idx_flow_runs_updated ON flow_runs(updated_at DESC);",
+].join("\n");
 
 const MIGRATIONS: ReadonlyArray<[table: string, column: string, ddl: string]> = [
   ["mandates", "session_id", "TEXT"], ["mandates", "flow_id", "TEXT"], ["handoffs", "deleted_files", "TEXT"],
@@ -143,7 +126,7 @@ const toArtifact = (r: ArtifactRow): ArtifactRecord => ({
   path: r.path, sha256: r.sha256, byteSize: r.byte_size, role: r.role,
 });
 const toHandoff = (r: HandoffRow): HandoffEnvelope => {
-  const deletedFiles = r.deleted_files !== null ? safeParseArray<string>(r.deleted_files) : undefined;
+  const deletedFiles = r.deleted_files != null ? safeParseArray<string>(r.deleted_files) : undefined;
   return {
     id: r.id, mandateId: r.mandate_id, mandateRev: r.mandate_rev, parentHandoffId: r.parent_handoff_id,
     fromRole: r.from_role, toTarget: r.to_target, verdict: r.verdict, summary: r.summary,
@@ -176,46 +159,71 @@ const toFlowCheckpoint = (row: Record<string, unknown>): PersistedFlowCheckpoint
   ...(row.user_steers != null ? { userSteers: safeParseArray<FlowUserSteer>(String(row.user_steers)) } : {}),
 });
 
+const hasTable = (db: Database, name: string): boolean =>
+  Boolean(db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1").get(name));
+const hasCol = (db: Database, table: string, col: string): boolean =>
+  (db.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some((r) => r.name === col);
+
 export class EnhanceStore {
   private db: Database | null = null;
+  private roDb: Database | null = null;
   private closed = false;
 
   constructor(readonly dbPath: string) {}
 
   isClosed(): boolean { return this.closed; }
   reopen(): void { this.closed = false; }
-  close(): void { this.closed = true; try { this.db?.close(); } catch {} this.db = null; }
+  close(): void {
+    this.closed = true;
+    try { this.roDb?.close(); } catch {}
+    try { this.db?.close(); } catch {}
+    this.roDb = null; this.db = null;
+  }
 
   private migrateSchema(db: Database): void {
     const colsByTable = new Map<string, Set<string>>();
     for (const [table, col, ddl] of MIGRATIONS) {
       let cols = colsByTable.get(table);
       if (!cols) {
-        const rows = db.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-        cols = new Set(rows.map((r) => r.name));
+        cols = new Set((db.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((r) => r.name));
         colsByTable.set(table, cols);
       }
       if (!cols.has(col)) { db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${ddl}`); cols.add(col); }
     }
   }
 
-  private conn(create: boolean): Database | null {
+  private writeConn(create: boolean): Database | null {
     if (this.closed) { if (!create) return null; throw new Error("EnhanceStore is closed."); }
     if (this.db) return this.db;
     if (!create && !existsSync(this.dbPath)) return null;
+    try { this.roDb?.close(); } catch {}
+    this.roDb = null;
     mkdirSync(path.dirname(this.dbPath), { recursive: true });
     this.db = new Database(this.dbPath);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
-    this.db.exec(SCHEMA);
-    this.migrateSchema(this.db);
+    this.db.exec(SCHEMA_TABLES); this.migrateSchema(this.db); this.db.exec(SCHEMA_INDEXES);
     return this.db;
+  }
+
+  private readConn(): Database | null {
+    if (this.closed) return null;
+    if (this.db || this.roDb) return this.db ?? this.roDb;
+    if (!existsSync(this.dbPath)) return null;
+    const walPath = `${this.dbPath}-wal`;
+    try {
+      if (existsSync(walPath) && statSync(walPath).size > 0 && !existsSync(`${this.dbPath}-shm`)) return this.writeConn(false);
+      const ro = new Database(this.dbPath, { readonly: true });
+      ro.query("SELECT 1 FROM sqlite_master LIMIT 1").get();
+      this.roDb = ro;
+      return ro;
+    } catch { return this.writeConn(false); }
   }
 
   upsertMandate(input: {
     id?: string; goal: string; constraints?: string[]; acceptance?: string[];
     status?: MandateStatus; sessionId?: string | null; flowId?: string | null;
   }): Mandate {
-    const db = this.conn(true)!;
+    const db = this.writeConn(true)!;
     return db.transaction(() => {
       const existingRow = input.id ? (db.query("SELECT * FROM mandates WHERE id = ?").get(input.id) as MandateRow | null) : null;
       const ts = nowIso();
@@ -247,7 +255,7 @@ export class EnhanceStore {
   }
 
   completeMandate(id: string): Mandate | null {
-    const db = this.conn(false);
+    const db = this.writeConn(false);
     if (!db) return null;
     return db.transaction(() => {
       const existing = db.query("SELECT * FROM mandates WHERE id = ?").get(id) as MandateRow | null;
@@ -259,14 +267,16 @@ export class EnhanceStore {
   }
 
   getActiveMandate(scope?: MandateScope): Mandate | null {
-    const db = this.conn(false);
-    if (!db) return null;
+    const db = this.readConn();
+    if (!db || !hasTable(db, "mandates")) return null;
+    const scopedCols = this.db !== null || (hasCol(db, "mandates", "session_id") && hasCol(db, "mandates", "flow_id"));
     if (scope?.flowId) {
+      if (!scopedCols) return null;
       const row = db.query("SELECT * FROM mandates WHERE status = 'active' AND flow_id = ? ORDER BY updated_at DESC, rowid DESC LIMIT 1")
         .get(scope.flowId) as MandateRow | null;
       return row ? toMandate(row) : null;
     }
-    if (scope?.sessionId) {
+    if (scope?.sessionId && scopedCols) {
       const row = db.query(
         "SELECT * FROM mandates WHERE status = 'active' AND flow_id IS NULL AND (session_id = ? OR session_id IS NULL) ORDER BY CASE WHEN session_id = ? THEN 0 ELSE 1 END, updated_at DESC, rowid DESC LIMIT 1",
       ).get(scope.sessionId, scope.sessionId) as MandateRow | null;
@@ -278,8 +288,8 @@ export class EnhanceStore {
   }
 
   getMandate(id: string): Mandate | null {
-    const db = this.conn(false);
-    const row = db ? (db.query("SELECT * FROM mandates WHERE id = ?").get(id) as MandateRow | null) : null;
+    const db = this.readConn();
+    const row = db && hasTable(db, "mandates") ? (db.query("SELECT * FROM mandates WHERE id = ?").get(id) as MandateRow | null) : null;
     return row ? toMandate(row) : null;
   }
 
@@ -293,14 +303,14 @@ export class EnhanceStore {
       id: randomUUID(), mandateId: input.mandateId, kind: input.kind, statement: input.statement,
       evidenceRef, verificationPlan: input.verificationPlan?.trim() || null, status: input.status ?? "open", createdAt: nowIso(),
     };
-    this.conn(true)!.query(
+    this.writeConn(true)!.query(
       "INSERT INTO epistemic_items (id, mandate_id, kind, statement, evidence_ref, verification_plan, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     ).run(item.id, item.mandateId, item.kind, item.statement, item.evidenceRef, item.verificationPlan, item.status, item.createdAt);
     return item;
   }
 
   updateEpistemicStatus(id: string, status: EpistemicStatus, evidenceRef?: string | null): EpistemicItem {
-    const db = this.conn(false);
+    const db = this.writeConn(false);
     if (!db) throw new Error(`Epistemic item "${id}" not found.`);
     return db.transaction(() => {
       const row = db.query("SELECT * FROM epistemic_items WHERE id = ?").get(id) as EpistemicRow | null;
@@ -313,14 +323,15 @@ export class EnhanceStore {
   }
 
   listEpistemicItems(mandateId: string): EpistemicItem[] {
-    const db = this.conn(false);
-    return db ? (db.query("SELECT * FROM epistemic_items WHERE mandate_id = ? ORDER BY created_at ASC, rowid ASC")
-      .all(mandateId) as EpistemicRow[]).map(toEpistemicItem) : [];
+    const db = this.readConn();
+    return db && hasTable(db, "epistemic_items")
+      ? (db.query("SELECT * FROM epistemic_items WHERE mandate_id = ? ORDER BY created_at ASC, rowid ASC").all(mandateId) as EpistemicRow[]).map(toEpistemicItem)
+      : [];
   }
 
   recordArtifacts(mandateId: string, artifacts: readonly ArtifactRecord[]): void {
     if (artifacts.length === 0) return;
-    const db = this.conn(true)!;
+    const db = this.writeConn(true)!;
     db.transaction(() => {
       const stmt = db.query("INSERT OR IGNORE INTO artifacts (mandate_id, path, sha256, byte_size, role, created_at) VALUES (?, ?, ?, ?, ?, ?)");
       const ts = nowIso();
@@ -329,14 +340,14 @@ export class EnhanceStore {
   }
 
   listArtifacts(mandateId: string): ArtifactRecord[] {
-    const db = this.conn(false);
-    return db ? db.query(
+    const db = this.readConn();
+    return db && hasTable(db, "artifacts") ? db.query(
       "SELECT path, sha256, byte_size, role FROM artifacts WHERE artifact_id IN (SELECT MAX(artifact_id) FROM artifacts WHERE mandate_id = ? GROUP BY path) ORDER BY path ASC",
     ).all(mandateId).map((row) => toArtifact(row as ArtifactRow)) : [];
   }
 
   saveHandoff(envelope: HandoffEnvelope): void {
-    this.conn(true)!.query(
+    this.writeConn(true)!.query(
       "INSERT OR REPLACE INTO handoffs (id, mandate_id, mandate_rev, parent_handoff_id, from_role, to_target, verdict, summary, artifacts, deleted_files, verified_facts, open_risks, feedback_for_upstream, observed_usage, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     ).run(
       envelope.id, envelope.mandateId, envelope.mandateRev, envelope.parentHandoffId, envelope.fromRole,
@@ -348,25 +359,25 @@ export class EnhanceStore {
   }
 
   getHandoff(id: string): HandoffEnvelope | null {
-    const db = this.conn(false), row = db ? (db.query("SELECT * FROM handoffs WHERE id = ?").get(id) as HandoffRow | null) : null;
+    const db = this.readConn(), row = db && hasTable(db, "handoffs") ? (db.query("SELECT * FROM handoffs WHERE id = ?").get(id) as HandoffRow | null) : null;
     return row ? toHandoff(row) : null;
   }
 
   getLatestHandoff(mandateId?: string): HandoffEnvelope | null {
-    const db = this.conn(false);
-    const row = db ? (db.query("SELECT * FROM handoffs WHERE (? IS NULL OR mandate_id = ?) ORDER BY created_at DESC, rowid DESC LIMIT 1")
+    const db = this.readConn();
+    const row = db && hasTable(db, "handoffs") ? (db.query("SELECT * FROM handoffs WHERE (? IS NULL OR mandate_id = ?) ORDER BY created_at DESC, rowid DESC LIMIT 1")
       .get(mandateId ?? null, mandateId ?? null) as HandoffRow | null) : null;
     return row ? toHandoff(row) : null;
   }
 
   listHandoffs(mandateId?: string, limit?: number): HandoffEnvelope[] {
-    const db = this.conn(false);
-    return db ? (db.query("SELECT * FROM handoffs WHERE (? IS NULL OR mandate_id = ?) ORDER BY created_at DESC, rowid DESC LIMIT COALESCE(?, -1)")
+    const db = this.readConn();
+    return db && hasTable(db, "handoffs") ? (db.query("SELECT * FROM handoffs WHERE (? IS NULL OR mandate_id = ?) ORDER BY created_at DESC, rowid DESC LIMIT COALESCE(?, -1)")
       .all(mandateId ?? null, mandateId ?? null, limit ?? null) as HandoffRow[]).map(toHandoff) : [];
   }
 
   saveJob(job: BackgroundJob): void {
-    this.conn(true)!.query(
+    this.writeConn(true)!.query(
       "INSERT OR REPLACE INTO jobs (job_id, mandate_id, hypothesis_id, command, cwd, pid, pgid, owner_pid, process_start_token, log_path, exit_file_path, status, exit_code, started_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     ).run(
       job.jobId, job.mandateId, job.hypothesisId, job.command, job.cwd, job.pid, job.pgid,
@@ -380,7 +391,7 @@ export class EnhanceStore {
     expectedStatuses: readonly JobStatus[],
     patch: { status: JobStatus; exitCode?: number | null; endedAt?: string | null },
   ): BackgroundJob | null {
-    const db = this.conn(false);
+    const db = this.writeConn(false);
     if (!db) return null;
     return db.transaction(() => {
       const row = db.query("SELECT * FROM jobs WHERE job_id = ?").get(jobId) as JobRow | null;
@@ -394,19 +405,19 @@ export class EnhanceStore {
   }
 
   getJob(jobId: string): BackgroundJob | null {
-    const db = this.conn(false), row = db ? (db.query("SELECT * FROM jobs WHERE job_id = ?").get(jobId) as JobRow | null) : null;
+    const db = this.readConn(), row = db && hasTable(db, "jobs") ? (db.query("SELECT * FROM jobs WHERE job_id = ?").get(jobId) as JobRow | null) : null;
     return row ? toJob(row) : null;
   }
 
   listJobs(status?: JobStatus, limit = 200): BackgroundJob[] {
-    const db = this.conn(false);
-    return db ? db.query("SELECT * FROM jobs WHERE (? IS NULL OR status = ?) ORDER BY started_at DESC, rowid DESC LIMIT ?")
+    const db = this.readConn();
+    return db && hasTable(db, "jobs") ? db.query("SELECT * FROM jobs WHERE (? IS NULL OR status = ?) ORDER BY started_at DESC, rowid DESC LIMIT ?")
       .all(status ?? null, status ?? null, limit > 0 ? limit : -1).map((row) => toJob(row as JobRow)) : [];
   }
 
   saveFlowCheckpoint(cp: PersistedFlowCheckpoint): void {
     if (this.closed) return;
-    const db = this.conn(true)!;
+    const db = this.writeConn(true)!;
     db.transaction(() => {
       db.query("INSERT OR REPLACE INTO flow_runs (flow_id, mandate_id, goal, role_chain, status, current_index, repair_round, last_handoff_id, max_repair_rounds, snapshot_json, owner_pid, owner_start_token, next_stage_seq, last_rejection_sig, user_steers, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .run(cp.flowId, cp.mandateId, cp.goal, JSON.stringify(cp.roleChain), cp.status, cp.currentIndex, cp.repairRound, cp.lastHandoffId, cp.maxRepairRounds, cp.snapshotJson, cp.ownerPid ?? null, cp.ownerStartToken ?? null, cp.nextStageSeq ?? null, cp.lastRejectionSig ?? null, cp.userSteers !== undefined ? JSON.stringify(cp.userSteers) : null, cp.updatedAt);
@@ -416,21 +427,21 @@ export class EnhanceStore {
 
   releaseFlowOwnership(flowId?: string | null, ownerPid?: number): void {
     if (this.closed) return;
-    const db = this.conn(false);
+    const db = this.writeConn(false);
     if (!db) return;
     if (flowId) db.query("UPDATE flow_runs SET owner_pid = NULL, owner_start_token = NULL WHERE flow_id = ? AND status = 'running'").run(flowId);
     else if (ownerPid !== undefined) db.query("UPDATE flow_runs SET owner_pid = NULL, owner_start_token = NULL WHERE owner_pid = ? AND status = 'running'").run(ownerPid);
   }
 
   getFlowCheckpoint(flowId: string): PersistedFlowCheckpoint | null {
-    const db = this.conn(false);
-    const row = db ? (db.query("SELECT * FROM flow_runs WHERE flow_id = ?").get(flowId) as Record<string, unknown> | null) : null;
+    const db = this.readConn();
+    const row = db && hasTable(db, "flow_runs") ? (db.query("SELECT * FROM flow_runs WHERE flow_id = ?").get(flowId) as Record<string, unknown> | null) : null;
     return row ? toFlowCheckpoint(row) : null;
   }
 
   getLatestFlowCheckpoint(): PersistedFlowCheckpoint | null {
-    const db = this.conn(false);
-    const row = db ? (db.query("SELECT * FROM flow_runs ORDER BY updated_at DESC, rowid DESC LIMIT 1")
+    const db = this.readConn();
+    const row = db && hasTable(db, "flow_runs") ? (db.query("SELECT * FROM flow_runs ORDER BY updated_at DESC, rowid DESC LIMIT 1")
       .get() as Record<string, unknown> | null) : null;
     return row ? toFlowCheckpoint(row) : null;
   }

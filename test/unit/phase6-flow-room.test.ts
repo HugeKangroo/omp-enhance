@@ -537,7 +537,10 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
           createdModels.push(opts.model);
           const handoffTool = opts.customTools[0];
           const guardHandlers = new Map<string, Array<(ev: any) => any>>();
-          for (const ext of opts.extensions ?? []) {
+          const factories = opts.restrictToolNames
+            ? (opts.preloadedPreparedExtensions ?? []).map((e: any) => e.factory)
+            : (opts.extensions ?? []);
+          for (const ext of factories) {
             ext({ on(ev: string, fn: (ev: any) => any) { guardHandlers.set(ev, [...(guardHandlers.get(ev) ?? []), fn]); } });
           }
           const emitEnd = (toolCallId: string, toolName: string, args: unknown) => {
@@ -642,7 +645,10 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
           childSystemPrompts.push(String(opts.customSystemPrompt));
           const handoffTool = opts.customTools[0];
           const guardHandlers = new Map<string, Array<(ev: any) => any>>();
-          for (const ext of opts.extensions ?? []) {
+          const factories = opts.restrictToolNames
+            ? (opts.preloadedPreparedExtensions ?? []).map((e: any) => e.factory)
+            : (opts.extensions ?? []);
+          for (const ext of factories) {
             ext({ on(ev: string, fn: (ev: any) => any) { guardHandlers.set(ev, [...(guardHandlers.get(ev) ?? []), fn]); } });
           }
           return {

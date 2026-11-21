@@ -18,8 +18,9 @@ id: qa
 name: 独立测试与证伪工程师
 description: 基于原始需求独立构造正常、边界与异常测试，证伪上游实现
 
-# 可选：为该角色绑定专属模型与推理档位（省略或显式设为 "inherit" 表示沿用当前会话模型）
+# 可选：为该角色绑定专属模型与推理档位（省略或显式设为 "inherit" 表示优先继承 @<role> 配置的 :thinking 后缀，否则沿用当前会话档位）
 # 支持 OMP 模型角色别名（@advisor, @vision, @default, @smol, @slow, @plan, @task）或精确 provider/model-id
+# thinking 支持：inherit | off | minimal | low | medium | high | xhigh | max | auto
 model: "@slow"
 thinking: high
 
@@ -79,9 +80,9 @@ method:
 
 ### 1.4 内置监督角色 (`supervisor`) 与 `@advisor` 默认继承
 
-`roles/supervisor.yaml` 是只读、无工具的运行期巡检角色：`model: "@advisor"`、`thinking: off`、`permissions.tools: []`、`permissions.writable: []`、`permissions.protected: ["**"]`（不参与 `/flow` 或 `/enhance-handoff` 业务阶段转手）。默认继承用户在 OMP 中配置的 **`@advisor`** 模型角色，也可在 **`/settings → Plugins → omp-enhance`** 修改 `supervisorModel`，或在 `/role edit supervisor` 中单独覆盖（显式设为 `inherit` 时沿用当前会话模型）。
+`roles/supervisor.yaml` 是只读、无工具的运行期巡检角色：`model: "@advisor"`、`thinking: inherit`、`permissions.tools: []`、`permissions.writable: []`、`permissions.protected: ["**"]`（不参与 `/flow` 或 `/enhance-handoff` 业务阶段转手）。默认自动继承用户在 OMP 中配置的 **`@advisor`** 模型角色及其 `:thinking` 推理档位（`supervisorThinking: "inherit"`，支持 `off` 至 `max` / `auto` 全部档位），也可在 **`/settings → Plugins → omp-enhance`** 修改 `supervisorModel` / `supervisorThinking`，或在 `/role edit supervisor` 中单独覆盖。
 
-它周期性读取 `SupervisorPulse`（包含目标、巡检序号、总耗时、静默时长、本周期增量、定界隔离的 `untrusted_log_tail`、正在运行的 `activeTool` 及最近 5 次 `priorDecisions`），并输出单个 JSON 对象：
+它周期性读取 `SupervisorPulse`（包含目标、巡检序号、总耗时、静默时长、本周期增量、阶段权限元数据 `roleId` / `readOnly` / `allowedTools`、OMP 原生后台异步任务数 `activeAsyncJobs`、定界隔离的 `untrusted_log_tail`、正在运行的 `activeTool` 及最近 5 次 `priorDecisions`），严禁要求只读或无 `bash` 阶段运行 Shell 命令，并输出单个 JSON 对象：
 
 | 裁决 | 适用目标 | 行为 |
 | --- | --- | --- |

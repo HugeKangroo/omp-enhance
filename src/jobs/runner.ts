@@ -130,6 +130,27 @@ export function cancelJob(store: EnhanceStore, jobId: string, options?: CancelJo
     ?? store.getJob(jobId) ?? { ...current, status: "cancelled", endedAt };
 }
 
+export function cancelJobsByIds(
+  store: EnhanceStore,
+  jobIds: Iterable<string>,
+  options?: CancelJobOptions,
+): BackgroundJob[] {
+  const cancelled: BackgroundJob[] = [];
+  const seen = new Set<string>();
+  for (const rawId of jobIds) {
+    const jobId = typeof rawId === "string" ? rawId.trim() : "";
+    if (!jobId || seen.has(jobId)) continue;
+    seen.add(jobId);
+    const current = reconcileSingleJob(store, jobId);
+    if (!current || current.status !== "running") continue;
+    try {
+      const updated = cancelJob(store, jobId, options);
+      if (updated.status === "cancelled") cancelled.push(updated);
+    } catch {}
+  }
+  return cancelled;
+}
+
 export function readJobLogTail(job: BackgroundJob, maxBytes = 4096): string {
   const cap = Math.floor(maxBytes);
   if (cap <= 0 || !existsSync(job.logPath)) return "";

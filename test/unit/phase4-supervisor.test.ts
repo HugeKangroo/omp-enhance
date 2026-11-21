@@ -154,6 +154,10 @@ describe("supervisor decision parsing & prompt rendering", () => {
 
     expect(sessionPrompt).toContain('"action":"continue"|"steer"|"abort"');
     expect(sessionPrompt).toContain('"steerMessage"');
+    expect(sessionPrompt).toContain("pulse.readOnly");
+    expect(sessionPrompt).toContain("pulse.allowedTools");
+    expect(sessionPrompt).toContain("NEVER steer the role to execute shell/CLI/test commands");
+    expect(sessionPrompt).toContain("pulse.activeAsyncJobs > 0");
 
     expect(computeErrorBackoffMs(1, 5_000, 600_000)).toBe(30_000);
     expect(computeErrorBackoffMs(2, 5_000, 600_000)).toBe(60_000);
@@ -572,6 +576,91 @@ describe("role session supervision", () => {
     expect(pulses[6]!.priorDecisions![4]!.checkNumber).toBe(6);
   });
 
+  test("forwards roleId/readOnly/allowedTools/activeAsyncJobs and treats activeAsyncJobs > 0 as active progress (F-A4, F-C2)", async () => {
+    const cwd = tempDir();
+    const supervisorRole = rolesFor(cwd).get("supervisor")!;
+    const pulses: SupervisorPulse[] = [];
+    const gate = Promise.withResolvers<void>();
+    const mutableAllowed = ["read", "grep", "enhance_handoff"];
+
+    const result = await runWithSessionSupervisor({
+      supervisorRole,
+      goal: "verify src/math.ts",
+      inspector: {
+        async evaluatePulse(pulse) {
+          pulses.push(pulse);
+          if (pulses.length === 1) {
+            mutableAllowed.push("bash");
+            await Bun.sleep(65);
+          } else if (pulses.length >= 3) {
+            gate.resolve();
+          }
+          return decision("continue", { nextCheckSec: 5 });
+        },
+      },
+      run: async () => {
+        await gate.promise;
+        return "verified";
+      },
+      getPulse: () => {
+        if (pulses.length === 0) {
+          return {
+            calls: 1,
+            summary: "read",
+            roleId: "reviewer",
+            readOnly: true,
+            allowedTools: mutableAllowed,
+            activeAsyncJobs: 0,
+          };
+        }
+        if (pulses.length === 1) {
+          return {
+            calls: 1,
+            summary: "read",
+            roleId: "qa",
+            readOnly: false,
+            allowedTools: ["read", "bash"],
+            activeAsyncJobs: 2,
+            activeTool: null,
+          };
+        }
+        return {
+          calls: 1,
+          summary: "read",
+          roleId: "qa",
+          readOnly: false,
+          allowedTools: ["read", "bash"],
+          activeAsyncJobs: 0,
+          activeTool: null,
+        };
+      },
+      initialDelayMs: 5,
+      minIntervalMs: 10,
+      maxIntervalMs: 15,
+    });
+
+    expect(result.result).toBe("verified");
+    expect(pulses).toHaveLength(3);
+
+    expect(pulses[0]!.roleId).toBe("reviewer");
+    expect(pulses[0]!.readOnly).toBe(true);
+    expect(pulses[0]!.allowedTools).toEqual(["read", "grep", "enhance_handoff"]);
+    expect(pulses[0]!.activeAsyncJobs).toBe(0);
+
+    // Tick 2 waited >65ms with 0 new tool calls, but activeAsyncJobs=2 resets idleSec to 0 and refreshes lastActivityMs!
+    expect(pulses[1]!.roleId).toBe("qa");
+    expect(pulses[1]!.readOnly).toBe(false);
+    expect(pulses[1]!.activeAsyncJobs).toBe(2);
+    expect(pulses[1]!.idleSec).toBe(0);
+    expect(pulses[1]!.deltaSummary).toContain("2 active async job(s)");
+    expect(pulses[1]!.deltaSummary).not.toBe("no new tool calls");
+
+    // Tick 3 ran ~10ms after Tick 2 when activeAsyncJobs dropped to 0: idleSec reflects ~10ms, NOT >75ms since Tick 1!
+    expect(pulses[2]!.activeAsyncJobs).toBe(0);
+    expect(pulses[2]!.idleSec).toBeLessThan(0.15);
+    expect(pulses[2]!.deltaSummary).toBe("no new tool calls");
+  });
+
   test("session completing while evaluatePulse is in flight is NOT clobbered by a late abort (B3.1)", async () => {
     const cwd = tempDir();
     const supervisorRole = rolesFor(cwd).get("supervisor")!;
@@ -714,10 +803,15 @@ describe("OMP supervisor inspector (src/omp/session.ts)", () => {
     let captured: Record<string, unknown> | null = null;
     let prompted = "";
     let cleared = false;
+    let advisorRoleSpec: string | undefined = "openrouter/qwen/qwen3.8-27b:xhigh";
     const inMem = { id: "in-memory-session" };
     const pi = {
+      getThinkingLevel: () => "max",
       pi: {
-        settings: { theme: "dark" },
+        settings: {
+          theme: "dark",
+          getModelRole: (roleTag: string) => (roleTag === "advisor" ? advisorRoleSpec : undefined),
+        },
         SessionManager: { inMemory: () => inMem },
         async createAgentSession(options: Record<string, unknown>) {
           captured = options;
@@ -759,7 +853,7 @@ describe("OMP supervisor inspector (src/omp/session.ts)", () => {
     expect(result).toEqual({ action: "continue", reason: "normal training", nextCheckSec: 120 });
     expect(captured).not.toBeNull();
     expect(captured!.model).toBe("advisor-model");
-    expect(captured!.thinkingLevel).toBe("off");
+    expect(captured!.thinkingLevel).toBe("xhigh");
     expect(captured!.sessionManager).toBe(inMem);
     expect(captured!.hasUI).toBe(false);
     expect(captured!.restrictToolNames).toBe(true);
@@ -777,5 +871,10 @@ describe("OMP supervisor inspector (src/omp/session.ts)", () => {
     expect(String(captured!.customSystemPrompt)).not.toContain('"steerMessage"');
     expect(prompted).toContain('"goal":"train"');
     expect(prompted).not.toContain('"steerMessage"');
+
+    // When @advisor has no :thinking suffix, default supervisor ("inherit") falls back to pi.getThinkingLevel() ("max").
+    advisorRoleSpec = "openrouter/qwen/qwen3.8-27b";
+    await inspector.evaluatePulse(pulse, supervisorRole);
+    expect(captured!.thinkingLevel).toBe("max");
   });
 });

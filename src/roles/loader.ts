@@ -5,6 +5,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
@@ -32,11 +33,23 @@ export interface DiscoverRolesOptions {
   strict?: boolean;
 }
 
+function safeStatIsFile(filePath: string): boolean {
+  try {
+    return statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
 function listYamlEntries(dir: string): string[] {
   if (!existsSync(dir)) return [];
   try {
     return readdirSync(dir, { withFileTypes: true })
-      .filter((entry) => entry.isFile() && /\.ya?ml$/i.test(entry.name))
+      .filter(
+        (entry) =>
+          /\.ya?ml$/i.test(entry.name) &&
+          (entry.isFile() || (entry.isSymbolicLink() && safeStatIsFile(path.join(dir, entry.name)))),
+      )
       .map((entry) => entry.name);
   } catch {
     return [];

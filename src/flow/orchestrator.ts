@@ -2,7 +2,7 @@ import {
   findBoundaryViolations, findProtectedViolations, snapshotConfigIntegrity, snapshotWorkspace,
   type SnapshotEntry,
 } from "../core/fs.ts";
-import { isRoleReadOnly } from "../core/policy.ts";
+import { isRoleReadOnly, roleAllowsBash } from "../core/policy.ts";
 import type { EnhanceStore } from "../core/store.ts";
 import type {
   EpistemicItem, FlowRunResult, FlowStepResult, FlowUserSteer, HandoffEnvelope, Mandate,
@@ -66,9 +66,18 @@ function taskPromptFor(input: {
   if (steers.length > 0) {
     extra.push(`User interjections: ${steers.map((s) => (s.targetRole ? `[@${s.targetRole}] ${s.text}` : s.text)).join(" | ")}`);
   }
+  const staticOnly = isRoleReadOnly(input.role) || !roleAllowsBash(input.role);
   return [
     `Role: ${input.role.id} (${input.role.name})`, `Mandate goal: ${input.mandate.goal}`, `Upstream handoff: ${upstream}`,
-    ...extra, "Work strictly inside your role conditioning and permitted tools.",
+    ...extra,
+    ...(staticOnly
+      ? [
+          "Verification mode: static/read-only source inspection — successful read/grep/glob/find/lsp calls satisfy requireToolEvidence; do NOT attempt shell execution or spawn subagents for shell access.",
+        ]
+      : []),
+    'Valid verifiedFacts[].evidenceRef formats: workspace path[:line] (e.g. "src/app.ts:12"), workspace directory path, artifact sha256, or observed toolCallId.',
+    'Mandate and Upstream Handoff are already provided in <omp-enhance-conditioning> (or via enhance_mandate action="get"); do NOT read or grep .omp-enhance/state.sqlite directly.',
+    "Work strictly inside your role conditioning and permitted tools.",
     "When finished, call enhance_handoff exactly once with verdict, summary, artifactPaths, openRisks,",
     "and feedbackForUpstream when the verdict is rejected. Do not claim work you did not execute.",
   ].join("\n");

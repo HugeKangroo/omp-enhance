@@ -55,6 +55,9 @@ describe("package.json omp.settings parity & native OMP settings loader", () => 
     expect(schema.flowRoutingMode.default).toBe(DEFAULT_ENHANCE_SETTINGS.flowRoutingMode);
     expect([...schema.supervisorThinking.values].sort()).toEqual([...ROLE_THINKING_LEVELS].sort());
     expect(schema.supervisorThinking.values).toContain("xhigh");
+    expect(schema.supervisorThinking.values).toContain("max");
+    expect(schema.supervisorThinking.values).toContain("auto");
+    expect(schema.supervisorThinking.default).toBe("inherit");
   });
 
   test("merges lockfile < parent/project plugin-overrides < .omp/enhance.yaml, clamps bounds, supports --profile, and gates untrusted projects", () => {
@@ -86,7 +89,7 @@ describe("package.json omp.settings parity & native OMP settings loader", () => 
       showStatusBar: false,
       supervisorEnabled: true,
       supervisorModel: "smol",
-      supervisorThinking: "off",
+      supervisorThinking: "inherit",
       supervisorInitialDelaySec: 5,
       flowMaxRepairRounds: 10,
       flowRoutingMode: "ask",
@@ -148,46 +151,82 @@ describe("package.json omp.settings parity & native OMP settings loader", () => 
 });
 
 describe("model & @advisor inheritance resolution", () => {
-  test("builtin supervisor defaults to @advisor, respects /settings, and honors explicit inherit overrides", () => {
+  test("builtin supervisor defaults to @advisor + inherit, extracts @role:thinking & provider/model:thinking suffixes, and avoids fuzzy @role substring matches", () => {
     const root = tempDir();
     const roles = discoverRoles({ cwd: root, globalRolesDir: path.join(root, "global"), builtinRolesDir });
     const supervisor = roles.get("supervisor")!;
+    const vision = roles.get("vision")!;
     expect(supervisor.model).toBe("@advisor");
-    expect(supervisor.thinking).toBe("off");
+    expect(supervisor.thinking).toBe("inherit");
 
     expect(normalizeModelSpec("advisor")).toBe("@advisor");
+    expect(normalizeModelSpec("advisor:xhigh")).toBe("@advisor:xhigh");
     expect(normalizeModelSpec("@smol")).toBe("@smol");
     expect(normalizeModelSpec("inherit")).toBeUndefined();
-    expect(normalizeModelSpec("deepseek/deepseek-flash")).toBe("deepseek/deepseek-flash");
+    expect(normalizeModelSpec("deepseek/deepseek-flash:max")).toBe("deepseek/deepseek-flash:max");
+
+    const qwenAdvisor = { provider: "openrouter", id: "qwen/qwen3.8-27b", input: ["text"] };
+    const qwenVision = { provider: "openrouter", id: "qwen/qwen3.8-flash", input: ["text", "image"] };
+    const gptSlow = { provider: "openai-codex", id: "gpt-6.1-sol", input: ["text", "image"] };
+    const roleSpecs: Record<string, string> = {
+      default: "deepseek/deepseek-flash:max",
+      advisor: "openrouter/qwen/qwen3.8-27b:xhigh",
+      vision: "openrouter/qwen/qwen3.8-flash:medium",
+      slow: "openai-codex/gpt-6.1-sol:max",
+    };
 
     const hostCtx = {
       model: "session-default-model",
       models: {
         resolve: (spec: string) =>
-          spec === "@advisor" ? "advisor-resolved" : spec === "@slow" ? "slow-resolved" : undefined,
-        list: () => [{ provider: "custom", id: "local-70b" }],
+          spec === "@advisor" ? qwenAdvisor
+            : spec === "@vision" ? qwenVision
+              : spec === "@slow" ? gptSlow
+                : undefined,
+        list: () => [qwenAdvisor, qwenVision, gptSlow, { provider: "custom", id: "local-70b" }],
       },
     };
-    const pi = { getThinkingLevel: () => "medium" };
+    const pi = {
+      getThinkingLevel: () => "max",
+      pi: { settings: { getModelRole: (r: string) => roleSpecs[r] } },
+    };
 
-    // 1. Default settings -> inherits OMP @advisor
+    // 1. Default settings -> supervisor inherits OMP @advisor model AND its :xhigh suffix (not session :max!)
     expect(resolveRoleRuntimeConfig(supervisor, pi, hostCtx, DEFAULT_ENHANCE_SETTINGS)).toEqual({
-      model: "advisor-resolved",
-      thinkingLevel: "off",
+      model: qwenAdvisor,
+      thinkingLevel: "xhigh",
     });
 
-    // 2. Native /settings override on supervisorModel -> overrides builtin supervisor.yaml
+    // 1b. Builtin vision has explicit thinking: "low"; when thinking is "inherit"/undefined, @vision's :medium suffix wins over session :max
+    expect(resolveRoleRuntimeConfig(vision, pi, hostCtx, DEFAULT_ENHANCE_SETTINGS)).toEqual({
+      model: qwenVision,
+      thinkingLevel: "low",
+    });
+    expect(resolveRoleRuntimeConfig({ ...vision, thinking: "inherit" }, pi, hostCtx, DEFAULT_ENHANCE_SETTINGS)).toEqual({
+      model: qwenVision,
+      thinkingLevel: "medium",
+    });
+
+    // 2. Native /settings override on supervisorModel + supervisorThinking -> explicit thinking wins over @slow:max
     expect(resolveRoleRuntimeConfig(supervisor, pi, hostCtx, {
       ...DEFAULT_ENHANCE_SETTINGS, supervisorModel: "slow", supervisorThinking: "low",
     })).toEqual({
-      model: "slow-resolved",
+      model: gptSlow,
       thinkingLevel: "low",
     });
 
-    // 3. Explicit custom model override in global supervisor.yaml -> wins over /settings
+    // 2b. supervisorThinking: "auto" or "max" supported cleanly
+    expect(resolveRoleRuntimeConfig(supervisor, pi, hostCtx, {
+      ...DEFAULT_ENHANCE_SETTINGS, supervisorModel: "slow", supervisorThinking: "auto",
+    })).toEqual({
+      model: gptSlow,
+      thinkingLevel: "auto",
+    });
+
+    // 3. Explicit custom "provider/model:thinking" in global supervisor.yaml strips :max for lookup & extracts thinking
     const customSupervisor = saveRoleSpec({
       id: "supervisor", name: supervisor.name, description: supervisor.description,
-      model: "custom/local-70b", thinking: "high", stance: supervisor.stance,
+      model: "custom/local-70b:high", thinking: "inherit", stance: supervisor.stance,
       method: supervisor.method, permissions: supervisor.permissions, exit: supervisor.exit,
     }, path.join(root, "global"));
     expect(resolveRoleRuntimeConfig(customSupervisor, pi, hostCtx, DEFAULT_ENHANCE_SETTINGS)).toEqual({
@@ -195,7 +234,7 @@ describe("model & @advisor inheritance resolution", () => {
       thinkingLevel: "high",
     });
 
-    // 4. Explicit `inherit` override in global supervisor.yaml -> inherits session model & thinking (NOT @advisor/off!)
+    // 4. Explicit `inherit` override in global supervisor.yaml -> inherits session model & session thinking ("max")
     const inheritSupervisor = saveRoleSpec({
       id: "supervisor", name: supervisor.name, description: supervisor.description,
       model: "inherit", thinking: "inherit", stance: supervisor.stance,
@@ -205,12 +244,32 @@ describe("model & @advisor inheritance resolution", () => {
     expect(inheritSupervisor.thinking).toBe("inherit");
     expect(resolveRoleRuntimeConfig(inheritSupervisor, pi, hostCtx, DEFAULT_ENHANCE_SETTINGS)).toEqual({
       model: "session-default-model",
-      thinkingLevel: "medium",
+      thinkingLevel: "max",
     });
 
-    // 5. Unconfigured @advisor falls back cleanly to current session model
-    expect(resolveModelSpec("@advisor", { model: "session-fallback", models: { resolve: () => undefined } }))
-      .toBe("session-fallback");
+    // 5. Unconfigured @advisor / @vision NEVER calls resolve("advisor") / resolve("vision") fuzzy substring match!
+    const resolveQueries: string[] = [];
+    const fuzzyTrapCtx = {
+      model: { provider: "deepseek", id: "deepseek-chat", input: ["text"] },
+      models: {
+        resolve: (q: string) => {
+          resolveQueries.push(q);
+          // Simulate OMP's fuzzy substring matching when '@' is stripped!
+          if (q === "advisor") return { provider: "trap", id: "bad-advisor-substring" };
+          if (q === "vision") return { provider: "deepseek", id: "deepseek-v4-flash-vision-exp", input: ["text"] };
+          return undefined;
+        },
+        list: () => [
+          { provider: "deepseek", id: "deepseek-v4-flash-vision-exp", input: ["text"] },
+          { provider: "openrouter", id: "real-multimodal-vl", input: ["text", "image"] },
+        ],
+      },
+    };
+    expect(resolveModelSpec("@advisor", fuzzyTrapCtx)).toEqual(fuzzyTrapCtx.model);
+    expect(resolveModelSpec("@vision", fuzzyTrapCtx)).toEqual({
+      provider: "openrouter", id: "real-multimodal-vl", input: ["text", "image"],
+    });
+    expect(resolveQueries).toEqual(["@advisor", "@vision"]);
   });
 });
 

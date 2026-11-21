@@ -41,9 +41,11 @@
           "medium",
           "high",
           "xhigh",
+          "max",
+          "auto",
           "inherit"
         ],
-        "default": "off",
+        "default": "inherit",
         "description": "Thinking effort level for periodic supervisor inspections"
       },
       "supervisorInitialDelaySec": {

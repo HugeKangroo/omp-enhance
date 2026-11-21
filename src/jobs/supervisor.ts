@@ -22,7 +22,10 @@ export interface WatchBackgroundJobResult {
 export interface RunWithSessionSupervisorInput<T> {
   supervisorRole: RoleSpec; inspector: SupervisorInspector; goal: string;
   run: (control: SessionSupervisorControl) => Promise<T>;
-  getPulse: () => { calls: number; summary: string; activeTool?: SupervisorActiveTool | null };
+  getPulse: () => {
+    calls: number; summary: string; activeTool?: SupervisorActiveTool | null;
+    roleId?: string; readOnly?: boolean; allowedTools?: string[]; activeAsyncJobs?: number;
+  };
   onSteer?: (message: string) => void | Promise<void>;
   onAbort?: () => void | Promise<void>;
   initialDelayMs?: number; minIntervalMs?: number; maxIntervalMs?: number; signal?: AbortSignal;
@@ -125,7 +128,11 @@ export function renderSupervisorPrompt(
     : '{"action":"continue"|"steer"|"abort","reason":"...","nextCheckSec":60,"evidence":"...","steerMessage":"..."}';
   const guidance = isJob
     ? "Background shell jobs have no interactive stdin and cannot be steered; choose only continue or abort."
-    : 'When action is "steer", provide a concise steerMessage and avoid repeating identical steers while activeTool is running.';
+    : [
+        'When action is "steer", provide a concise steerMessage and avoid repeating identical steers while activeTool is running.',
+        'When pulse.readOnly is true or pulse.allowedTools does not include "bash", NEVER steer the role to execute shell/CLI/test commands (bash, npm test, node, pytest, etc.) — static read/grep/find/lsp inspection is its intended verification mode.',
+        "When pulse.activeAsyncJobs > 0, native background jobs are actively running; waiting on them is active progress, not an idle stall.",
+      ].join("\n");
   return [
     `You are "${role.id}" (${role.name}), the runtime supervisor for omp-enhance.`,
     role.stance.trim(), "Method:", ...role.method.map((step, index) => `${index + 1}. ${step}`),
@@ -256,13 +263,19 @@ export async function watchBackgroundJob(input: WatchBackgroundJobInput): Promis
 type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown };
 
 function formatSessionDeltaSummary(
-  delta: number, previousCalls: number, summary: string, activeTool: SupervisorActiveTool | null,
+  delta: number, previousCalls: number, summary: string, activeTool: SupervisorActiveTool | null, activeAsyncJobs = 0,
 ): string {
+  const asyncNote = activeAsyncJobs > 0 ? `${activeAsyncJobs} active async job(s)` : "";
   if (activeTool) {
     const label = activeTool.summary || activeTool.name;
-    return delta > 0
+    const base = delta > 0
       ? `${delta} new tool calls (${summary || "completed"}); active tool running: ${label} (${activeTool.elapsedSec}s)`
       : `0 completed calls in window; active tool running: ${label} (${activeTool.elapsedSec}s)`;
+    return asyncNote ? `${base}; ${asyncNote}` : base;
+  }
+  if (asyncNote) {
+    if (delta > 0) return `${summary || `${delta} new tool calls`}; ${asyncNote}`;
+    return previousCalls === 0 && summary ? `${summary}; ${asyncNote}` : `0 completed calls in window; ${asyncNote}`;
   }
   return delta > 0 ? (summary || `${delta} new tool calls`) : (previousCalls === 0 && summary ? summary : "no new tool calls");
 }
@@ -307,14 +320,21 @@ export async function runWithSessionSupervisor<T>(
 
     const snapshot = input.getPulse(), now = Date.now(), previousCalls = lastCalls;
     const delta = Math.max(0, snapshot.calls - lastCalls), activeTool = snapshot.activeTool ?? null;
-    if (delta > 0 || activeTool) lastActivityMs = now;
+    const activeAsyncJobs = typeof snapshot.activeAsyncJobs === "number" && Number.isFinite(snapshot.activeAsyncJobs)
+      ? Math.max(0, Math.floor(snapshot.activeAsyncJobs)) : undefined;
+    const hasAsyncJobs = (activeAsyncJobs ?? 0) > 0;
+    if (delta > 0 || activeTool || hasAsyncJobs) lastActivityMs = now;
     lastCalls = snapshot.calls; checks += 1;
 
     const pulse: SupervisorPulse = {
       targetKind: "role_session", goal: input.goal, checkNumber: checks, deltaBytesOrCalls: delta,
       elapsedSec: Math.round((now - startedMs) / 100) / 10,
-      idleSec: activeTool ? 0 : Math.round((now - lastActivityMs) / 100) / 10,
-      deltaSummary: formatSessionDeltaSummary(delta, previousCalls, snapshot.summary, activeTool),
+      idleSec: activeTool || hasAsyncJobs ? 0 : Math.round((now - lastActivityMs) / 100) / 10,
+      deltaSummary: formatSessionDeltaSummary(delta, previousCalls, snapshot.summary, activeTool, activeAsyncJobs ?? 0),
+      ...(snapshot.roleId !== undefined ? { roleId: snapshot.roleId } : {}),
+      ...(snapshot.readOnly !== undefined ? { readOnly: snapshot.readOnly } : {}),
+      ...(snapshot.allowedTools !== undefined ? { allowedTools: [...snapshot.allowedTools] } : {}),
+      ...(activeAsyncJobs !== undefined ? { activeAsyncJobs } : {}),
       activeTool, priorDecisions: priorDecisions.slice(-5),
     };
 

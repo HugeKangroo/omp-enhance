@@ -6,6 +6,7 @@ import path from "node:path";
 import { EnhanceStore } from "../../src/core/store.ts";
 import {
   cancelJob,
+  cancelJobsByIds,
   readJobLogTail,
   reconcileJobs,
   startBackgroundJob,
@@ -282,6 +283,38 @@ describe("background jobs (src/jobs/runner.ts)", () => {
       expect(tail.length).toBeGreaterThan(0);
       expect(tail.includes("\uFFFD")).toBe(false);
       expect(tailBlock.endsWith(tail)).toBe(true);
+    }
+  });
+
+  test("cancelJobsByIds cancels only still-running jobs and ignores completed, duplicate, or missing IDs (F-C2)", async () => {
+    const cwd = tempDir();
+    const store = new EnhanceStore(path.join(cwd, "state.sqlite"));
+    const completedJob = startBackgroundJob({ store, cwd, command: 'sleep 0.02 && echo "done_ok"' });
+    const runningJob = startBackgroundJob({ store, cwd, command: "sleep 30" });
+
+    try {
+      await waitUntil(() => existsSync(completedJob.exitFilePath));
+
+      const cancelled = cancelJobsByIds(
+        store,
+        ["", "   ", "missing-job-id", completedJob.jobId, runningJob.jobId, runningJob.jobId],
+        { graceMs: 40 },
+      );
+
+      expect(cancelled).toHaveLength(1);
+      expect(cancelled[0]!.jobId).toBe(runningJob.jobId);
+      expect(cancelled[0]!.status).toBe("cancelled");
+
+      const preservedCompleted = store.getJob(completedJob.jobId)!;
+      expect(preservedCompleted.status).toBe("completed");
+      expect(preservedCompleted.exitCode).toBe(0);
+
+      expect(store.getJob(runningJob.jobId)?.status).toBe("cancelled");
+      await waitUntil(() => !processAlive(runningJob.pid), 3000);
+    } finally {
+      try { process.kill(-runningJob.pgid, "SIGKILL"); } catch {}
+      try { process.kill(runningJob.pid, "SIGKILL"); } catch {}
+      store.close();
     }
   });
 });

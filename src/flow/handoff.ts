@@ -13,6 +13,25 @@ import type {
 
 const TEST_GLOBS = ["test/**", "tests/**", "**/*.test.*", "**/*.spec.*"] as const;
 
+function stripEvidenceSelectorAndNotes(rawRef: string): string {
+  let s = rawRef
+    .trim()
+    .replace(/\s+\([^)]*\)\s*$/, "")
+    .replace(/\s+(?:—|--)\s+[\s\S]*$/, "")
+    .replace(/\s*;\s+[\s\S]*$/, "")
+    .trim();
+  let prev = "";
+  while (s && s !== prev) {
+    prev = s;
+    s = s
+      .replace(/:(?:raw|summary)$/i, "")
+      .replace(/#L\d+(?:-L?\d+)?$/i, "")
+      .replace(/:\d+(?:-\d+)?(?::\d+)?$/i, "")
+      .trim();
+  }
+  return s;
+}
+
 export class BoundaryViolationError extends Error {
   readonly violations: string[];
   readonly roleId: string;
@@ -124,16 +143,32 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
     }
   }
 
+  const resolvedCwd = path.resolve(input.cwd);
+  const afterPaths = [...after.keys()];
   const verifiedFacts = [...(input.verifiedFacts ?? [])];
   for (const fact of verifiedFacts) {
     const evidenceRef = fact.evidenceRef?.trim();
     let verified = Boolean(evidenceRef && allowedEvidence.has(evidenceRef));
     if (!verified && evidenceRef) {
-      const stripped = evidenceRef.replace(/(?::\d+(?:-\d+)?(?::\d+)?|#L\d+(?:-L?\d+)?)$/i, "");
+      const stripped = stripEvidenceSelectorAndNotes(evidenceRef);
       if (stripped) {
-        const normRel = normalizeRelPath(path.relative(input.cwd, path.resolve(input.cwd, stripped)));
-        if (normRel && normRel !== ".." && !normRel.startsWith("../")) {
-          verified = allowedEvidence.has(normRel) || (hasValidTool && after.has(normRel));
+        const absTarget = path.resolve(resolvedCwd, stripped);
+        if (absTarget === resolvedCwd) {
+          verified = hasValidTool && after.size > 0;
+        } else {
+          const normRel = normalizeRelPath(path.relative(resolvedCwd, absTarget));
+          if (
+            normRel &&
+            normRel !== ".." &&
+            !normRel.startsWith("../") &&
+            normRel !== ".omp-enhance" &&
+            !normRel.startsWith(".omp-enhance/")
+          ) {
+            const dirPrefix = `${normRel}/`;
+            verified =
+              allowedEvidence.has(normRel) ||
+              (hasValidTool && (after.has(normRel) || afterPaths.some((p) => p.startsWith(dirPrefix))));
+          }
         }
       }
     }

@@ -3,7 +3,7 @@ import { normalizeUsageSummary } from "../core/settings.ts";
 import type { EnhanceStore } from "../core/store.ts";
 import type {
   EnhanceSettings, EpistemicKind, EpistemicStatus, FlowRunResult, HandoffEnvelope,
-  HandoffVerdict, Mandate, MandateStatus, RoleSpec, VerifiedFact,
+  HandoffVerdict, Mandate, MandateStatus, RoleSpec, UsageSummary, VerifiedFact,
 } from "../core/types.ts";
 import { BoundaryViolationError, createAndVerifyHandoff } from "../flow/handoff.ts";
 import { executeRoleStep, type RoleSessionRunner, type RoleStepContext, type RoleSupervisorConfig } from "../flow/orchestrator.ts";
@@ -24,7 +24,7 @@ export interface WorkspaceRuntime {
   syncStatusBar(ctx: any): void;
   runnerFor(ctx: any): RoleSessionRunner;
   supervisorFor(ctx: any): RoleSupervisorConfig | undefined;
-  emitMessage(ctx: any, text: string): void;
+  emitMessage(ctx: any, text: string, options?: { excludeFromContext?: boolean }): void;
   startManagedFlow(input: {
     ctx: any; flowId?: string; roles: RoleSpec[]; mandate: Mandate;
     initialHandoff: HandoffEnvelope | null; maxRepairRounds: number;
@@ -72,9 +72,26 @@ export function schemaKit(pi: any) {
       T?.Union ? T.Union(values.map((v: string) => T.Literal(v))) : { type: "string", enum: values },
     obj: (props: Record<string, unknown>, req: string[]): unknown =>
       T?.Object
-        ? T.Object(Object.fromEntries(Object.entries(props).map(([k, v]) => [k, req.includes(k) ? v : opt(v)])))
-        : { type: "object", properties: props, required: req },
+        ? T.Object(
+            Object.fromEntries(Object.entries(props).map(([k, v]) => [k, req.includes(k) ? v : opt(v)])),
+            { additionalProperties: false },
+          )
+        : { type: "object", properties: props, required: req, additionalProperties: false },
   };
+}
+
+function extractForegroundUsage(ctx: any): UsageSummary | null {
+  const direct = normalizeUsageSummary(ctx?.getLastAssistantMessage?.()?.usage);
+  if (direct) return direct;
+  const entries: any[] = ctx?.sessionManager?.getBranch?.() ?? ctx?.sessionManager?.getEntries?.() ?? [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i], msg = e?.type === "message" ? e.message : e;
+    if (msg?.role === "assistant" && msg?.usage) {
+      const u = normalizeUsageSummary(msg.usage);
+      if (u) return u;
+    }
+  }
+  return null;
 }
 
 const toolResult = (payload: unknown, isError = false) => ({
@@ -133,6 +150,7 @@ async function executeJobParams(input: {
   store: EnhanceStore; cwd: string; role: RoleSpec | null; params: Record<string, unknown>;
   settings: EnhanceSettings; supervisor?: RoleSupervisorConfig;
   defaultMandateId?: string | null; defaultGoal?: string; signal?: AbortSignal;
+  onJobStarted?: (jobId: string) => void;
 }) {
   const action = asString(input.params.action);
   const perm = canRoleUseCompanionTool(input.role, "enhance_job", action ?? "start");
@@ -141,13 +159,13 @@ async function executeJobParams(input: {
   if (action === "start") {
     const command = asString(input.params.command);
     if (!command) throw new Error("enhance_job start requires a command.");
-    return {
-      job: startBackgroundJob({
-        store: input.store, cwd: input.cwd, command,
-        mandateId: asString(input.params.mandateId) ?? input.defaultMandateId ?? null,
-        hypothesisId: asString(input.params.hypothesisId),
-      }),
-    };
+    const job = startBackgroundJob({
+      store: input.store, cwd: input.cwd, command,
+      mandateId: asString(input.params.mandateId) ?? input.defaultMandateId ?? null,
+      hypothesisId: asString(input.params.hypothesisId),
+    });
+    input.onJobStarted?.(job.jobId);
+    return { job };
   }
   if (action === "list" || action === "reconcile") { reconcileJobs(input.store); return { jobs: input.store.listJobs() }; }
   if (action === "tail") {
@@ -167,6 +185,7 @@ async function executeJobParams(input: {
       ? startBackgroundJob({ store: input.store, cwd: input.cwd, command, mandateId: asString(input.params.mandateId) ?? input.defaultMandateId ?? null, hypothesisId: asString(input.params.hypothesisId) })
       : null;
     if (!job) throw new Error(jobId ? `Unknown jobId "${jobId}".` : "enhance_job watch requires a jobId or command.");
+    if (!jobId) input.onJobStarted?.(job.jobId);
     const supEnabled = input.settings.supervisorEnabled !== false && Boolean(input.supervisor);
     const delaySec = typeof input.params.initialDelaySec === "number" && Number.isFinite(input.params.initialDelaySec)
       ? Math.max(0, input.params.initialDelaySec) : input.settings.supervisorInitialDelaySec;
@@ -181,10 +200,15 @@ async function executeJobParams(input: {
   throw new Error(`Unknown enhance_job action "${action}".`);
 }
 
-export function buildStageCompanionTools(pi: any, stepCtx: RoleStepContext, settings: EnhanceSettings): any[] {
+export function buildStageCompanionTools(
+  pi: any,
+  stepCtx: RoleStepContext,
+  settings: EnhanceSettings,
+  onJobStarted?: (jobId: string) => void,
+): any[] {
   const kit = schemaKit(pi);
   const tools: any[] = [{
-    name: "enhance_mandate", label: "Stage Mandate & Epistemic Board", loadMode: "essential", approval: "write",
+    name: "enhance_mandate", label: "Stage Mandate & Epistemic Board", loadMode: "essential",
     description: "Read the active Mandate or add/update epistemic-board items inside this stage.",
     parameters: kit.obj({
       action: kit.en(["set", "get", "add_item", "update_item"]), goal: kit.str(),
@@ -210,7 +234,8 @@ export function buildStageCompanionTools(pi: any, stepCtx: RoleStepContext, sett
           const sig = toolSignal instanceof AbortSignal ? toolSignal : stepCtx.signal;
           return toolResult(await executeJobParams({
             store: stepCtx.store, cwd: stepCtx.cwd, role: stepCtx.role, params, settings,
-            supervisor: stepCtx.supervisor, defaultMandateId: stepCtx.mandate.id, defaultGoal: stepCtx.mandate.goal, signal: sig,
+            supervisor: stepCtx.supervisor, defaultMandateId: stepCtx.mandate.id, defaultGoal: stepCtx.mandate.goal,
+            signal: sig, onJobStarted,
           }));
         } catch (err) { return toolError(err); }
       },
@@ -222,19 +247,19 @@ export function buildStageCompanionTools(pi: any, stepCtx: RoleStepContext, sett
 export function registerEnhanceTools(pi: any, getWorkspace: (ctx: any) => WorkspaceRuntime): void {
   const kit = schemaKit(pi);
   const registerTool = (input: {
-    name: string; label: string; description: string; approval: "read" | "write" | "exec"; parameters: unknown;
+    name: string; label: string; description: string; approval?: "read" | "write" | "exec"; parameters: unknown;
     execute: (params: Record<string, unknown>, ctx: any, signal?: AbortSignal) => Promise<unknown>;
   }): void => {
     pi.registerTool({
       name: input.name, label: input.label, description: input.description,
-      loadMode: "essential", approval: input.approval, parameters: input.parameters,
+      loadMode: "essential", ...(input.approval ? { approval: input.approval } : {}), parameters: input.parameters,
       execute: (_id: string, params: Record<string, unknown>, signal: unknown, _onUpdate: unknown, ctx: any) =>
         input.execute(params, ctx, signal instanceof AbortSignal ? signal : undefined),
     });
   };
 
   registerTool({
-    name: "enhance_mandate", label: "Enhance Mandate", approval: "write",
+    name: "enhance_mandate", label: "Enhance Mandate",
     description: "Set or read the active Mandate, and add/update epistemic-board items.",
     parameters: kit.obj({
       action: kit.en(["set", "get", "add_item", "update_item"]), goal: kit.str(),
@@ -249,7 +274,7 @@ export function registerEnhanceTools(pi: any, getWorkspace: (ctx: any) => Worksp
   });
 
   registerTool({
-    name: "enhance_handoff", label: "Enhance Handoff", approval: "write",
+    name: "enhance_handoff", label: "Enhance Handoff",
     description: "Create a verified HandoffEnvelope for the active role; optionally delegate immediately.",
     parameters: kit.obj({
       verdict: kit.en(VERDICTS), summary: kit.str(), toTarget: kit.str(), artifactPaths: kit.arr(kit.str()),
@@ -284,10 +309,10 @@ export function registerEnhanceTools(pi: any, getWorkspace: (ctx: any) => Worksp
           store: ws.store, role, cwd: ws.cwd, mandate, sessionId: sid, toTarget,
           parentHandoffId: mandate ? ws.store.getLatestHandoff(mandate.id)?.id ?? null : null,
           verdict: verdict as HandoffVerdict, summary, artifactPaths: asStringArray(params.artifactPaths),
-          baselineSnapshot: tracker.getBaselineSnapshot(), baselineConfigSnapshot: tracker.getBaselineConfigSnapshot(),
+          baselineSnapshot: tracker.getBaselineSnapshot(ws.cwd), baselineConfigSnapshot: tracker.getBaselineConfigSnapshot(ws.cwd),
           observedCalls: tracker.getObservedCalls(), verifiedFacts: asVerifiedFacts(params.verifiedFacts),
           openRisks: asStringArray(params.openRisks), feedbackForUpstream: asString(params.feedbackForUpstream),
-          observedUsage: normalizeUsageSummary(ctx?.getLastAssistantMessage?.()?.usage),
+          observedUsage: extractForegroundUsage(ctx),
         });
 
         if (wantDelegate && targetRole) {

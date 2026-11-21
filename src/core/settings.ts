@@ -33,6 +33,9 @@ export const OMP_MODEL_ROLE_IDS = [
 
 const MODEL_ROLE_SET = new Set<string>(OMP_MODEL_ROLE_IDS);
 const THINKING_SET = new Set<string>(ROLE_THINKING_LEVELS);
+const EXPLICIT_THINKING_SET = new Set<string>(
+  ROLE_THINKING_LEVELS.filter((level) => level !== "inherit"),
+);
 const ROUTING_MODES = new Set<string>(["ask", "auto", "manual"]);
 
 const clampInt = (value: number, min: number, max: number): number =>
@@ -43,7 +46,7 @@ export const DEFAULT_ENHANCE_SETTINGS: EnhanceSettings = {
   showStatusBar: true,
   supervisorEnabled: true,
   supervisorModel: "@advisor",
-  supervisorThinking: "off",
+  supervisorThinking: "inherit",
   supervisorInitialDelaySec: 30,
   flowMaxRepairRounds: 2,
   flowRoutingMode: "ask",
@@ -181,10 +184,28 @@ export function loadEnhanceSettings(options: LoadEnhanceSettingsOptions): Enhanc
   return effective;
 }
 
+export function splitModelThinkingSuffix(spec: string): {
+  base: string;
+  thinking?: Exclude<RoleThinkingLevel, "inherit">;
+} {
+  const trimmed = spec.trim();
+  const idx = trimmed.lastIndexOf(":");
+  if (idx <= 0) return { base: trimmed };
+  const suffix = trimmed.slice(idx + 1).trim().toLowerCase();
+  if (!EXPLICIT_THINKING_SET.has(suffix)) return { base: trimmed };
+  const base = trimmed.slice(0, idx).trim();
+  return base
+    ? { base, thinking: suffix as Exclude<RoleThinkingLevel, "inherit"> }
+    : { base: trimmed };
+}
+
 export function normalizeModelSpec(spec: string | undefined): string | undefined {
   const trimmed = spec?.trim();
   if (!trimmed || trimmed === "inherit") return undefined;
-  return trimmed.startsWith("@") || !MODEL_ROLE_SET.has(trimmed) ? trimmed : `@${trimmed}`;
+  const { base, thinking } = splitModelThinkingSuffix(trimmed);
+  if (!base || base === "inherit") return undefined;
+  const normBase = base.startsWith("@") || !MODEL_ROLE_SET.has(base) ? base : `@${base}`;
+  return thinking ? `${normBase}:${thinking}` : normBase;
 }
 
 export function modelSupportsVision(model: unknown): boolean | null {
@@ -194,25 +215,130 @@ export function modelSupportsVision(model: unknown): boolean | null {
   return ((model as { input: unknown[] }).input).includes("image");
 }
 
-export function resolveModelSpec(spec: string | undefined, hostCtx: any): unknown {
+function readConfiguredModelRole(roleTag: string, pi?: any, hostCtx?: any): string | undefined {
+  for (const s of [hostCtx?.settings, pi?.pi?.settings, pi?.settings]) {
+    if (!s) continue;
+    if (typeof s.getModelRole === "function") {
+      const v = s.getModelRole(roleTag);
+      if (typeof v === "string" && v.trim()) return v.trim();
+    }
+    if (typeof s.getModelRoles === "function") {
+      const v = s.getModelRoles()?.[roleTag];
+      if (typeof v === "string" && v.trim()) return v.trim();
+    }
+    if (typeof s.modelRoles === "object" && s.modelRoles !== null) {
+      const v = (s.modelRoles as Record<string, unknown>)[roleTag];
+      if (typeof v === "string" && v.trim()) return v.trim();
+    }
+  }
+  return undefined;
+}
+
+function resolveModelSpecInner(
+  spec: string | undefined,
+  hostCtx: any,
+  pi: any,
+  visitedRoles: Set<string>,
+): unknown {
   const normalized = normalizeModelSpec(spec);
   if (!normalized) return hostCtx?.model;
-  const resolved =
-    hostCtx?.models?.resolve?.(normalized) ??
-    (normalized.startsWith("@") ? hostCtx?.models?.resolve?.(normalized.slice(1)) : undefined);
   const list: any[] = Array.isArray(hostCtx?.models?.list?.()) ? hostCtx.models.list() : [];
-  if (normalized === "@vision") {
-    if (resolved !== undefined && resolved !== null && modelSupportsVision(resolved) !== false) {
-      return resolved;
-    }
-    if (modelSupportsVision(hostCtx?.model) === true) return hostCtx.model;
-    return list.find((m) => modelSupportsVision(m) === true) ?? resolved ?? hostCtx?.model;
+  if (!normalized.startsWith("@")) {
+    const literalMatch = list.find(
+      (m) => m && (`${m.provider}/${m.id}` === normalized || m.id === normalized),
+    );
+    if (literalMatch !== undefined) return literalMatch;
   }
+
+  const { base } = splitModelThinkingSuffix(normalized);
+  if (base.startsWith("@")) {
+    const roleTag = base.slice(1);
+    let resolved = hostCtx?.models?.resolve?.(base);
+    if ((resolved === undefined || resolved === null) && !visitedRoles.has(roleTag)) {
+      const configured = readConfiguredModelRole(roleTag, pi, hostCtx)?.split(",")[0]?.trim();
+      if (configured) {
+        const nextVisited = new Set(visitedRoles);
+        nextVisited.add(roleTag);
+        resolved = resolveModelSpecInner(configured, hostCtx, pi, nextVisited);
+      }
+    }
+    if (base === "@vision") {
+      if (resolved !== undefined && resolved !== null && modelSupportsVision(resolved) !== false) {
+        return resolved;
+      }
+      if (modelSupportsVision(hostCtx?.model) === true) return hostCtx.model;
+      return (
+        list.find((m) => modelSupportsVision(m) === true) ??
+        (resolved !== undefined && resolved !== null ? resolved : hostCtx?.model)
+      );
+    }
+    return resolved !== undefined && resolved !== null ? resolved : hostCtx?.model;
+  }
+
+  const resolved =
+    (normalized !== base ? hostCtx?.models?.resolve?.(normalized) : undefined) ??
+    hostCtx?.models?.resolve?.(base);
   if (resolved !== undefined && resolved !== null) return resolved;
   return (
-    list.find((m) => m && (`${m.provider}/${m.id}` === normalized || m.id === normalized)) ??
+    list.find((m) => m && (`${m.provider}/${m.id}` === base || m.id === base)) ??
     hostCtx?.model
   );
+}
+
+export function resolveModelSpec(spec: string | undefined, hostCtx: any, pi?: any): unknown {
+  return resolveModelSpecInner(spec, hostCtx, pi, new Set<string>());
+}
+
+export function extractModelSpecThinking(
+  spec: string | undefined,
+  pi: any,
+  hostCtx: any,
+  resolvedModel?: unknown,
+): Exclude<RoleThinkingLevel, "inherit"> | undefined {
+  const normalized = normalizeModelSpec(spec);
+  if (!normalized) return undefined;
+  const list: any[] = Array.isArray(hostCtx?.models?.list?.()) ? hostCtx.models.list() : [];
+  if (
+    !normalized.startsWith("@") &&
+    list.some((m) => m && (`${m.provider}/${m.id}` === normalized || m.id === normalized))
+  ) {
+    return undefined;
+  }
+  const { base, thinking } = splitModelThinkingSuffix(normalized);
+  if (thinking) return thinking;
+  if (!base.startsWith("@")) return undefined;
+
+  if (base === "@vision") {
+    const directVision = hostCtx?.models?.resolve?.("@vision");
+    if (
+      directVision !== undefined &&
+      directVision !== null &&
+      modelSupportsVision(directVision) === false &&
+      resolvedModel !== directVision
+    ) {
+      return undefined;
+    }
+  }
+
+  const visited = new Set<string>();
+  let roleTag = base.slice(1);
+  while (roleTag && !visited.has(roleTag) && visited.size < 8) {
+    visited.add(roleTag);
+    const raw = readConfiguredModelRole(roleTag, pi, hostCtx)?.split(",")[0]?.trim();
+    const nextNorm = normalizeModelSpec(raw);
+    if (!nextNorm) return undefined;
+    if (
+      !nextNorm.startsWith("@") &&
+      list.some((m) => m && (`${m.provider}/${m.id}` === nextNorm || m.id === nextNorm))
+    ) {
+      return undefined;
+    }
+    const parsed = splitModelThinkingSuffix(nextNorm);
+    if (parsed.thinking) return parsed.thinking;
+    if (!parsed.base.startsWith("@")) return undefined;
+    roleTag = parsed.base.slice(1);
+  }
+  return undefined;
 }
 
 export function resolveRoleRuntimeConfig(
@@ -232,10 +358,14 @@ export function resolveRoleRuntimeConfig(
       ? role.thinking
       : settings.supervisorThinking
     : role.thinking;
+  const model = resolveModelSpec(modelSpec, hostCtx, pi);
+  const explicitThinking = thinkSpec && thinkSpec !== "inherit" ? thinkSpec : undefined;
+  const roleSuffixThinking = explicitThinking
+    ? undefined
+    : extractModelSpecThinking(modelSpec, pi, hostCtx, model);
   return {
-    model: resolveModelSpec(modelSpec, hostCtx),
-    thinkingLevel:
-      thinkSpec && thinkSpec !== "inherit" ? thinkSpec : pi?.getThinkingLevel?.(),
+    model,
+    thinkingLevel: explicitThinking ?? roleSuffixThinking ?? pi?.getThinkingLevel?.(),
   };
 }
 

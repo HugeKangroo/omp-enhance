@@ -23,9 +23,9 @@
    - **长作业与进程身份防误杀对账**：后台长作业、会话/流程级 `Mandate`、`HandoffEnvelope`、认知黑板与 Flow 检查点全程持久化至 `.omp-enhance/state.sqlite`（6 张表，WAL + `busy_timeout` 并发事务模式，按需惰性创建）；通过进程启动时间指纹（`processStartToken`）防止跨重启 PID 复用误判或误杀无关进程。
    - **Flow 断点续跑（`/flow continue` / `Ctrl+R`）**：多角色 Flow 每步与阶段切换自动写入带属主进程指纹的检查点；若进程中断后通过 `omp --continue` 重开，已完成阶段绝不重跑，群聊气泡、用户中途插话与工具轨迹完整恢复，输入 `/flow continue`（或在 `/flow` 面板按 `Ctrl+R`）即可从中断阶段继续执行（安全越界 `violation` 状态禁止带脏续跑）。
    - **会话角色记忆与 `F5` 重试保护**：当前会话切换的 `/role <id>` 自动随 OMP `.jsonl` 会话分支持久化（切换回 `inherit` 或 `/role off` 时自动还原会话初始模型与推理档位）；当单轮请求因网络波动报错或中断后按 **`F5` 重试**时，自动保留报错前的文件基线快照与已执行工具证据。
-6. **运行期自适应巡检与止损（Supervisor 默认继承 `@advisor`）**
-   - 内置 `supervisor` 默认自动继承你在 OMP 中配置的 **`@advisor`（Advisor 模型角色）**，也可在 `/settings → Plugins → omp-enhance`（`supervisorModel`）或 `/role edit supervisor` 中自由改绑任意模型或设为 `inherit`。
-   - 为隔离阶段子会话（`/flow`、`/enhance-handoff`、`delegateNow`）及 `enhance_job(action="watch")` 后台作业提供周期性增量脉搏巡检（感知正在运行的长耗时工具 `activeTool` 与最近巡检历史 `priorDecisions`）：子会话支持 `continue`、`steer`、`abort` 三种裁决，无标准输入的后台作业仅约束为 `continue` 或 `abort`。
+6. **运行期自适应巡检与止损（Supervisor 默认继承 `@advisor` 模型与推理档位）**
+   - 内置 `supervisor` 默认自动继承你在 OMP 中配置的 **`@advisor`（Advisor 模型角色及其 `:thinking` 推理档位，`supervisorThinking: "inherit"`）**，完整支持 OMP `19.x` 全部推理档位（含 `max` 与 `auto`），也可在 `/settings → Plugins → omp-enhance`（`supervisorModel` / `supervisorThinking`）或 `/role edit supervisor` 中自由改绑任意模型或推理档位。
+   - 为隔离阶段子会话（`/flow`、`/enhance-handoff`、`delegateNow`）及 `enhance_job(action="watch")` 后台作业提供周期性增量脉搏巡检（携带阶段 `roleId` / `readOnly` / `allowedTools` 权限元数据、正在运行的长耗时工具 `activeTool`、OMP 原生后台异步任务数 `activeAsyncJobs` 与最近巡检历史 `priorDecisions`）：对只读或无 `bash` 阶段严禁误导执行 Shell 命令，原生 `bg_*` 后台任务运行期自动计为活跃进展；子会话支持 `continue`、`steer`、`abort` 三种裁决（阶段中止时自动清理该阶段启动的残留 `enhance_job` 进程组），无标准输入的后台作业仅约束为 `continue` 或 `abort`。
    - 快速任务在初始延迟（默认 30 秒）内结束时不产生任何监督模型调用；关闭 `supervisorEnabled` 时 `watch` 仅静默轮询完成状态而不触发 `@advisor` 调用；监督模型自身报错时 **fail-open** 并按指数退避（`30s → 60s → 120s...`）重试，绝不误杀健康任务或刷爆配额。
 7. **双流协同架构 + 左右对称群聊卡片与 `/flow` 动作检查器（B + C 形态）**
    - **前台沟通流 + 后台执行流非阻塞并发**：多角色 Flow 在后台异步推进，主对话框始终解锁可随时追问或插话；支持在 `/settings → Plugins → omp-enhance` 切换 `flowRoutingMode`（默认 `ask` 询问确认、`auto` 自动派发、`manual` 仅手动 `/flow` 触发）。

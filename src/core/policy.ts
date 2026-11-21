@@ -1,3 +1,5 @@
+import { existsSync, readdirSync, statSync } from "node:fs";
+import path from "node:path";
 import type { ObservedToolCall, RoleSpec, SupervisorActiveTool } from "./types.ts";
 import {
   matchesGlobList, resolveSafeTargetRealpath, snapshotConfigIntegrity, snapshotWorkspace,
@@ -9,82 +11,61 @@ export const COMPANION_TOOL_NAMES = [
 ] as const;
 
 export const READONLY_SUBAGENTS = ["scout", "reviewer", "security-reviewer"] as const;
-export const WRITE_TOOLS: Readonly<Record<string, true>> = { write: true, edit: true, apply_patch: true };
-export const MUTATING_HOST_TOOLS = ["write", "edit", "apply_patch", "bash", "eval", "manage_skill"] as const;
+export const WRITE_TOOLS: Readonly<Record<string, true>> = {
+  write: true, edit: true, apply_patch: true, ast_edit: true,
+};
+export const MUTATING_HOST_TOOLS = [
+  "write", "edit", "apply_patch", "ast_edit", "bash", "eval",
+  "manage_skill", "learn", "memory_edit", "retain", "context_notes", "new_context",
+] as const;
 export const DEFAULT_READONLY_TOOLS = ["read", "grep", "glob", "find", "lsp", "task", "wait"] as const;
 
+const GLOB_META = /[*?[\]{}]/;
 const READONLY_SUBAGENT_SET = new Set<string>(READONLY_SUBAGENTS);
-const STRICT_READONLY_BLOCKED_TOOLS = new Set<string>(["write", "edit", "apply_patch", "eval", "manage_skill"]);
+const STRICT_READONLY_BLOCKED_TOOLS = new Set<string>([
+  "write", "edit", "apply_patch", "ast_edit", "eval",
+  "manage_skill", "learn", "memory_edit", "retain", "context_notes", "new_context",
+]);
 
-export function isCompanionTool(toolName: string): boolean {
-  return (COMPANION_TOOL_NAMES as readonly string[]).includes(toolName);
-}
-
+export const isCompanionTool = (toolName: string): boolean => (COMPANION_TOOL_NAMES as readonly string[]).includes(toolName);
 export function isRoleReadOnly(role: RoleSpec | null | undefined): boolean {
   if (!role) return false;
-  if (role.permissions.writable !== undefined) return role.permissions.writable.length === 0;
-  return (role.permissions.protected ?? []).includes("**");
+  return role.permissions.writable !== undefined ? role.permissions.writable.length === 0 : (role.permissions.protected ?? []).includes("**");
 }
-
-export function hasWriteBoundary(role: RoleSpec | null | undefined): boolean {
-  if (!role) return false;
-  return role.permissions.writable !== undefined || (role.permissions.protected?.length ?? 0) > 0;
-}
-
+export const hasWriteBoundary = (role: RoleSpec | null | undefined): boolean =>
+  Boolean(role && (role.permissions.writable !== undefined || (role.permissions.protected?.length ?? 0) > 0));
 export function roleAllowsBash(role: RoleSpec | null | undefined): boolean {
   if (!role) return true;
-  if (role.permissions.tools !== undefined) return role.permissions.tools.includes("bash");
-  return !isRoleReadOnly(role);
+  return role.permissions.tools !== undefined ? role.permissions.tools.includes("bash") : !isRoleReadOnly(role);
 }
 
-export function canRoleDelegateTo(
-  fromRole: RoleSpec | null | undefined,
-  targetRole: RoleSpec | null | undefined,
-): { allowed: boolean; reason?: string } {
+export function canRoleDelegateTo(fromRole: RoleSpec | null | undefined, targetRole: RoleSpec | null | undefined): { allowed: boolean; reason?: string } {
   if (!targetRole) return { allowed: false, reason: "Unknown delegation target role." };
-  if (targetRole.id === "supervisor") {
-    return { allowed: false, reason: 'Role "supervisor" is an internal monitor and cannot be delegated to.' };
-  }
-  if (fromRole && fromRole.id === targetRole.id) {
-    return { allowed: false, reason: `Role "${fromRole.id}" cannot delegate to itself.` };
-  }
+  if (targetRole.id === "supervisor") return { allowed: false, reason: 'Role "supervisor" is an internal monitor and cannot be delegated to.' };
+  if (fromRole && fromRole.id === targetRole.id) return { allowed: false, reason: `Role "${fromRole.id}" cannot delegate to itself.` };
   if (fromRole && isRoleReadOnly(fromRole) && !isRoleReadOnly(targetRole)) {
-    return {
-      allowed: false,
-      reason: `Read-only role "${fromRole.id}" cannot escalate write privileges by delegating to "${targetRole.id}".`,
-    };
+    return { allowed: false, reason: `Read-only role "${fromRole.id}" cannot escalate write privileges by delegating to "${targetRole.id}".` };
   }
   return { allowed: true };
 }
 
 export function canRoleUseCompanionTool(
-  role: RoleSpec | null | undefined,
-  toolName: string,
-  action?: string,
-  targetRoles?: readonly RoleSpec[],
+  role: RoleSpec | null | undefined, toolName: string, action?: string, targetRoles?: readonly RoleSpec[],
 ): { allowed: boolean; reason?: string } {
-  if (!role) return { allowed: true };
-  if (toolName === "enhance_mandate" || toolName === "enhance_handoff") return { allowed: true };
+  if (!role || toolName === "enhance_mandate" || toolName === "enhance_handoff") return { allowed: true };
   if (toolName === "enhance_job") {
-    const normalized = action?.trim().toLowerCase();
-    if (normalized === "list" || normalized === "tail" || normalized === "reconcile") {
-      return { allowed: true };
-    }
+    const norm = action?.trim().toLowerCase();
+    if (norm === "list" || norm === "tail" || norm === "reconcile") return { allowed: true };
     if (isRoleReadOnly(role) || !roleAllowsBash(role)) {
-      return {
-        allowed: false,
-        reason: `Role "${role.id}" does not permit background shell job execution (requires bash + non-readonly permissions).`,
-      };
+      return { allowed: false, reason: `Role "${role.id}" does not permit background shell job execution (requires bash + non-readonly permissions).` };
     }
     return { allowed: true };
   }
   if (toolName === "enhance_flow") {
-    const normalized = action?.trim().toLowerCase();
-    if (normalized === "status" || normalized === "cancel") return { allowed: true };
+    const norm = action?.trim().toLowerCase();
+    if (norm === "status" || norm === "cancel") return { allowed: true };
     if (isRoleReadOnly(role)) {
-      if (targetRoles && targetRoles.length > 0 && targetRoles.every((r) => isRoleReadOnly(r))) {
-        return { allowed: true };
-      }
+      if (targetRoles && targetRoles.length > 0 && targetRoles.every((r) => isRoleReadOnly(r))) return { allowed: true };
       return { allowed: false, reason: `Read-only role "${role.id}" cannot start or steer write-capable Flows.` };
     }
     return { allowed: true };
@@ -149,20 +130,38 @@ export function summarizeToolCall(toolName: string, input: unknown): string {
   return toolName;
 }
 
-function extractRawWriteTargets(toolName: string, input: unknown): string[] {
-  if (!WRITE_TOOLS[toolName]) return [];
+function extractRawWriteTargets(toolName: string, input: unknown): { targets: string[]; invalid: boolean } {
+  if (!WRITE_TOOLS[toolName]) return { targets: [], invalid: false };
   const record = typeof input === "object" && input !== null && !Array.isArray(input)
     ? (input as Record<string, unknown>) : {};
   const targets: string[] = [];
+  let invalid = false;
   const add = (value: unknown): void => {
     if (typeof value === "string" && value.trim()) targets.push(value.trim());
   };
-  add(record.path);
+  const addArray = (arr: unknown): void => {
+    if (!Array.isArray(arr)) return;
+    if (arr.length === 0) { invalid = true; return; }
+    for (const item of arr) {
+      if (typeof item !== "string" || !item.trim()) invalid = true;
+      else targets.push(item.trim());
+    }
+  };
+  const rawPath = typeof record.path === "string" && record.path.trim() ? record.path.trim() : undefined;
+  const rawGlob = record.glob;
+  if (rawGlob !== undefined) {
+    if (typeof rawGlob !== "string" || !rawGlob.trim()) invalid = true;
+    else if (rawPath) targets.push(`${rawPath.replace(/\/+$/, "")}/${rawGlob.trim().replace(/^\/+/, "")}`);
+    else targets.push(rawGlob.trim());
+  } else if (rawPath) {
+    targets.push(rawPath);
+  }
   add(record.file_path);
   add(record.filePath);
   add(record.target_file);
   add(record.destination);
-  if (Array.isArray(record.paths)) for (const value of record.paths) add(value);
+  addArray(record.paths);
+  addArray(record.files);
   if (Array.isArray(record.edits)) {
     for (const edit of record.edits) {
       if (typeof edit === "object" && edit !== null) {
@@ -179,15 +178,103 @@ function extractRawWriteTargets(toolName: string, input: unknown): string[] {
       for (const match of text.matchAll(/^\*\*\* Move to:\s*(.+)$/gm)) add(match[1]);
     }
   }
-  return targets;
+  return { targets, invalid };
+}
+
+const isExistingDir = (p: string): boolean => { try { return statSync(p).isDirectory(); } catch { return false; } };
+
+function staticPrefixOfGlob(raw: string): string {
+  const norm = raw.trim().replaceAll("\\", "/").replace(/^(?:\.\/)+/, "").replace(/\/+$/, "");
+  if (!norm || norm === ".") return "";
+  const segs: string[] = [];
+  for (const seg of norm.split("/")) {
+    if (GLOB_META.test(seg)) break;
+    segs.push(seg);
+  }
+  return segs.join("/");
+}
+
+function validateWriteTarget(cwd: string, rawTarget: string, role: RoleSpec): { block: boolean; reason?: string } {
+  const writable = role.permissions.writable, protectedGlobs = role.permissions.protected ?? [];
+  const hasGlob = GLOB_META.test(rawTarget);
+  if (!hasGlob) {
+    const resolved = resolveSafeTargetRealpath(cwd, rawTarget);
+    if (resolved.escapesWorkspace) return { block: true, reason: `Path "${rawTarget}" escapes the workspace boundary.` };
+    if (resolved.relPath !== "" && !isExistingDir(resolved.resolvedPath)) {
+      if (matchesGlobList(resolved.relPath, protectedGlobs)) {
+        return { block: true, reason: `Path "${resolved.relPath}" is protected for role "${role.id}".` };
+      }
+      if (writable && !matchesGlobList(resolved.relPath, writable)) {
+        return { block: true, reason: `Path "${resolved.relPath}" is outside the writable globs for role "${role.id}".` };
+      }
+      return { block: false };
+    }
+  }
+
+  const slashNorm = rawTarget.trim().replaceAll("\\", "/");
+  const rootLead = slashNorm.startsWith("/") ? "/" : (/^[a-zA-Z]:\//.exec(slashNorm)?.[0] ?? "");
+  const restSegs = slashNorm.slice(rootLead.length).replace(/^(?:\.\/)+/, "").split("/").filter(Boolean);
+  const staticSegs: string[] = [];
+  for (const seg of restSegs) { if (GLOB_META.test(seg)) break; staticSegs.push(seg); }
+  const prefixTarget = rootLead ? `${rootLead}${staticSegs.join("/")}` : (staticSegs.join("/") || ".");
+  const resolvedBase = resolveSafeTargetRealpath(cwd, prefixTarget);
+  if (resolvedBase.escapesWorkspace) return { block: true, reason: `Path "${rawTarget}" escapes the workspace boundary.` };
+  const subRoot = resolvedBase.relPath;
+  if (!subRoot) {
+    return { block: true, reason: `Role "${role.id}" restricts write paths; "${rawTarget}" must target a bounded subdirectory or file.` };
+  }
+
+  const tailSegs = restSegs.slice(staticSegs.length);
+  const probeTail = tailSegs.length > 0
+    ? tailSegs.map((s) => (s === "**" ? "__sub__" : s.replace(/\{([^,}]+)(?:,[^}]*)?\}/g, "$1").replace(/\*\*/g, "__sub__").replace(/[*?]/g, "x").replace(/\[[^\]]*\]/g, "x"))).join("/")
+    : "__probe__";
+  const probes = [...new Set([`${subRoot}/${probeTail}`, `${subRoot}/__probe__`])];
+
+  for (const pGlob of protectedGlobs) {
+    const pPre = staticPrefixOfGlob(pGlob);
+    if (!pPre || pPre === subRoot || pPre.startsWith(`${subRoot}/`) || subRoot.startsWith(`${pPre}/`)) {
+      return { block: true, reason: `Target "${rawTarget}" overlaps protected path "${pGlob}" for role "${role.id}".` };
+    }
+  }
+  if (probes.some((p) => matchesGlobList(p, protectedGlobs))) {
+    return { block: true, reason: `Target "${rawTarget}" is protected for role "${role.id}".` };
+  }
+  if (writable && !matchesGlobList(probes[0]!, writable)) {
+    return { block: true, reason: `Target "${rawTarget}" is outside the writable globs for role "${role.id}".` };
+  }
+
+  if (existsSync(resolvedBase.resolvedPath)) {
+    const stack = [resolvedBase.resolvedPath];
+    while (stack.length > 0) {
+      const dir = stack.pop()!;
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name === ".git" || entry.name === "node_modules" || entry.name === ".omp-enhance") continue;
+        const full = path.join(dir, entry.name);
+        const safe = resolveSafeTargetRealpath(cwd, full);
+        if (safe.escapesWorkspace) return { block: true, reason: `Symlink "${safe.relPath}" inside "${subRoot}" escapes workspace.` };
+        const checkPath = isExistingDir(safe.resolvedPath) ? `${safe.relPath}/__probe__` : safe.relPath;
+        if (matchesGlobList(safe.relPath, protectedGlobs) || matchesGlobList(checkPath, protectedGlobs)) {
+          return { block: true, reason: `Path "${safe.relPath}" inside "${subRoot}" is protected for role "${role.id}".` };
+        }
+        if (entry.isSymbolicLink() && writable && !matchesGlobList(checkPath, writable)) {
+          return { block: true, reason: `Symlink "${entry.name}" inside "${subRoot}" points outside writable globs for role "${role.id}".` };
+        }
+        if (entry.isDirectory()) stack.push(full);
+      }
+    }
+  }
+  return { block: false };
 }
 
 export function extractWriteTargetPaths(cwd: string, toolName: string, input: unknown): string[] {
-  const rawTargets = extractRawWriteTargets(toolName, input);
-  const resolved = rawTargets.map((target) => {
-    const safe = resolveSafeTargetRealpath(cwd, target);
-    return safe.escapesWorkspace ? `../${safe.relPath.replace(/^(?:\.\.\/)+/, "")}` : safe.relPath;
-  });
+  const { targets } = extractRawWriteTargets(toolName, input);
+  const resolved = targets
+    .filter((t) => !GLOB_META.test(t))
+    .flatMap((target) => {
+      const safe = resolveSafeTargetRealpath(cwd, target);
+      if (!safe.escapesWorkspace && (safe.relPath === "" || isExistingDir(safe.resolvedPath))) return [];
+      return [safe.escapesWorkspace ? `../${safe.relPath.replace(/^(?:\.\.\/)+/, "")}` : safe.relPath];
+    });
   return [...new Set(resolved)];
 }
 
@@ -258,8 +345,8 @@ export function checkToolCallAllowed(
     return { block: true, reason: `Role "${role.id}" is read-only; write operations are not permitted.` };
   }
 
-  const rawTargets = extractRawWriteTargets(event.toolName, event.input);
-  if (rawTargets.length === 0) {
+  const { targets: rawTargets, invalid } = extractRawWriteTargets(event.toolName, event.input);
+  if (invalid || rawTargets.length === 0) {
     return {
       block: true,
       reason: `Role "${role.id}" restricts write paths and could not verify target path for "${event.toolName}".`,
@@ -267,16 +354,8 @@ export function checkToolCallAllowed(
   }
 
   for (const rawTarget of rawTargets) {
-    const resolved = resolveSafeTargetRealpath(cwd, rawTarget);
-    if (resolved.escapesWorkspace) {
-      return { block: true, reason: `Path "${rawTarget}" escapes the workspace boundary.` };
-    }
-    if (matchesGlobList(resolved.relPath, role.permissions.protected ?? [])) {
-      return { block: true, reason: `Path "${resolved.relPath}" is protected for role "${role.id}".` };
-    }
-    if (writable && !matchesGlobList(resolved.relPath, writable)) {
-      return { block: true, reason: `Path "${resolved.relPath}" is outside the writable globs for role "${role.id}".` };
-    }
+    const res = validateWriteTarget(cwd, rawTarget, role);
+    if (res.block) return res;
   }
   return { block: false };
 }
@@ -291,35 +370,31 @@ export function isValidExecutionEvidence(toolName: string, isError: boolean): bo
 export class TurnTracker {
   private baseline: Map<string, SnapshotEntry> | null = null;
   private configBaseline: Map<string, SnapshotEntry> | null = null;
+  private lastCwd: string | null = null;
   private calls: ObservedToolCall[] = [];
   private inFlightTool: { name: string; startedMs: number; summary?: string } | null = null;
   private turnOpen = false;
+  private turnFailed = false;
 
-  resetTurn(cwd: string): void {
-    this.turnOpen = false;
-    this.inFlightTool = null;
-    this.beginTurn(cwd, false);
+  resetTurn(cwd?: string): void {
+    if (cwd) this.lastCwd = cwd;
+    this.baseline = null; this.configBaseline = null; this.calls = [];
+    this.inFlightTool = null; this.turnOpen = false; this.turnFailed = false;
   }
 
   beginTurn(cwd: string, preserveIfIncomplete = true): void {
+    this.lastCwd = cwd;
     if (preserveIfIncomplete && this.turnOpen && this.baseline !== null) return;
-    this.baseline = snapshotWorkspace(cwd);
-    this.configBaseline = snapshotConfigIntegrity(cwd);
-    this.calls = [];
-    this.inFlightTool = null;
-    this.turnOpen = true;
+    this.baseline = snapshotWorkspace(cwd); this.configBaseline = snapshotConfigIntegrity(cwd);
+    this.calls = []; this.inFlightTool = null; this.turnOpen = true; this.turnFailed = false;
   }
 
-  completeTurn(): void {
-    this.turnOpen = false;
-    this.inFlightTool = null;
-  }
+  markTurnFailed(): void { this.turnFailed = true; this.inFlightTool = null; }
+  completeTurn(): void { this.turnOpen = false; this.turnFailed = false; this.inFlightTool = null; }
+  isTurnFailed(): boolean { return this.turnFailed; }
 
   checkToolCallAllowed(
-    cwd: string,
-    role: RoleSpec | null,
-    event: { toolName: string; input?: unknown },
-    rolesMap?: ReadonlyMap<string, RoleSpec>,
+    cwd: string, role: RoleSpec | null, event: { toolName: string; input?: unknown }, rolesMap?: ReadonlyMap<string, RoleSpec>,
   ): { block: boolean; reason?: string } {
     return checkToolCallAllowed(cwd, role, event, rolesMap);
   }
@@ -328,18 +403,12 @@ export class TurnTracker {
     this.inFlightTool = { name: toolName, startedMs: Date.now(), summary: summarizeToolCall(toolName, input) };
   }
 
-  recordToolExecutionEnd(
-    cwd: string,
-    event: { toolCallId: string; toolName: string; args?: unknown; isError?: boolean },
-  ): ObservedToolCall {
+  recordToolExecutionEnd(cwd: string, event: { toolCallId: string; toolName: string; args?: unknown; isError?: boolean }): ObservedToolCall {
     this.inFlightTool = null;
     const call: ObservedToolCall = {
-      toolCallId: event.toolCallId,
-      toolName: event.toolName,
-      isError: event.isError ?? false,
+      toolCallId: event.toolCallId, toolName: event.toolName, isError: event.isError ?? false,
       touchedPaths: extractWriteTargetPaths(cwd, event.toolName, event.args),
-      timestamp: new Date().toISOString(),
-      summary: summarizeToolCall(event.toolName, event.args),
+      timestamp: new Date().toISOString(), summary: summarizeToolCall(event.toolName, event.args),
     };
     this.calls.push(call);
     return call;
@@ -355,6 +424,14 @@ export class TurnTracker {
   }
 
   getObservedCalls(): ObservedToolCall[] { return [...this.calls]; }
-  getBaselineSnapshot(): ReadonlyMap<string, SnapshotEntry> | null { return this.baseline; }
-  getBaselineConfigSnapshot(): ReadonlyMap<string, SnapshotEntry> | null { return this.configBaseline; }
+  getBaselineSnapshot(cwd?: string): ReadonlyMap<string, SnapshotEntry> | null {
+    const target = cwd ?? this.lastCwd;
+    if (this.baseline === null && target) this.baseline = snapshotWorkspace(target);
+    return this.baseline;
+  }
+  getBaselineConfigSnapshot(cwd?: string): ReadonlyMap<string, SnapshotEntry> | null {
+    const target = cwd ?? this.lastCwd;
+    if (this.configBaseline === null && target) this.configBaseline = snapshotConfigIntegrity(target);
+    return this.configBaseline;
+  }
 }

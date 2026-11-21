@@ -237,13 +237,13 @@ export async function openRoleEditor(roleId: string, deps: RoleStudioDeps, initi
     if (choice.startsWith("Activate ")) {
       await deps.activateRole(role.id); ui.notify?.(`Activated role "${role.id}"`, "info");
     } else if (choice.startsWith("Model:")) {
-      const picked = await pickRoleModel(isSup && role.source === "builtin" ? settings.supervisorModel : role.model, deps);
+      const picked = await pickRoleModel(isSup && (role.source === "builtin" || role.model === undefined) ? settings.supervisorModel : role.model, deps);
       if (picked !== null) {
         persist((d) => { if (picked === "inherit") { if (isSup) d.model = "inherit"; else delete d.model; } else d.model = picked; });
         if (deps.getActiveRoleId() === role.id) await deps.activateRole(role.id);
       }
     } else if (choice.startsWith("Thinking:")) {
-      const curThink = isSup && role.source === "builtin" ? settings.supervisorThinking : (role.thinking ?? "inherit");
+      const curThink = isSup && (role.source === "builtin" || role.thinking === undefined) ? settings.supervisorThinking : (role.thinking ?? "inherit");
       const picked: string | undefined = await ui.select("Select Thinking Level", [...ROLE_THINKING_LEVELS], {
         outline: true, initialIndex: Math.max(0, ROLE_THINKING_LEVELS.indexOf(curThink)),
       });
