@@ -62,6 +62,7 @@ function taskPromptFor(input: {
   const extra: string[] = [];
   if (h?.verifiedFacts?.length) extra.push(`Upstream verifiedFacts: ${h.verifiedFacts.map((f) => `${f.claim} [${f.evidenceRef}]`).join("; ")}`);
   if (h?.deletedFiles?.length) extra.push(`Upstream deletedFiles: ${h.deletedFiles.join(", ")}`);
+  if (h?.questionsForUser?.length) extra.push(`Upstream questionsForUser: ${h.questionsForUser.join(" | ")}`);
   const steers = input.userSteers.filter((s) => !s.targetRole || s.targetRole === input.role.id);
   if (steers.length > 0) {
     extra.push(`User interjections: ${steers.map((s) => (s.targetRole ? `[@${s.targetRole}] ${s.text}` : s.text)).join(" | ")}`);
@@ -78,8 +79,8 @@ function taskPromptFor(input: {
     'Valid verifiedFacts[].evidenceRef formats: workspace path[:line] (e.g. "src/app.ts:12"), workspace directory path, artifact sha256, or observed toolCallId.',
     'Mandate and Upstream Handoff are already provided in <omp-enhance-conditioning> (or via enhance_mandate action="get"); do NOT read or grep .omp-enhance/state.sqlite directly.',
     "Work strictly inside your role conditioning and permitted tools.",
-    "When finished, call enhance_handoff exactly once with verdict, summary, artifactPaths, openRisks,",
-    "and feedbackForUpstream when the verdict is rejected. Do not claim work you did not execute.",
+    "When finished, call enhance_handoff exactly once with verdict (ready | needs_input | rejected | blocked), summary, artifactPaths, openRisks,",
+    "questionsForUser when verdict is needs_input, and feedbackForUpstream when verdict is rejected. Do not claim work you did not execute.",
   ].join("\n");
 }
 
@@ -166,13 +167,14 @@ export async function executeRoleFlow(input: ExecuteRoleFlowInput): Promise<Flow
   while (idx < input.roles.length) {
     input.observer?.onProgress?.({ currentIndex: idx, repairRound, lastHandoffId: upstream?.id ?? null, lastRejectionSig, nextStageSeq: seq });
     if (input.signal?.aborted || input.observer?.isCancelled?.()) {
-      return { status: "cancelled", steps, finalEnvelope: upstream, reason: "Cancelled by user." };
+      return { status: "cancelled", cwd: input.cwd, steps, finalEnvelope: upstream, reason: "Cancelled by user." };
     }
     const role = input.roles[idx]!;
     const toTarget = idx + 1 < input.roles.length ? input.roles[idx + 1]!.id : "user";
     seq += 1;
     const stageId = input.observer?.allocateStageId?.({ roleId: role.id, round: repairRound, stepIndex: idx }) ?? `step-${seq}-r${repairRound}-${idx}-${role.id}`;
-    const effectiveRepairTarget = idx > repairTargetIdx ? repairTargetRoleId : "user";
+    const hasWritableSoFar = input.roles.slice(0, idx + 1).some((r) => !isRoleReadOnly(r));
+    const effectiveRepairTarget = hasWritableSoFar && idx > repairTargetIdx ? repairTargetRoleId : "user";
 
     const res = await executeRoleStep({
       cwd: input.cwd, store: input.store, role, mandate: input.mandate, upstreamHandoff: upstream,
@@ -183,7 +185,7 @@ export async function executeRoleFlow(input: ExecuteRoleFlowInput): Promise<Flow
     });
     if (!res.ok) {
       const status = res.status === "cancelled" ? "cancelled" : (res.status === "aborted_by_supervisor" ? "aborted_by_supervisor" : "violation");
-      return { status, steps, finalEnvelope: upstream, reason: res.reason };
+      return { status, cwd: input.cwd, steps, finalEnvelope: upstream, reason: res.reason };
     }
     let env = res.envelope;
     if (env.verdict === "rejected" && env.toTarget !== effectiveRepairTarget) {
@@ -191,18 +193,28 @@ export async function executeRoleFlow(input: ExecuteRoleFlowInput): Promise<Flow
       if (input.store.getHandoff(env.id)) input.store.saveHandoff(env);
     }
     steps.push({ stepIndex: idx, roleId: role.id, round: repairRound, envelope: env });
-    if (env.verdict === "blocked") return { status: "blocked", steps, finalEnvelope: env, reason: env.summary };
+    if (env.verdict === "needs_input") {
+      input.observer?.onProgress?.({ currentIndex: idx, repairRound, lastHandoffId: env.id, lastRejectionSig, nextStageSeq: seq });
+      const qs = env.questionsForUser?.length ? ` (${env.questionsForUser.join("; ")})` : "";
+      return { status: "waiting_input", cwd: input.cwd, steps, finalEnvelope: env, reason: `${env.summary}${qs}` };
+    }
+    if (env.verdict === "blocked") return { status: "blocked", cwd: input.cwd, steps, finalEnvelope: env, reason: env.summary };
     if (env.verdict === "rejected") {
+      if (!hasWritableSoFar) {
+        input.observer?.onProgress?.({ currentIndex: idx + 1, repairRound, lastHandoffId: env.id, lastRejectionSig, nextStageSeq: seq });
+        input.store.completeMandate(input.mandate.id);
+        return { status: "completed", cwd: input.cwd, steps, finalEnvelope: env, reason: env.feedbackForUpstream ?? env.summary };
+      }
       if (idx <= repairTargetIdx) {
-        return { status: "blocked", steps, finalEnvelope: env, reason: env.feedbackForUpstream ?? env.summary };
+        return { status: "blocked", cwd: input.cwd, steps, finalEnvelope: env, reason: env.feedbackForUpstream ?? env.summary };
       }
       const signature = (env.feedbackForUpstream ?? env.summary).trim().toLowerCase().replace(/\s+/g, " ");
       if (lastRejectionSig !== null && signature === lastRejectionSig) {
-        return { status: "stagnated", steps, finalEnvelope: env, reason: "Identical rejection feedback repeated without progress." };
+        return { status: "stagnated", cwd: input.cwd, steps, finalEnvelope: env, reason: "Identical rejection feedback repeated without progress." };
       }
       lastRejectionSig = signature;
       if (repairRound >= maxRepairRounds) {
-        return { status: "rejected_max_rounds", steps, finalEnvelope: env, reason: `Exceeded maxRepairRounds (${maxRepairRounds}).` };
+        return { status: "rejected_max_rounds", cwd: input.cwd, steps, finalEnvelope: env, reason: `Exceeded maxRepairRounds (${maxRepairRounds}).` };
       }
       repairRound += 1; upstream = env; idx = repairTargetIdx;
       continue;
@@ -212,5 +224,5 @@ export async function executeRoleFlow(input: ExecuteRoleFlowInput): Promise<Flow
   }
 
   input.store.completeMandate(input.mandate.id);
-  return { status: "completed", steps, finalEnvelope: upstream };
+  return { status: "completed", cwd: input.cwd, steps, finalEnvelope: upstream };
 }

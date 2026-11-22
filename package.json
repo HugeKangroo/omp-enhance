@@ -14,8 +14,8 @@
     "settings": {
       "defaultRole": {
         "type": "string",
-        "default": "general",
-        "description": "Role activated automatically on session start (use 'off' to disable)"
+        "default": "off",
+        "description": "Role activated automatically on session start ('off' for standard OMP, or 'coordinator')"
       },
       "showStatusBar": {
         "type": "boolean",
@@ -69,8 +69,8 @@
           "auto",
           "manual"
         ],
-        "default": "ask",
-        "description": "How foreground general dispatches multi-role flows: ask first (default), auto, or manual"
+        "default": "auto",
+        "description": "How foreground sessions dispatch multi-role flows: auto (default), ask, or manual"
       }
     }
   },

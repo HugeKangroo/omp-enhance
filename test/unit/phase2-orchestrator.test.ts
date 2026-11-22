@@ -87,9 +87,12 @@ describe("Markov role conditioning", () => {
         toolCallId: "dev-tc-1", toolName: "bash", isError: false,
         touchedPaths: [], timestamp: new Date().toISOString(), summary: "bash bun test",
       };
+      writeFile(cwd, "src/added.ts", "export const added = 1;\n");
+      writeFile(cwd, "test/math.test.ts", "export const ok = true;\n");
       const realUpstream = createAndVerifyHandoff({
         store, role: roles.get("dev")!, cwd, mandate, toTarget: "reviewer",
         verdict: "ready", summary: "UPSTREAM_SUMMARY",
+        artifactPaths: ["src/math.ts", "src/added.ts", "test/math.test.ts"],
         baselineSnapshot: baseline, observedCalls: [devCall],
         verifiedFacts: [
           { claim: "Legacy module removed cleanly", evidenceRef: "dev-tc-1" },
@@ -105,6 +108,12 @@ describe("Markov role conditioning", () => {
       });
       expect(realUpstream.deletedFiles).toEqual(["src/legacy.ts"]);
       expect(realUpstream.verifiedFacts).toHaveLength(9);
+      // High-3: unchanged file from baseline gets role="inspected", new src file gets "changed", new test file gets "test"!
+      expect(realUpstream.artifacts.map((a) => `${a.path}:${a.role}`)).toEqual([
+        "src/added.ts:changed",
+        "src/math.ts:inspected",
+        "test/math.test.ts:test",
+      ]);
       expect(() =>
         createAndVerifyHandoff({
           store, role: roles.get("dev")!, cwd, mandate, toTarget: "reviewer",
@@ -326,12 +335,23 @@ describe("child role & supervisor session isolation (F-A1, F-A2, F-A4, F-A6, F-C
         },
       };
 
-      // 1) Stage session (qa) gets sub-session identity, restrictToolNames: true, autoApprove: true, enableMemory: false, and preloadedPreparedExtensions
-      const runner = createOmpRoleSessionRunner(fakePi, { cwd, modelRegistry: hostModelRegistry }, undefined, roles);
+      // 1) Stage session (qa) gets sub-session identity, restrictToolNames: true, autoApprove: true, enableMemory: false, noContextFiles: false, enableLsp, and domain skills/rules (and NEVER clobbers host setWorkingMessage!)
+      let workingMessageCalls = 0;
+      const fakePiWithLsp = {
+        ...fakePi,
+        getAllTools: () => ["read", "write", "edit", "bash", "lsp", "enhance_handoff"].map((name) => ({ name })),
+      };
+      const runner = createOmpRoleSessionRunner(
+        fakePiWithLsp,
+        { cwd, modelRegistry: hostModelRegistry, ui: { setWorkingMessage() { workingMessageCalls += 1; } } },
+        undefined,
+        roles,
+      );
       await runner.runRoleTurn({
         cwd, store, role: roles.get("qa")!, mandate, epistemicItems: [],
         upstreamHandoff: null, toTarget: "user", conditioningPrompt: "", taskPrompt: "", stageId: "qa-r0",
       });
+      expect(workingMessageCalls).toBe(0);
 
       const stageCap = captures[0]!;
       expect(customProvidersCleared).toBe(false);
@@ -342,6 +362,10 @@ describe("child role & supervisor session isolation (F-A1, F-A2, F-A4, F-A6, F-C
       expect(stageCap.hasUI).toBe(false);
       expect(stageCap.autoApprove).toBe(true);
       expect(stageCap.enableMemory).toBe(false);
+      expect(stageCap.noContextFiles).toBe(false);
+      expect(stageCap.enableLsp).toBe(true);
+      expect(stageCap.skills).toBeUndefined();
+      expect(stageCap.rules).toBeUndefined();
       expect(stageCap.restrictToolNames).toBe(true);
       expect(stageCap.allowRestrictedCustomTools).toBe(true);
       expect(stageCap.toolNames).toContain("enhance_handoff");
@@ -587,11 +611,109 @@ describe("role flow repair loop & mandate completion", () => {
       store.close();
     }
   });
+
+  test("pauses cleanly on verdict=needs_input (status=waiting_input) with questionsForUser and resumes with user answer", async () => {
+    const { cwd, roles, store, mandate } = setup();
+    try {
+      let devTurns = 0;
+      let resumedTaskPrompt = "";
+      const runner: RoleSessionRunner = {
+        async runRoleTurn(ctx) {
+          if (ctx.role.id === "dev") {
+            devTurns += 1;
+            if (devTurns === 1) {
+              const env = createAndVerifyHandoff({
+                store, role: ctx.role, cwd, mandate, toTarget: ctx.toTarget,
+                verdict: "needs_input", summary: "Need token TTL policy",
+                questionsForUser: ["Should refresh token TTL be 24h or 7d?"],
+              });
+              return { envelope: env, observedCalls: [], assistantText: "asking", usage: null };
+            }
+            resumedTaskPrompt = ctx.taskPrompt;
+            const call: ObservedToolCall = { toolCallId: "d-2", toolName: "bash", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+            const env = createAndVerifyHandoff({
+              store, role: ctx.role, cwd, mandate, parentHandoffId: ctx.upstreamHandoff?.id ?? null,
+              toTarget: ctx.toTarget, verdict: "ready", summary: "Implemented 7d TTL", observedCalls: [call],
+            });
+            return { envelope: env, observedCalls: [call], assistantText: "done", usage: null };
+          }
+          const qaCall: ObservedToolCall = { toolCallId: "q-1", toolName: "bash", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+          const env = createAndVerifyHandoff({
+            store, role: ctx.role, cwd, mandate, parentHandoffId: ctx.upstreamHandoff?.id ?? null,
+            toTarget: ctx.toTarget, verdict: "ready", summary: "QA verified 7d TTL", observedCalls: [qaCall],
+          });
+          return { envelope: env, observedCalls: [qaCall], assistantText: "qa ok", usage: null };
+        },
+      };
+
+      const paused = await executeRoleFlow({
+        cwd, store, mandate, runner, roles: [roles.get("dev")!, roles.get("qa")!],
+      });
+      expect(paused.status).toBe("waiting_input");
+      expect(paused.cwd).toBe(cwd);
+      expect(paused.finalEnvelope?.verdict).toBe("needs_input");
+      expect(paused.finalEnvelope?.questionsForUser).toEqual(["Should refresh token TTL be 24h or 7d?"]);
+      expect(store.getMandate(mandate.id)?.status).toBe("active");
+
+      const resumed = await executeRoleFlow({
+        cwd, store, mandate, runner, roles: [roles.get("dev")!, roles.get("qa")!],
+        startIndex: 0, initialHandoff: paused.finalEnvelope,
+        userSteers: [{ text: "Use 7d TTL with rotation", createdAt: new Date().toISOString() }],
+      });
+      expect(resumed.status).toBe("completed");
+      expect(resumedTaskPrompt).toContain("Use 7d TTL with rotation");
+      expect(resumedTaskPrompt).toContain("Should refresh token TTL be 24h or 7d?");
+      expect(store.getMandate(mandate.id)?.status).toBe("completed");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("completes standalone read-only audit flows (reviewer / planner -> reviewer) as status=completed when verdict=rejected", async () => {
+    const { cwd, roles, store, mandate } = setup();
+    writeFile(cwd, "src/auth.ts", "export const verify = (t: string) => t.length > 0;\n");
+    try {
+      const runner: RoleSessionRunner = {
+        async runRoleTurn(ctx) {
+          const call: ObservedToolCall = { toolCallId: `ro-${ctx.role.id}`, toolName: "read", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+          const env = ctx.role.id === "planner"
+            ? createAndVerifyHandoff({
+                store, role: ctx.role, cwd, mandate, baselineSnapshot: ctx.beforeSnapshot,
+                artifactPaths: ["src/auth.ts"], toTarget: ctx.toTarget, verdict: "ready", summary: "Blueprint ready", observedCalls: [call],
+              })
+            : createAndVerifyHandoff({
+                store, role: ctx.role, cwd, mandate, baselineSnapshot: ctx.beforeSnapshot,
+                artifactPaths: ["src/auth.ts"], toTarget: ctx.toTarget, verdict: "rejected",
+                summary: "Audit found missing signature verification",
+                feedbackForUpstream: "src/auth.ts:1 accepts unsigned tokens", observedCalls: [call],
+              });
+          return { envelope: env, observedCalls: [call], assistantText: "audited", usage: null };
+        },
+      };
+
+      const singleAudit = await executeRoleFlow({ cwd, store, mandate, runner, roles: [roles.get("reviewer")!] });
+      expect(singleAudit.status).toBe("completed");
+      expect(singleAudit.finalEnvelope?.verdict).toBe("rejected");
+      expect(singleAudit.finalEnvelope?.toTarget).toBe("user");
+      expect(singleAudit.finalEnvelope?.artifacts).toMatchObject([{ path: "src/auth.ts", role: "inspected" }]);
+      expect(store.getMandate(mandate.id)?.status).toBe("completed");
+
+      const m2 = store.upsertMandate({ goal: "Audit plan" });
+      const twoStageAudit = await executeRoleFlow({ cwd, store, mandate: m2, runner, roles: [roles.get("planner")!, roles.get("reviewer")!] });
+      expect(twoStageAudit.status).toBe("completed");
+      expect(twoStageAudit.finalEnvelope?.verdict).toBe("rejected");
+      expect(twoStageAudit.finalEnvelope?.toTarget).toBe("user");
+      expect(store.getMandate(m2.id)?.status).toBe("completed");
+    } finally {
+      store.close();
+    }
+  });
 });
 
 interface TestContext {
   cwd: string;
-  ui: { notify(message: string, level: string): void };
+  hasUI?: boolean;
+  ui: { notify(message: string, level: string): void; setStatus?(key: string, val?: string): void; setWidget?(key: string, val?: any): void; select?: (...args: any[]) => Promise<string | undefined> };
   modelRegistry: Record<string, never>;
   model?: unknown;
   models?: { resolve(spec: string): unknown; list(): unknown[] };
@@ -604,20 +726,28 @@ function createHarness(cwd: string, root: string) {
   const messages: string[] = [];
   const rawMessages: Array<{ content: string; excludeFromContext?: boolean }> = [];
   const notifications: string[] = [];
-  let activeTools: string[] = [];
+  const statusHistory: Array<string | undefined> = [];
+  let setActiveToolsCalls = 0;
+  let activeTools: string[] = ["read", "grep", "glob", "find", "ls", "lsp", "bash", "edit", "write", "web_search"];
   let currentModel: unknown = { provider: "anthropic", id: "claude-sonnet-4" };
   let thinkingLevel = "high";
   const branchEntries: unknown[] = [
     { type: "message", message: { role: "assistant", usage: { input: 240, output: 80, cost: { total: 0.004 } } } },
   ];
 
+  // Includes lazy/deferred tools (ast_grep, ast_edit, debug) in getAllTools() that are NOT in initial getActiveTools()!
   const allToolNames = [
-    "read", "grep", "lsp", "bash", "edit", "write", "web_search",
+    "read", "grep", "glob", "find", "ls", "lsp", "bash", "edit", "write", "web_search",
+    "ast_grep", "ast_edit", "debug",
     "enhance_mandate", "enhance_handoff", "enhance_flow", "enhance_job",
   ];
   const ctx: TestContext & { sessionManager?: { getBranch(): unknown[] } } = {
     cwd,
-    ui: { notify: (message: string) => { notifications.push(message); } },
+    ui: {
+      notify: (message: string) => { notifications.push(message); },
+      setStatus: (_k: string, v?: string) => { statusHistory.push(v); },
+      setWidget: () => {},
+    },
     modelRegistry: {},
     get model() { return currentModel; },
     models: {
@@ -630,14 +760,18 @@ function createHarness(cwd: string, root: string) {
     on(name: string, handler: (event: Record<string, unknown>, ctx: TestContext) => unknown) {
       handlers.set(name, [...(handlers.get(name) ?? []), handler]);
     },
-    registerTool(tool: any) { tools.set(tool.name, tool); },
+    registerTool(tool: any) {
+      tools.set(tool.name, tool);
+      if (!activeTools.includes(tool.name)) activeTools.push(tool.name);
+    },
     registerCommand(name: string, command: any) { commands.set(name, command); },
     sendMessage(message: { content: string; excludeFromContext?: boolean }) {
       messages.push(message.content);
       rawMessages.push(message);
     },
+    getActiveTools() { return [...activeTools]; },
     getAllTools() { return allToolNames.map((name) => ({ name })); },
-    async setActiveTools(names: string[]) { activeTools = names; },
+    async setActiveTools(names: string[]) { setActiveToolsCalls += 1; activeTools = names; },
     async setModel(m: unknown) { currentModel = m; },
     setThinkingLevel(level: string) { thinkingLevel = level; },
     getThinkingLevel() { return thinkingLevel; },
@@ -667,91 +801,133 @@ function createHarness(cwd: string, root: string) {
     await command.handler(args, ctx);
   };
   return {
-    ctx, tools, commands, messages, rawMessages, notifications, runHook, execTool, runCommand,
+    ctx, handlers, tools, commands, messages, rawMessages, notifications, statusHistory,
+    runHook, execTool, runCommand,
+    setActiveToolsCalls: () => setActiveToolsCalls,
     activeTools: () => activeTools,
     currentModel: () => currentModel,
     thinkingLevel: () => thinkingLevel,
   };
 }
 
-describe("entry extension", () => {
-  test("wires role commands, leaves native /handoff untouched, awaits session-switch role sync, and restores baseline model/thinking", async () => {
+describe("entry extension (SuperAgent /coord, zero-intrusion default off, and converged 3 commands)", () => {
+  test("starts in zero-intrusion off mode, preserves lazy/deferred tools across /coord -> /coord off, blocks foreground specialist hijack, and enforces coordinator boundaries", async () => {
     const root = tempDir();
     const cwd = path.join(root, "workspace");
+    const cmdOutFile = path.join(root, "cmd.out");
     mkdirSync(cwd, { recursive: true });
     writeFile(cwd, "src/app.ts", "export const value = 1;\n");
     writeFile(cwd, "test/app.test.ts", "test('app', () => {});\n");
+    const initialToolsSnapshot = ["read", "grep", "glob", "find", "ls", "lsp", "bash", "edit", "write", "web_search"];
     const harness = createHarness(cwd, root);
+
+    // Only the 3 converged commands exist; legacy /enhance-handoff and /enhance-status are gone, and @file input hook is gone!
+    expect([...harness.commands.keys()].sort()).toEqual(["coord", "flow", "role"]);
+    expect(harness.handlers.has("input")).toBe(false);
+
+    // 1) Medium-2: Real OMP pi.registerTool appends enhance_* to initial activeTools (10 native + 4 enhance_* = 14);
+    // session_start strips ONLY the 4 enhance_* tools down to exact 10 native active tools without activating deferred tools (ast_grep/ast_edit/debug),
+    // and subsequent off turns make ZERO redundant setActiveTools calls!
+    expect(harness.activeTools()).toHaveLength(14);
+    await harness.runHook("session_start", {});
+    expect(harness.setActiveToolsCalls()).toBe(1);
+    expect(harness.activeTools()).toEqual(initialToolsSnapshot);
+    expect(harness.activeTools()).not.toContain("ast_grep");
+    const offStart = await harness.runHook("before_agent_start", { systemPrompt: ["BASE"], prompt: "hello" });
+    expect(offStart).toBeUndefined();
+    expect(harness.setActiveToolsCalls()).toBe(1);
+    expect(harness.statusHistory.at(-1)).toBeUndefined();
+    expect(harness.activeTools()).toEqual(initialToolsSnapshot);
+    expect(existsSync(path.join(cwd, ".omp-enhance", "state.sqlite"))).toBe(false);
+
+    // 2) /coord activates coordinator in natural Chinese (+ OMP_ENHANCE_CMD_OUT metadata), and repeated /coord is idempotent!
+    const prevOut = process.env.OMP_ENHANCE_CMD_OUT;
+    process.env.OMP_ENHANCE_CMD_OUT = cmdOutFile;
+    try {
+      await harness.runCommand("coord", "");
+      expect(harness.messages.at(-1)).toContain("总秘书模式已开启");
+      expect(readFileSync(cmdOutFile, "utf8")).toContain("Active role: coordinator [builtin]");
+      await harness.runCommand("coord", "");
+      expect(harness.messages.at(-1)).toContain("总秘书模式已在运行中");
+    } finally {
+      if (prevOut === undefined) delete process.env.OMP_ENHANCE_CMD_OUT;
+      else process.env.OMP_ENHANCE_CMD_OUT = prevOut;
+    }
+
+    expect(harness.statusHistory.at(-1)).toContain("enhance:coordinator");
+    expect(harness.activeTools()).toContain("read");
+    expect(harness.activeTools()).toContain("enhance_flow");
+    expect(harness.activeTools()).not.toContain("enhance_handoff");
+    expect(harness.activeTools()).not.toContain("write");
+    expect(harness.activeTools()).not.toContain("bash");
+
+    const coordWriteBlock = await harness.runHook("tool_call", { toolName: "write", input: { path: "src/app.ts" } }) as { block: boolean; reason?: string };
+    expect(coordWriteBlock.block).toBe(true);
+    expect(coordWriteBlock.reason).toContain("pure coordinator");
+    expect(await harness.runHook("tool_call", { toolName: "bash", input: { command: "ls" } })).toMatchObject({ block: true });
+    expect(await harness.runHook("tool_call", { toolName: "enhance_job", input: { action: "start", command: "sleep 1" } })).toMatchObject({ block: true });
+    expect(await harness.runHook("tool_call", { toolName: "enhance_flow", input: { action: "start", roles: ["dev", "qa"], goal: "Ship feature" } })).toBeUndefined();
 
     const mandatePayload = await harness.execTool("enhance_mandate", {
       action: "set", goal: "MANDATE_X", constraints: ["no deps"], acceptance: ["tests pass"],
     });
     const mandate = mandatePayload.mandate as Mandate;
-    expect(mandate.goal).toBe("MANDATE_X");
     const mandateId = mandate.id;
 
-    const start = await harness.runHook("before_agent_start", { systemPrompt: ["BASE"], prompt: "hello" });
-    const systemPrompt = (start as { systemPrompt: string[] }).systemPrompt;
-    expect(systemPrompt[0]).toBe("BASE");
-    expect(systemPrompt[1]).toContain("<omp-enhance-conditioning>");
-    expect(systemPrompt[1]).toContain("Active Role: general");
+    const coordPrompt = await harness.runHook("before_agent_start", { systemPrompt: ["BASE"], prompt: "plan it" });
+    const systemPrompt = (coordPrompt as { systemPrompt: string[] }).systemPrompt;
+    expect(systemPrompt[1]).toContain("Active Role: coordinator");
+    expect(systemPrompt[1]).toContain("## Available Specialists (Role × Project Context/Skills)");
+    expect(systemPrompt[1]).toContain("planner");
+    expect(systemPrompt[1]).toContain("## Multi-Project Active Workloads");
     expect(systemPrompt[1]).toContain("MANDATE_X");
 
-    // Native OMP `/handoff` (`/compact handoff`) is NEVER intercepted, with or without arguments!
-    expect(await harness.runHook("input", { text: "/handoff" })).toBeUndefined();
-    expect(await harness.runHook("input", { text: "/handoff reviewer" })).toBeUndefined();
-    expect(await harness.runHook("input", { text: "/role list" })).toBeUndefined();
+    // 3) Medium-1: Bare `/role dev` does NOT hijack foreground session (shows card + tip in headless, or opens editor in UI)!
+    await harness.runCommand("role", "dev");
+    expect(harness.messages.at(-1)).toContain("不会接管当前前台会话");
+    await harness.runCommand("coord", "status");
+    expect(harness.messages.at(-1)).toContain("总秘书运行中 (coordinator)");
+    expect(harness.messages.at(-1)).not.toContain("╭─");
 
-    // Switching to vision overrides model/thinking, and switching back to general/off restores baseline!
-    await harness.runCommand("role", "vision");
+    // Explicit `--foreground` override switches foreground role, and `/coord off` restores EXACT initial getActiveTools() without deferred tools!
+    await harness.runCommand("role", "vision --foreground");
     expect(harness.currentModel()).toMatchObject({ provider: "openrouter", id: "qwen-vl" });
     expect(harness.thinkingLevel()).toBe("low");
-    expect(harness.activeTools()).not.toContain("enhance_job");
 
-    // Session transition inside before_agent_start awaits applyActiveRole before returning!
-    const nextSessionCtx = Object.assign(Object.create(harness.ctx), {
-      sessionManager: { getSessionId: () => "sess-switched", getBranch: () => [] },
-    });
-    await harness.runHook("before_agent_start", { systemPrompt: ["BASE"] }, nextSessionCtx);
+    await harness.runCommand("coord", "off");
+    expect(harness.messages.at(-1)).toContain("已关闭总秘书模式");
     expect(harness.currentModel()).toMatchObject({ provider: "anthropic", id: "claude-sonnet-4" });
     expect(harness.thinkingLevel()).toBe("high");
-    expect(harness.activeTools()).toContain("enhance_job");
+    expect(harness.activeTools()).toEqual(initialToolsSnapshot);
+    expect(harness.activeTools()).not.toContain("ast_grep");
+    expect(harness.activeTools()).not.toContain("ast_edit");
+    expect(harness.activeTools()).not.toContain("debug");
+    expect(harness.activeTools()).not.toContain("enhance_flow");
+    expect(harness.statusHistory.at(-1)).toBeUndefined();
 
-    await harness.runCommand("role", "general");
-    expect(harness.currentModel()).toMatchObject({ provider: "anthropic", id: "claude-sonnet-4" });
-    expect(harness.thinkingLevel()).toBe("high");
-
+    // 4) /role blocks internal supervisor and renders human-readable YAML/cards without Box-in-Box borders!
+    await harness.runCommand("role", "supervisor");
+    expect(harness.messages.at(-1)).toContain("内部督导组件");
     await harness.runCommand("role", "list");
-    expect(harness.messages.at(-1)).toContain("* general [builtin]");
-    expect(harness.messages.at(-1)).toContain("qa [builtin]");
+    expect(harness.messages.at(-1)).toContain("coordinator [总控入口]");
+    expect(harness.messages.at(-1)).not.toContain("supervisor [builtin]");
+    await harness.runCommand("role", "show planner");
+    expect(harness.messages.at(-1)).toContain("# Role: planner");
+    expect(harness.messages.at(-1)).toContain("stance:");
+    await harness.runCommand("flow", "status");
+    expect(harness.messages.at(-1)).not.toContain("╭─");
 
-    // Preserves --* words inside /role create description and handles duplicate errors gracefully
+    // 5) /role create, explicit --foreground qa write-boundary enforcement, and foreground enhance_handoff usage
     await harness.runCommand("role", "create custom-auditor --project Check --strict edge cases");
     const rolePath = path.join(cwd, ".omp", "roles", "custom-auditor.yaml");
     expect(existsSync(rolePath)).toBe(true);
     expect(readFileSync(rolePath, "utf8")).toContain('description: "Check --strict edge cases"');
-    expect(harness.messages.at(-1)).toContain('Created role "custom-auditor" [project]');
 
-    await harness.runCommand("role", "create custom-auditor --project Duplicate attempt");
-    expect(harness.messages.at(-1)).toContain("already exists");
-
-    await harness.runCommand("role", "qa");
-    expect(harness.messages.at(-1)).toContain("Active role: qa [builtin]");
-    expect(harness.activeTools()).toContain("bash");
-    expect(harness.activeTools()).toContain("edit");
-    expect(harness.activeTools()).toContain("enhance_handoff");
-    expect(harness.activeTools()).not.toContain("web_search");
-
+    await harness.runCommand("role", "qa --foreground");
     expect(await harness.runHook("tool_call", { toolName: "write", input: { path: "src/app.ts" } })).toMatchObject({ block: true });
     expect(await harness.runHook("tool_call", { toolName: "write", input: { path: "test/app.test.ts" } })).toBeUndefined();
-    expect(await harness.runHook("tool_call", { toolName: "shell", input: {} })).toMatchObject({ block: true });
 
-    await harness.runCommand("role", "off");
-    expect(harness.messages.at(-1)).toContain("Role conditioning disabled");
-    expect(harness.activeTools()).toContain("web_search");
-
-    await harness.runCommand("role", "dev");
-    // F-A6 & F-A9: protocol tools omit approval: "write", schemaKit enforces additionalProperties: false
+    await harness.runCommand("role", "dev --foreground");
     expect(harness.tools.get("enhance_mandate")!.approval).toBeUndefined();
     expect(harness.tools.get("enhance_handoff")!.approval).toBeUndefined();
     expect(harness.tools.get("enhance_flow")!.approval).toBe("exec");
@@ -774,8 +950,6 @@ describe("entry extension", () => {
     });
     const handoff = handoffPayload.handoff as HandoffEnvelope;
     expect(handoff.fromRole).toBe("dev");
-    expect(handoff.toTarget).toBe("user");
-    // F-A9: foreground enhance_handoff extracts observedUsage from sessionManager.getBranch()!
     expect(handoff.observedUsage).toEqual({ inputTokens: 240, outputTokens: 80, costUsd: 0.004 });
 
     const inspect = new EnhanceStore(path.join(cwd, ".omp-enhance", "state.sqlite"));
@@ -785,18 +959,10 @@ describe("entry extension", () => {
       inspect.close();
     }
 
-    await harness.runCommand("enhance-status", "");
+    await harness.runCommand("coord", "status");
     expect(harness.rawMessages.at(-1)?.excludeFromContext).toBe(true);
-    const status = JSON.parse(harness.messages.at(-1)!) as {
-      activeRoleId: string | null;
-      roleCount: number;
-      epistemicCount: number;
-      latestHandoff: { id: string } | null;
-    };
-    expect(status.activeRoleId).toBe("dev");
-    expect(status.roleCount).toBe(9);
-    expect(status.epistemicCount).toBe(0);
-    expect(status.latestHandoff?.id).toBe(handoff.id);
+    expect(harness.messages.at(-1)).toContain("前台覆写角色 (dev)");
+    expect(harness.messages.at(-1)).toContain("8 个角色");
 
     await harness.runHook("session_shutdown", {});
   });

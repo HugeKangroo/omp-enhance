@@ -121,10 +121,11 @@ export function createOmpRoleSessionRunner(
 ): RoleSessionRunner {
   const kit = schemaKit(pi);
   const handoffSchema = kit.obj({
-    verdict: kit.en(["ready", "rejected", "blocked"]), summary: kit.str(), toTarget: kit.str(), delegateNow: kit.bool(),
+    verdict: kit.en(["ready", "needs_input", "rejected", "blocked"]),
+    summary: kit.str(), toTarget: kit.str(), delegateNow: kit.bool(),
     artifactPaths: kit.arr(kit.str()),
     verifiedFacts: kit.arr(kit.obj({ claim: kit.str(), evidenceRef: kit.str() }, ["claim", "evidenceRef"])),
-    openRisks: kit.arr(kit.str()), feedbackForUpstream: kit.str(),
+    openRisks: kit.arr(kit.str()), questionsForUser: kit.arr(kit.str()), feedbackForUpstream: kit.str(),
   }, ["verdict", "summary"]);
 
   return {
@@ -170,6 +171,9 @@ export function createOmpRoleSessionRunner(
               consultRole = roles?.get(consultId);
             }
             const effectiveTarget = consultRole ? consultRole.id : (params.verdict === "rejected" ? (stepCtx.repairTargetRoleId ?? "user") : stepCtx.toTarget);
+            const questionsForUser = Array.isArray(params.questionsForUser)
+              ? params.questionsForUser.filter((q: unknown): q is string => typeof q === "string" && q.trim().length > 0)
+              : undefined;
             const envelope = createAndVerifyHandoff({
               store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
               flowId: stepCtx.flowId, parentHandoffId: stepCtx.upstreamHandoff?.id ?? null,
@@ -177,7 +181,7 @@ export function createOmpRoleSessionRunner(
               artifactPaths: params.artifactPaths, baselineSnapshot: baselineSnap,
               baselineConfigSnapshot: baselineConfigSnap, enforceConfigIntegrity: true,
               observedCalls: collectObservedCalls(), verifiedFacts: params.verifiedFacts,
-              openRisks: params.openRisks, feedbackForUpstream: params.feedbackForUpstream,
+              openRisks: params.openRisks, questionsForUser, feedbackForUpstream: params.feedbackForUpstream,
               observedUsage: extractSessionUsage(childSession),
             });
             if (consultRole) {
@@ -198,7 +202,6 @@ export function createOmpRoleSessionRunner(
         },
       };
 
-      const setWork = (msg?: string): void => { try { hostCtx?.ui?.setWorkingMessage?.(msg); } catch {} };
       const childGuardExt = (childPi: any): void => {
         childPi.on("tool_call", (ev: any) => {
           const toolName = ev.toolName ?? ev.name ?? "", input = ev.input ?? ev.args;
@@ -208,9 +211,7 @@ export function createOmpRoleSessionRunner(
         childPi.on("tool_execution_start", (ev: any) => {
           const toolName = ev.toolName ?? ev.name ?? "", input = ev.args ?? ev.input;
           childTracker.recordToolExecutionStart(toolName, input);
-          const summary = summarizeToolCall(toolName, input);
-          setWork(`stage:${stepCtx.role.id} → ${summary}`);
-          stepCtx.observer?.onToolStart?.(stageId, summary);
+          stepCtx.observer?.onToolStart?.(stageId, summarizeToolCall(toolName, input));
         });
         childPi.on("tool_execution_end", (ev: any) => {
           const call = childTracker.recordToolExecutionEnd(stepCtx.cwd, {
@@ -242,8 +243,8 @@ export function createOmpRoleSessionRunner(
         ...(model ? { model } : {}), ...(thinkingLevel ? { thinkingLevel } : {}),
         settings: createChildSettingsProxy(pi.pi.settings),
         hasUI: false, autoApprove: true, enableMemory: false, bindProcessState: false, disableExtensionDiscovery: true,
-        noContextFiles: true, enableMCP: false, enableLsp: false, preloadedCustomToolPaths: [],
-        skills: [], rules: [], promptTemplates: [], slashCommands: [],
+        noContextFiles: false, enableMCP: false, enableLsp: allowedTools.includes("lsp"),
+        preloadedCustomToolPaths: [], promptTemplates: [], slashCommands: [],
         customSystemPrompt: sysPrompt, customTools: [childHandoffTool, ...extraStageTools],
         preloadedPreparedExtensions: [
           { path: "<enhance-guard>", resolvedPath: "<enhance-guard>", factory: childGuardExt, error: null },
@@ -255,8 +256,8 @@ export function createOmpRoleSessionRunner(
       const onExternalAbort = () => { cancelledByUser = true; void created.session.abort?.(); };
       stepCtx.signal?.addEventListener("abort", onExternalAbort, { once: true });
       stepCtx.observer?.bindControls?.({
-        steer: async (msg: string) => { setWork(`stage:${stepCtx.role.id} ↺ steered by user`); await created.session.steer?.(`[User interjection in Flow room]: ${msg}`); },
-        abort: async () => { cancelledByUser = true; setWork(`stage:${stepCtx.role.id} ✕ cancelled by user`); await created.session.abort?.(); },
+        steer: async (msg: string) => { await created.session.steer?.(`[User interjection in Flow room]: ${msg}`); },
+        abort: async () => { cancelledByUser = true; await created.session.abort?.(); },
       }, stageId);
 
       const finish = (abortedBySupervisor: SupervisorDecision | null = null): RoleTurnOutcome => {
@@ -286,7 +287,6 @@ export function createOmpRoleSessionRunner(
       };
 
       try {
-        setWork(`stage:${stepCtx.role.id} (${stepCtx.role.name}) running...`);
         const supervisor = stepCtx.supervisor;
         if (!supervisor) return await runTurn({ aborted: false, decisions: [] });
         const supervised = await runWithSessionSupervisor({
@@ -304,13 +304,11 @@ export function createOmpRoleSessionRunner(
           },
           onSteer: async (message) => {
             const framed = message.startsWith("[Supervisor]:") ? message : `[Supervisor]: ${message}`;
-            setWork(`stage:${stepCtx.role.id} ↺ steered by supervisor`);
             stepCtx.observer?.onSupervisorNote?.(stageId, `↺ steer: ${message}`);
             await created.session.steer?.(framed);
           },
           onAbort: async () => {
             supervisorAborted = true;
-            setWork(`stage:${stepCtx.role.id} ✕ aborted by supervisor`);
             stepCtx.observer?.onSupervisorNote?.(stageId, "✕ aborted by supervisor");
             await created.session.abort?.();
           },
@@ -324,7 +322,6 @@ export function createOmpRoleSessionRunner(
         const stageAborted = (supervisorAborted && !submittedEnvelope) || cancelledByUser ||
           Boolean(stepCtx.signal?.aborted) || Boolean(stepCtx.observer?.isCancelled?.());
         if (stageAborted && stageStartedJobIds.size > 0) cancelJobsByIds(stepCtx.store, stageStartedJobIds);
-        setWork(undefined);
         await created.session.dispose();
       }
     },

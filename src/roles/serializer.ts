@@ -19,6 +19,7 @@ const TOP_KEYS: Record<string, true> = {
   description: true,
   model: true,
   thinking: true,
+  internal: true,
   stance: true,
   method: true,
   permissions: true,
@@ -29,6 +30,7 @@ const PERMISSION_KEYS: Record<string, true> = {
   tools: true,
   writable: true,
   protected: true,
+  dispatch: true,
 };
 
 const EXIT_KEYS: Record<string, true> = {
@@ -103,12 +105,14 @@ export function computeRoleContentSha256(
     description: role.description,
     model: role.model ?? null,
     thinking: role.thinking ?? null,
+    internal: role.internal ?? false,
     stance: role.stance,
     method: role.method,
     permissions: {
       tools: role.permissions.tools,
       writable: role.permissions.writable,
       protected: role.permissions.protected,
+      dispatch: role.permissions.dispatch ?? false,
     },
     exit: role.exit,
   };
@@ -163,6 +167,14 @@ export function parseRoleYaml(
     thinking = rawThinking as RoleThinkingLevel;
   }
 
+  let internal: boolean | undefined;
+  if (roleYaml.internal !== undefined) {
+    if (typeof roleYaml.internal !== "boolean") {
+      throw new Error(`internal must be a boolean in ${filePath}`);
+    }
+    internal = roleYaml.internal;
+  }
+
   const stance = stringValue(roleYaml.stance, "stance", filePath).replace(/\r\n/g, "\n");
   const method = stringList(roleYaml.method, "method", filePath, false);
 
@@ -177,6 +189,9 @@ export function parseRoleYaml(
     }
     const permissionYaml = roleYaml.permissions as Record<string, unknown>;
     assertKeys(permissionYaml, PERMISSION_KEYS, "permissions", filePath);
+    if (permissionYaml.dispatch !== undefined && typeof permissionYaml.dispatch !== "boolean") {
+      throw new Error(`permissions.dispatch must be a boolean in ${filePath}`);
+    }
     permissions = {
       ...(permissionYaml.tools === undefined
         ? {}
@@ -187,6 +202,7 @@ export function parseRoleYaml(
       ...(permissionYaml.protected === undefined
         ? {}
         : { protected: stringList(permissionYaml.protected, "permissions.protected", filePath) }),
+      ...(permissionYaml.dispatch === undefined ? {} : { dispatch: permissionYaml.dispatch }),
     };
   }
 
@@ -219,6 +235,7 @@ export function parseRoleYaml(
     description,
     ...(model !== undefined ? { model } : {}),
     ...(thinking !== undefined ? { thinking } : {}),
+    ...(internal !== undefined ? { internal } : {}),
     stance,
     method,
     permissions,
@@ -252,14 +269,15 @@ export function serializeRoleYaml(
     `description: ${JSON.stringify(role.description)}`,
     ...(role.model !== undefined ? [`model: ${JSON.stringify(role.model)}`] : []),
     ...(role.thinking !== undefined ? [`thinking: ${formatYamlScalar(role.thinking)}`] : []),
+    ...(role.internal !== undefined ? [`internal: ${role.internal}`] : []),
     stanceHeader,
     ...stanceLines,
     "method:",
     ...role.method.map((step) => `  - ${JSON.stringify(step)}`),
   ];
 
-  const { tools, writable, protected: prot } = role.permissions;
-  if (tools !== undefined || writable !== undefined || prot !== undefined) {
+  const { tools, writable, protected: prot, dispatch } = role.permissions;
+  if (tools !== undefined || writable !== undefined || prot !== undefined || dispatch !== undefined) {
     lines.push("permissions:");
     if (tools !== undefined) {
       lines.push(`  tools: [${tools.map((item) => JSON.stringify(item)).join(", ")}]`);
@@ -269,6 +287,9 @@ export function serializeRoleYaml(
     }
     if (prot !== undefined) {
       lines.push(`  protected: [${prot.map((item) => JSON.stringify(item)).join(", ")}]`);
+    }
+    if (dispatch !== undefined) {
+      lines.push(`  dispatch: ${dispatch}`);
     }
   }
 

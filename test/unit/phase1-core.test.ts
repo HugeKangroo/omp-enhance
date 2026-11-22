@@ -11,8 +11,9 @@ import {
   resolveSafeTargetRealpath, snapshotConfigIntegrity, snapshotWorkspace, splitBraceSafeGlobs,
 } from "../../src/core/fs.ts";
 import {
-  COMPANION_TOOL_NAMES, DEFAULT_READONLY_TOOLS, checkToolCallAllowed, extractWriteTargetPaths,
-  isValidExecutionEvidence, resolveRoleActiveTools, TurnTracker,
+  canRoleDispatch, COMPANION_TOOL_NAMES, DEFAULT_READONLY_TOOLS, checkToolCallAllowed,
+  extractWriteTargetPaths, isInternalRole, isValidExecutionEvidence,
+  resolveEffectiveActiveTools, resolveRoleActiveTools, TurnTracker,
 } from "../../src/core/policy.ts";
 import { EnhanceStore, captureProcessStartToken, isProcessAliveWithToken } from "../../src/core/store.ts";
 import type {
@@ -21,7 +22,7 @@ import type {
 import { BoundaryViolationError, createAndVerifyHandoff } from "../../src/flow/handoff.ts";
 import { formatRuntimeVisionHint, renderConditioningBlock } from "../../src/roles/conditioning.ts";
 import {
-  cloneRoleSpec, discoverRoles, discoverRolesWithDiagnostics, hasBuiltinRole,
+  cloneRoleSpec, discoverRoles, discoverRolesWithDiagnostics, hasBuiltinRole, listUserVisibleRoles,
   parseRoleYaml, saveRoleSpec, scaffoldRoleFile, serializeRoleYaml,
 } from "../../src/roles/loader.ts";
 
@@ -257,11 +258,14 @@ describe("EnhanceStore", () => {
       expect(store.listJobs()).toEqual([]);
       expect(store.getLatestHandoff()).toBeNull();
       expect(Bun.file(storePath).size).toBe(0);
+      expect(existsSync(path.join(path.dirname(storePath), ".gitignore"))).toBe(false);
 
       const mandate = store.upsertMandate({ goal: "Persistence" });
       expect(Bun.file(storePath).size).toBeGreaterThan(0);
+      expect(readFileSync(path.join(path.dirname(storePath), ".gitignore"), "utf8")).toBe("*\n");
       store.recordArtifacts(mandate.id, [
         { path: "src/app.ts", sha256: "aaa", byteSize: 12, role: "changed" },
+        { path: "src/readonly.ts", sha256: "ddd", byteSize: 20, role: "inspected" },
         { path: "test/app.test.ts", sha256: "bbb", byteSize: 34, role: "test" },
       ]);
       // Updating src/app.ts to a new sha256 deduplicates listArtifacts to latest per path
@@ -270,6 +274,7 @@ describe("EnhanceStore", () => {
       ]);
       expect(store.listArtifacts(mandate.id)).toEqual([
         { path: "src/app.ts", sha256: "ccc", byteSize: 16, role: "changed" },
+        { path: "src/readonly.ts", sha256: "ddd", byteSize: 20, role: "inspected" },
         { path: "test/app.test.ts", sha256: "bbb", byteSize: 34, role: "test" },
       ]);
 
@@ -281,13 +286,22 @@ describe("EnhanceStore", () => {
         createdAt: "2026-01-01T00:00:00.000Z",
       };
       const second: HandoffEnvelope = {
-        ...first, id: "handoff-2", parentHandoffId: first.id, summary: "Second delivery",
-        deletedFiles: ["src/obsolete.ts"], createdAt: "2026-01-02T00:00:00.000Z",
+        ...first, id: "handoff-2", parentHandoffId: first.id, verdict: "needs_input", summary: "Second delivery",
+        deletedFiles: ["src/obsolete.ts"],
+        questionsForUser: ["Prefer lower false negatives or lower false positives?", "Max latency budget (ms)?"],
+        createdAt: "2026-01-02T00:00:00.000Z",
       };
       store.saveHandoff(first);
       store.saveHandoff(second);
       expect(store.getHandoff(first.id)).toEqual(first);
+      expect(store.getHandoff(second.id)).toEqual(second);
       expect(store.getLatestHandoff()).toEqual(second);
+      // Re-open fresh EnhanceStore instance to verify SQLite round-trip of verdict="needs_input" + questionsForUser
+      store.close();
+      const reopened = new EnhanceStore(storePath);
+      expect(reopened.getHandoff(second.id)).toEqual(second);
+      reopened.close();
+      store.reopen();
       expect(store.getLatestHandoff(mandate.id)?.id).toBe(second.id);
       expect(store.getLatestHandoff("missing")).toBeNull();
       expect(store.listHandoffs(mandate.id).map((handoff) => handoff.id)).toEqual([second.id, first.id]);
@@ -346,11 +360,14 @@ describe("EnhanceStore", () => {
 });
 
 describe("roles loader, serializer, and conditioning", () => {
-  test("loads all eight built-in roles including general, algo, and vision (@vision)", () => {
+  test("loads First-Principles built-in role roster (coordinator, planner, dev, algo, qa, reviewer, vision + internal supervisor)", () => {
     const isolated = tempDir();
     const roles = discoverRoles({ cwd: isolated, globalRolesDir: path.join(isolated, "missing-global") });
     expect([...roles.keys()].sort()).toEqual([
-      "algo", "dev", "general", "ml-engineer", "qa", "reviewer", "supervisor", "vision",
+      "algo", "coordinator", "dev", "planner", "qa", "reviewer", "supervisor", "vision",
+    ]);
+    expect(listUserVisibleRoles(roles).map((r) => r.id)).toEqual([
+      "coordinator", "algo", "dev", "planner", "qa", "reviewer", "vision",
     ]);
     for (const role of roles.values()) {
       expect(role.source).toBe("builtin");
@@ -359,8 +376,30 @@ describe("roles loader, serializer, and conditioning", () => {
       expect(role.contentSha256).toMatch(/^[a-f0-9]{64}$/);
     }
     expect(hasBuiltinRole("qa")).toBe(true);
-    expect(hasBuiltinRole("QA")).toBe(false);
+    expect(hasBuiltinRole("general")).toBe(false);
+    expect(hasBuiltinRole("ml-engineer")).toBe(false);
+
+    const coordinator = roles.get("coordinator")!;
+    expect(canRoleDispatch(coordinator)).toBe(true);
+    expect(coordinator.permissions.dispatch).toBe(true);
+    expect(coordinator.permissions.tools).toEqual(["read", "grep", "glob", "find", "ls", "lsp"]);
+    expect(coordinator.permissions.writable).toEqual([]);
+    expect(coordinator.permissions.protected).toEqual(["**"]);
+    expect(coordinator.exit.requireToolEvidence).toBe(false);
+
+    const planner = roles.get("planner")!;
+    expect(planner.permissions.tools).toEqual(["read", "grep", "glob", "find", "ls", "lsp"]);
+    expect(planner.permissions.writable).toEqual([]);
+    expect(planner.permissions.protected).toEqual(["**"]);
+    expect(planner.exit.requireToolEvidence).toBe(true);
+
+    const supervisor = roles.get("supervisor")!;
+    expect(supervisor.internal).toBe(true);
+    expect(isInternalRole(supervisor)).toBe(true);
+
     expect(roles.get("algo")?.exit.requireToolEvidence).toBe(true);
+    expect(roles.get("algo")?.stance).toContain("needs_input");
+    expect(roles.get("algo")?.stance).toContain("questionsForUser");
     expect(roles.get("vision")?.model).toBe("@vision");
     expect(roles.get("vision")?.permissions.tools).toEqual(["read", "glob", "find"]);
     expect(roles.get("vision")?.permissions.writable).toEqual([]);
@@ -454,6 +493,20 @@ describe("roles loader, serializer, and conditioning", () => {
       .toThrow(/Unknown exit field "require_tool_evidnce"/);
     expect(() => parseRoleYaml(`${base}exit:\n  require_tool_evidence: null\n`, "project", filePath))
       .toThrow(/must be a boolean/);
+    expect(() => parseRoleYaml(`${base}internal: "yes"\n`, "project", filePath))
+      .toThrow(/internal must be a boolean/);
+    expect(() => parseRoleYaml(`${base}permissions:\n  dispatch: "yes"\n`, "project", filePath))
+      .toThrow(/permissions\.dispatch must be a boolean/);
+    const roundTripDispatch = parseRoleYaml(
+      serializeRoleYaml({
+        id: "lead", name: "Lead", description: "Coord", internal: false, stance: "s", method: ["m"],
+        permissions: { tools: ["read"], writable: [], protected: ["**"], dispatch: true },
+        exit: { requireToolEvidence: false, criteria: [] },
+      }),
+      "global", path.join(root, "lead.yaml"),
+    );
+    expect(roundTripDispatch.permissions.dispatch).toBe(true);
+    expect(roundTripDispatch.internal).toBe(false);
     expect(() => parseRoleYaml(base, "project", path.join(root, "other.yaml")))
       .toThrow(/does not match filename/);
     expect(() => parseRoleYaml("id: bad id\nstance: x\nmethod:\n  - y\n", "project", filePath))
@@ -529,7 +582,9 @@ describe("roles loader, serializer, and conditioning", () => {
       artifacts: [{ path: "src/auth.ts", sha256: "abc123", byteSize: 42, role: "changed" }],
       deletedFiles: ["src/legacy-auth.ts"],
       verifiedFacts: [{ claim: "Unit suite passed", evidenceRef: "call-bash-1" }],
-      openRisks: ["No rate-limit test"], feedbackForUpstream: null,
+      openRisks: ["No rate-limit test"],
+      questionsForUser: ["Should refresh tokens rotate on every use?"],
+      feedbackForUpstream: null,
       observedUsage: null, createdAt: "2026-01-02T00:00:00.000Z",
     };
 
@@ -547,12 +602,33 @@ describe("roles loader, serializer, and conditioning", () => {
       "Active Role: qa", "独立测试与证伪工程师", "Harden authentication", "No new dependencies",
       "All tests pass", "Token expiry is 15 minutes", "call-1", "fromRole: dev", "verdict: ready",
       "Implemented auth guard", "src/auth.ts", "src/legacy-auth.ts", "Unit suite passed (evidence: call-bash-1)",
-      "No rate-limit test", "Verify expired refresh tokens",
+      "No rate-limit test", "questionsForUser:", "Should refresh tokens rotate on every use?",
+      "Verify expired refresh tokens",
     ]) {
       expect(block).toContain(expected);
     }
     expect(block).not.toContain("FALSE_CLAIM");
     expect(block).not.toContain("Dev-only note");
+
+    // Coordinator renders Available Specialists (excluding internal supervisor & self) + Multi-Project Active Workloads
+    const coordBlock = renderConditioningBlock({
+      role: roles.get("coordinator")!,
+      availableRoles: [...roles.values()],
+      activeWorkloads: ["flow-api [waiting_input] cwd=/tmp/proj-a (algo)"],
+    });
+    expect(coordBlock).toContain("## Available Specialists (Role × Project Context/Skills)");
+    for (const specId of ["- algo (", "- dev (", "- planner (", "- qa (", "- reviewer (", "- vision ("]) {
+      expect(coordBlock).toContain(specId);
+    }
+    expect(coordBlock).not.toContain("- supervisor (");
+    expect(coordBlock).not.toContain("- coordinator (");
+    expect(coordBlock).toContain("Host Advisor Note:");
+    expect(coordBlock).toContain("- dev → qa → reviewer:");
+    expect(coordBlock).toContain("NEVER expose JSON brackets");
+    expect(roles.get("coordinator")!.stance).toContain("Host Advisor Note:");
+    expect(roles.get("coordinator")!.stance).toContain("dev → qa");
+    expect(coordBlock).toContain("## Multi-Project Active Workloads");
+    expect(coordBlock).toContain("flow-api [waiting_input] cwd=/tmp/proj-a (algo)");
 
     // Vision role on text-only fallback must NOT be told to delegate to itself
     expect(formatRuntimeVisionHint(false, "vision")).toContain("do NOT self-delegate");
@@ -571,18 +647,53 @@ describe("policy & TurnTracker", () => {
 
     const roles = discoverRoles({ cwd, globalRolesDir: path.join(root, "missing") });
     const qa = roles.get("qa")!;
-    const general = roles.get("general")!;
+    const dev = roles.get("dev")!;
+    const coordinator = roles.get("coordinator")!;
     const reviewer = roles.get("reviewer")!;
     const tracker = new TurnTracker();
     tracker.resetTurn(cwd);
 
-    expect(tracker.checkToolCallAllowed(cwd, general, {
+    // Off mode (role === null) allows native OMP tools freely without forced tool list
+    expect(resolveEffectiveActiveTools(null, ["read", "write", "bash"])).toBeNull();
+    expect(tracker.checkToolCallAllowed(cwd, null, {
+      toolName: "edit", input: { path: "../../../.omp/agent/managed-skills/colab-dev/SKILL.md" },
+    })).toEqual({ block: false });
+    expect(tracker.checkToolCallAllowed(cwd, dev, {
       toolName: "edit", input: { path: "../../../.omp/agent/managed-skills/colab-dev/SKILL.md" },
     })).toEqual({ block: false });
 
+    // Coordinator (dispatch: true) blocks direct writes/shell, enhance_handoff, and enhance_job(start), while allowing enhance_flow & job monitoring!
+    for (const blocked of ["write", "edit", "apply_patch", "ast_edit", "bash", "eval", "manage_skill", "learn", "memory_edit", "retain"]) {
+      const res = tracker.checkToolCallAllowed(cwd, coordinator, { toolName: blocked, input: { path: "src/app.ts", command: "ls" } }, roles);
+      expect(res.block).toBe(true);
+      expect(res.reason).toContain("is a pure coordinator and never mutates files or runs shell commands directly");
+    }
+    expect(tracker.checkToolCallAllowed(cwd, coordinator, { toolName: "read", input: { path: "src/app.ts" } }, roles))
+      .toEqual({ block: false });
+    expect(tracker.checkToolCallAllowed(cwd, coordinator, { toolName: "enhance_flow", input: { action: "start", roles: ["dev", "qa"] } }, roles))
+      .toEqual({ block: false });
+    expect(tracker.checkToolCallAllowed(cwd, coordinator, { toolName: "enhance_handoff", input: { verdict: "ready", summary: "nope" } }, roles))
+      .toMatchObject({ block: true, reason: expect.stringContaining("never submits stage handoffs") });
+    expect(tracker.checkToolCallAllowed(cwd, coordinator, { toolName: "enhance_job", input: { action: "start", command: "bun test" } }, roles)).toEqual({
+      block: true,
+      reason: 'Role "coordinator" never spawns shell commands directly — dispatch specialist ["algo"] or ["dev"] via enhance_flow to run background jobs.',
+    });
+    expect(tracker.checkToolCallAllowed(cwd, coordinator, { toolName: "enhance_job", input: { action: "watch", command: "bun test" } }, roles))
+      .toMatchObject({ block: true });
+    for (const allowedJobAction of ["list", "reconcile", "tail", "watch", "cancel"] as const) {
+      expect(tracker.checkToolCallAllowed(cwd, coordinator, { toolName: "enhance_job", input: { action: allowedJobAction, jobId: "job-1" } }, roles))
+        .toEqual({ block: false });
+    }
+    expect(tracker.checkToolCallAllowed(cwd, coordinator, { toolName: "enhance_mandate", input: { action: "set", goal: "Ship" } }, roles))
+      .toEqual({ block: false });
+    expect(resolveRoleActiveTools(coordinator, ["read", "grep", "ls", "write", "bash"], "foreground")).toEqual([
+      "read", "grep", "ls", "enhance_mandate", "enhance_flow", "enhance_job",
+    ]);
+
     for (const toolName of ["edit", "write"] as const) {
-      expect(tracker.checkToolCallAllowed(cwd, qa, { toolName, input: { path: "src/app.ts" } }))
-        .toMatchObject({ block: true });
+      const blocked = tracker.checkToolCallAllowed(cwd, qa, { toolName, input: { path: "src/app.ts" } });
+      expect(blocked.block).toBe(true);
+      expect(blocked.reason).toContain("/coord off");
     }
     // Fail-closed when WRITE_TOOLS receives unrecognized/empty target keys
     expect(tracker.checkToolCallAllowed(cwd, qa, { toolName: "write", input: { unknownKey: "test/a.test.ts" } }))

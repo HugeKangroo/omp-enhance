@@ -12,7 +12,7 @@ import {
 } from "../../src/core/settings.ts";
 import { ROLE_THINKING_LEVELS, type RoleSpec } from "../../src/core/types.ts";
 import {
-  discoverRoles, parseRoleYaml, resetRoleOverride, saveRoleSpec, serializeRoleYaml,
+  discoverRoles, listUserVisibleRoles, parseRoleYaml, resetRoleOverride, saveRoleSpec, serializeRoleYaml,
 } from "../../src/roles/loader.ts";
 import { parseOverlayKey } from "../../src/ui/kit.ts";
 import {
@@ -45,14 +45,16 @@ describe("package.json omp.settings parity & native OMP settings loader", () => 
     const pkg = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
     const schema = pkg?.omp?.settings as Record<string, any>;
     expect(Object.keys(schema).sort()).toEqual(Object.keys(DEFAULT_ENHANCE_SETTINGS).sort());
-    expect(schema.defaultRole.default).toBe(DEFAULT_ENHANCE_SETTINGS.defaultRole);
+    expect(schema.defaultRole.default).toBe("off");
+    expect(DEFAULT_ENHANCE_SETTINGS.defaultRole).toBeNull();
     expect(schema.showStatusBar.default).toBe(DEFAULT_ENHANCE_SETTINGS.showStatusBar);
     expect(schema.supervisorEnabled.default).toBe(DEFAULT_ENHANCE_SETTINGS.supervisorEnabled);
     expect(schema.supervisorModel.default).toBe(DEFAULT_ENHANCE_SETTINGS.supervisorModel);
     expect(schema.supervisorThinking.default).toBe(DEFAULT_ENHANCE_SETTINGS.supervisorThinking);
     expect(schema.supervisorInitialDelaySec.default).toBe(DEFAULT_ENHANCE_SETTINGS.supervisorInitialDelaySec);
     expect(schema.flowMaxRepairRounds.default).toBe(DEFAULT_ENHANCE_SETTINGS.flowMaxRepairRounds);
-    expect(schema.flowRoutingMode.default).toBe(DEFAULT_ENHANCE_SETTINGS.flowRoutingMode);
+    expect(schema.flowRoutingMode.default).toBe("auto");
+    expect(DEFAULT_ENHANCE_SETTINGS.flowRoutingMode).toBe("auto");
     expect([...schema.supervisorThinking.values].sort()).toEqual([...ROLE_THINKING_LEVELS].sort());
     expect(schema.supervisorThinking.values).toContain("xhigh");
     expect(schema.supervisorThinking.values).toContain("max");
@@ -92,7 +94,7 @@ describe("package.json omp.settings parity & native OMP settings loader", () => 
       supervisorThinking: "inherit",
       supervisorInitialDelaySec: 5,
       flowMaxRepairRounds: 10,
-      flowRoutingMode: "ask",
+      flowRoutingMode: "auto",
     });
 
     // Parent monorepo .omp/plugin-overrides.json applies to nested packages/sub cwd
@@ -104,7 +106,7 @@ describe("package.json omp.settings parity & native OMP settings loader", () => 
           supervisorThinking: "xhigh",
           supervisorInitialDelaySec: 9999,
           flowMaxRepairRounds: -4,
-          flowRoutingMode: "auto",
+          flowRoutingMode: "ask",
         },
       },
     }));
@@ -116,7 +118,7 @@ describe("package.json omp.settings parity & native OMP settings loader", () => 
       supervisorThinking: "xhigh",
       supervisorInitialDelaySec: 600,
       flowMaxRepairRounds: 0,
-      flowRoutingMode: "auto",
+      flowRoutingMode: "ask",
     });
 
     writeText(path.join(cwd, ".omp", "enhance.yaml"), [
@@ -136,7 +138,7 @@ describe("package.json omp.settings parity & native OMP settings loader", () => 
       cwd, pluginLockPath: lockPath, isProjectTrusted: false, onWarning: (w) => warnings.push(w),
     });
     expect(untrusted.defaultRole).toBe("qa");
-    expect(untrusted.flowRoutingMode).toBe("ask");
+    expect(untrusted.flowRoutingMode).toBe("auto");
     expect(untrusted.supervisorEnabled).toBe(true);
     expect(warnings.some((w) => w.includes("not trusted"))).toBe(true);
 
@@ -273,10 +275,10 @@ describe("model & @advisor inheritance resolution", () => {
   });
 });
 
-describe("Role Studio strict UI, glob parsing, supervisor CoW/inherit, and tool union", () => {
+describe("Role Studio strict UI, glob parsing, coordinator/specialist grouping, internal supervisor hiding, and tool union", () => {
   function createStudioHarness(cwd: string, globalDir: string, hostToolNames: string[]) {
     let roles = discoverRoles({ cwd, globalRolesDir: globalDir, builtinRolesDir });
-    let activeRoleId: string | null = "general";
+    let activeRoleId: string | null = null;
     const activeToolHistory: string[][] = [];
     const modelHistory: unknown[] = [];
     const notifications: Array<{ text: string; level?: string }> = [];
@@ -337,18 +339,19 @@ describe("Role Studio strict UI, glob parsing, supervisor CoW/inherit, and tool 
 
     // Strict selectQueue: EVERY non-undefined choice MUST exist verbatim in `_options`!
     const selectQueue: Array<string | undefined> = [
-      "+ Create new role...",
+      "+ 新建自定义专员...",
       "project (.omp/roles)",
       "readonly (纯只读验证，受保护路径 **)",
       "@slow",
-      `Allowed tools: [${[...DEFAULT_READONLY_TOOLS].join(", ")}]`,
+      "高级路径与工具设置",
+      `可用工具列表: [${[...DEFAULT_READONLY_TOOLS].join(", ")}]`,
       "bash", // toggle bash ON while preserving unloaded DEFAULT_READONLY_TOOLS (glob, find, lsp, task, wait)!
-      "✓ Save tool selection",
-      "Protected globs: [**]",
-      "Writable globs: [readonly]",
-      "Edit full role YAML...",
-      'Activate "sec-audit" in current session',
-      undefined, // exit role editor
+      "✓ 保存工具勾选",
+      "受保护路径 Globs: [**]",
+      "可写路径 Globs: [readonly]",
+      "返回", // back from 高级路径与工具设置
+      "编辑完整 YAML...",
+      "返回", // exit role editor (note: non-dispatch specialist omits "在当前会话启用")
       undefined, // exit studio home
     ];
     const inputQueue: Array<string | undefined> = [
@@ -358,6 +361,7 @@ describe("Role Studio strict UI, glob parsing, supervisor CoW/inherit, and tool 
       "src/**/*.{ts,tsx}, test/**", // Brace-safe writable globs!
     ];
     let editorAttempt = 0;
+    const specialistEditorMenus: string[][] = [];
 
     const ctx = {
       cwd,
@@ -369,6 +373,9 @@ describe("Role Studio strict UI, glob parsing, supervisor CoW/inherit, and tool 
       },
       ui: {
         async select(title: string, options: string[]) {
+          // Internal supervisor must NEVER appear in Role Studio picker options
+          expect(options.some((opt) => opt.includes("supervisor"))).toBe(false);
+          if (title.includes("[后台专员]")) specialistEditorMenus.push(options);
           const next = selectQueue.shift();
           if (next !== undefined) {
             expect(options).toContain(next);
@@ -388,6 +395,19 @@ describe("Role Studio strict UI, glob parsing, supervisor CoW/inherit, and tool 
 
     await openRoleStudioHome(h.makeDeps(ctx));
 
+    // Non-dispatch specialist editor omits foreground activation item and uses natural Chinese labels
+    expect(specialistEditorMenus.length).toBeGreaterThan(0);
+    for (const menu of specialistEditorMenus) {
+      expect(menu.some((opt) => opt.includes("在当前会话启用") || opt.includes("Activate"))).toBe(false);
+      expect(menu.some((opt) => opt.startsWith("模型绑定:"))).toBe(true);
+      expect(menu.some((opt) => opt.startsWith("推理档位:"))).toBe(true);
+      expect(menu.some((opt) => opt.startsWith("权限边界预设:"))).toBe(true);
+      expect(menu).toContain("高级路径与工具设置");
+      expect(menu).toContain("编辑完整 YAML...");
+      expect(menu).toContain("拷贝为新角色...");
+      expect(menu).toContain("返回");
+    }
+
     const createdPath = path.join(cwd, ".omp", "roles", "sec-audit.yaml");
     expect(existsSync(createdPath)).toBe(true);
     const parsedCreated = parseRoleYaml(readFileSync(createdPath, "utf8"), "project", createdPath);
@@ -398,45 +418,26 @@ describe("Role Studio strict UI, glob parsing, supervisor CoW/inherit, and tool 
     expect(parsedCreated.permissions.protected).toEqual(["**"]);
     expect(parsedCreated.permissions.writable).toEqual(["src/**/*.{ts,tsx}", "test/**"]);
     expect(h.notifications.some((n) => n.level === "warning" && n.text.includes("unknown_field"))).toBe(true);
+
+    // Internal supervisor is hidden from Role Studio editor (managed via /settings -> Plugins -> omp-enhance)
+    await openRoleEditor("supervisor", h.makeDeps(ctx));
+    expect(existsSync(path.join(globalDir, "supervisor.yaml"))).toBe(false);
+    expect(h.notifications.some((n) => n.text.includes("/settings"))).toBe(true);
+
+    // Coordinator editor DOES expose foreground activation and CoW preserves permissions.dispatch: true
+    selectQueue.push('在当前会话启用 "coordinator"', "模型绑定: inherit", "@slow", "返回");
+    await openRoleEditor("coordinator", h.makeDeps(ctx));
+    expect(h.getActiveRoleId()).toBe("coordinator");
     expect(h.modelHistory).toEqual(["resolved-slow-model"]);
-
-    // Supervisor Copy-on-Write:
-    // 1) Toggling `Require tool evidence` on builtin supervisor MUST NOT bake `@advisor`/`off` into override
-    selectQueue.push(
-      "Require tool evidence: false",
-      undefined,
-    );
-    await openRoleEditor("supervisor", h.makeDeps(ctx));
-    const supOverridePath = path.join(globalDir, "supervisor.yaml");
-    const supAfterToggle = parseRoleYaml(readFileSync(supOverridePath, "utf8"), "global", supOverridePath);
-    expect(supAfterToggle.exit.requireToolEvidence).toBe(true);
-    expect(supAfterToggle.model).toBeUndefined();
-    expect(supAfterToggle.thinking).toBeUndefined();
-    expect(resolveRoleRuntimeConfig(
-      supAfterToggle, { getThinkingLevel: () => "high" }, ctx,
-      { ...DEFAULT_ENHANCE_SETTINGS, supervisorModel: "@slow", supervisorThinking: "low" },
-    )).toEqual({ model: "resolved-slow-model", thinkingLevel: "low" });
-
-    // 2) Choosing `Model: inherit` & `Thinking: inherit` on supervisor saves explicit "inherit" (not snapping to @slow/low)
-    selectQueue.push(
-      "Model: @slow (via /settings)",
-      "inherit",
-      "Thinking: low (via /settings)",
-      "inherit",
-      undefined,
-    );
-    await openRoleEditor("supervisor", h.makeDeps(ctx));
-    const supInherit = parseRoleYaml(readFileSync(supOverridePath, "utf8"), "global", supOverridePath);
-    expect(supInherit.model).toBe("inherit");
-    expect(supInherit.thinking).toBe("inherit");
-    expect(resolveRoleRuntimeConfig(
-      supInherit, { getThinkingLevel: () => "high" }, { model: "user-session-model" },
-      { ...DEFAULT_ENHANCE_SETTINGS, supervisorModel: "@slow", supervisorThinking: "low" },
-    )).toEqual({ model: "user-session-model", thinkingLevel: "high" });
+    const coordOverridePath = path.join(globalDir, "coordinator.yaml");
+    const coordSaved = parseRoleYaml(readFileSync(coordOverridePath, "utf8"), "global", coordOverridePath);
+    expect(coordSaved.model).toBe("@slow");
+    expect(coordSaved.permissions.dispatch).toBe(true);
+    resetRoleOverride({ id: "coordinator", targetDir: globalDir });
 
     // 3) Copy-on-Write on builtin reviewer + defensive confirm (false/undefined refuses reset) + true resets & re-activates
     await h.makeDeps(ctx).activateRole("reviewer");
-    selectQueue.push("Model: inherit", "@slow", undefined);
+    selectQueue.push("模型绑定: inherit", "@slow", "返回");
     await openRoleEditor("reviewer", h.makeDeps(ctx));
     const globalReviewerPath = path.join(globalDir, "reviewer.yaml");
     expect(existsSync(globalReviewerPath)).toBe(true);
@@ -444,13 +445,13 @@ describe("Role Studio strict UI, glob parsing, supervisor CoW/inherit, and tool 
 
     // If ui.confirm is missing/undefined, Reset override fails closed and keeps override intact
     const noConfirmCtx = { ...ctx, ui: { ...ctx.ui, confirm: undefined } };
-    selectQueue.push("Reset global override", undefined);
+    selectQueue.push("恢复内置默认", "返回");
     await openRoleEditor("reviewer", h.makeDeps(noConfirmCtx));
     expect(existsSync(globalReviewerPath)).toBe(true);
 
     // With confirm() === true, Reset deletes override and re-runs activateRole("reviewer")
     const prevActivations = h.activeToolHistory.length;
-    selectQueue.push("Reset global override", undefined);
+    selectQueue.push("恢复内置默认", "返回");
     await openRoleEditor("reviewer", h.makeDeps(ctx));
     expect(existsSync(globalReviewerPath)).toBe(false);
     expect(h.activeToolHistory.length).toBeGreaterThan(prevActivations);
@@ -495,16 +496,27 @@ describe("Role Studio strict UI, glob parsing, supervisor CoW/inherit, and tool 
     expect(parseOverlayKey("\x1b[32;1:1u")).toBe("space");
     expect(parseOverlayKey("\x1b[13;1:1u")).toBe("enter");
 
-    // Drive custom overlay: switch to qa -> press 'e' -> Space-toggle index 0 (`apply_patch`) + Enter -> Back -> Esc
+    // Visible order: [coordinator (0), algo (1), dev (2), planner (3), qa (4), reviewer (5), vision (6)]
+    expect(listUserVisibleRoles(h.getRoles()).map((r) => r.id)).toEqual([
+      "coordinator", "algo", "dev", "planner", "qa", "reviewer", "vision",
+    ]);
+
+    // Drive custom overlay:
+    // 1) Enter on coordinator (idx 0) activates coordinator; second open + Enter on coordinator toggles back to off (null)!
+    // 2) Move down 4 to qa (idx 4), press dead 'h' (ignored!), then Enter -> opens openRoleEditor("qa") directly WITHOUT foreground activation!
+    const renderedFrames: string[][] = [];
     const customScripts: string[][] = [
-      ["\x1b[1;1:1B", "\x1b[1;1:1B", "\x1b[13;1:1u"], // general (idx 2) -> ml-engineer (3) -> qa (4) + Enter!
-      ["\x1b[101:69:101;1:1u"],                       // Kitty 'e' with colon sub-params -> open editor on qa
+      ["\x1b[13;1:1u"], // Enter on coordinator (idx 0) -> activates coordinator
+      ["\x1b[13;1:1u"], // Enter on coordinator again -> toggles back to off (null)
+      ["\x1b[1;1:1B", "\x1b[1;1:1B", "\x1b[1;1:1B", "\x1b[1;1:1B", "h", "\x1b[13;1:1u"], // down 4 -> qa(4), 'h' is ignored, Enter opens editor!
       ["\x1b[32;1:1u", "\x1b[13;1:1u"],               // Space (uncheck `apply_patch`) + Enter in checkbox overlay
       ["\x1b[27::27;1:1u"],                           // Kitty Esc with colon sub-params exits studio cleanly!
     ];
     const selectScripts: Array<string | undefined> = [
-      `Allowed tools: [${qaBefore.permissions.tools!.join(", ")}]`,
-      "← Back",
+      "高级路径与工具设置",
+      `可用工具列表: [${qaBefore.permissions.tools!.join(", ")}]`,
+      "返回",
+      "返回",
     ];
 
     const ctx = {
@@ -517,7 +529,7 @@ describe("Role Studio strict UI, glob parsing, supervisor CoW/inherit, and tool 
           const comp = factory({ requestRender() {} }, { fg: (_c: string, s: string) => s, bold: (s: string) => s }, {}, (res: unknown) => {
             resolved = res;
           });
-          comp.render(100);
+          renderedFrames.push(comp.render(110));
           for (const key of keys) comp.handleInput(key);
           return resolved;
         },
@@ -531,9 +543,20 @@ describe("Role Studio strict UI, glob parsing, supervisor CoW/inherit, and tool 
     };
 
     await openRoleStudioHome(h.makeDeps(ctx));
-    expect(h.getActiveRoleId()).toBe("qa");
-
+    expect(h.getActiveRoleId()).toBe("coordinator");
     await openRoleStudioHome(h.makeDeps(ctx));
+    expect(h.getActiveRoleId()).toBeNull();
+    const homeLines = renderedFrames[0]!.join("\n");
+    expect(homeLines).toContain("[总控入口] coordinator");
+    expect(homeLines).toContain("[后台专员] planner");
+    expect(homeLines).toContain("↑↓ 选择 · Enter 配置/切换 · n 新建 · c 拷贝 · x 退回标准OMP · Esc/q 关闭面板");
+    expect(homeLines).not.toContain("h 交接");
+    expect(homeLines).not.toContain("x 关闭(Off)");
+    expect(homeLines).not.toContain("supervisor");
+
+    // Pressing Enter on specialist qa (idx 4) opens editor directly and keeps activeRoleId === null!
+    await openRoleStudioHome(h.makeDeps(ctx));
+    expect(h.getActiveRoleId()).toBeNull();
     const savedQaPath = path.join(globalDir, "qa.yaml");
     expect(existsSync(savedQaPath)).toBe(true);
     const savedQa = parseRoleYaml(readFileSync(savedQaPath, "utf8"), "global", savedQaPath);
@@ -572,18 +595,21 @@ describe("ompEnhance slash-command economy, Tab completions, and protection of a
     };
 
     ompEnhance(pi, { globalRolesDir: globalDir, builtinRolesDir, pluginLockPath: lockPath });
-    expect([...commands.keys()].sort()).toEqual(["enhance-handoff", "enhance-status", "flow", "role"]);
+    expect([...commands.keys()].sort()).toEqual(["coord", "flow", "role"]);
 
     const roleCmd = commands.get("role")!;
+    expect(roleCmd.getArgumentCompletions!("").some((c) => c.value === "supervisor")).toBe(false);
     expect(roleCmd.getArgumentCompletions!("q").map((c) => c.value)).toEqual(["qa"]);
     expect(roleCmd.getArgumentCompletions!("edit rev").map((c) => c.value)).toEqual(["edit reviewer"]);
-    expect(commands.get("enhance-handoff")!.getArgumentCompletions!("").some((c) => c.value === "supervisor")).toBe(false);
-    expect(commands.get("flow")!.getArgumentCompletions!("dev,q").map((c) => c.value)).toEqual(["dev,qa"]);
+    expect(commands.get("coord")!.getArgumentCompletions!("").map((c) => c.value)).toEqual(["on", "off", "status", "toggle"]);
+    expect(commands.get("coord")!.getArgumentCompletions!("st").map((c) => c.value)).toEqual(["status"]);
+    expect(commands.get("flow")!.getArgumentCompletions!("").map((c) => c.value)).toEqual(["status", "cancel"]);
+    expect(commands.get("flow")!.getArgumentCompletions!("ca").map((c) => c.value)).toEqual(["cancel"]);
 
     const cliCtx = { cwd, hasUI: false, ui: { notify() {}, setStatus() {} } };
 
     // All 8 built-in roles MUST be protected from CLI deletion
-    for (const builtinId of ["algo", "dev", "general", "ml-engineer", "qa", "reviewer", "supervisor", "vision"]) {
+    for (const builtinId of ["algo", "coordinator", "dev", "planner", "qa", "reviewer", "supervisor", "vision"]) {
       await roleCmd.handler(`delete ${builtinId}`, cliCtx);
       expect(messages.at(-1)).toContain(`Built-in role "${builtinId}" cannot be deleted`);
     }

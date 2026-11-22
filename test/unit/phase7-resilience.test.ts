@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { EnhanceStore } from "../../src/core/store.ts";
@@ -96,7 +96,8 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     const lockPath = path.join(makeTempDir("p7-flow-lock"), "omp-plugins.lock.json");
     writeText(lockPath, JSON.stringify({ settings: { "omp-enhance": { flowRoutingMode: "auto" } } }));
 
-    expect(parseFlowOverlayInput("\x12")).toEqual({ kind: "resume_flow" });
+    expect(parseFlowOverlayInput("\t")).toEqual({ kind: "next_project" });
+    expect(parseFlowOverlayInput("q")).toEqual({ kind: "escape" });
 
     const instance1ExecutedRoles: string[] = [];
     let qaReachedMidStage = false;
@@ -190,7 +191,8 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     const ctx2 = { cwd, hasUI: false, ui: { setStatus(_k: string, b?: string) { statusBadges2.push(b); } } };
     await h2.emit("session_start", {}, ctx2);
 
-    expect(statusBadges2.at(-1)).toContain("flow:paused");
+    // Default role is null ("off") with zero running flows -> status bar is hidden (undefined)!
+    expect(statusBadges2.at(-1)).toBeUndefined();
 
     const hydrated = JSON.parse((await h2.tools.get("enhance_flow")!.execute("st", {
       action: "status",
@@ -201,9 +203,9 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     expect(hydrated.entries.some((e: any) => e.speaker === "dev" && e.badge === "✓ ready")).toBe(true);
     expect(hydrated.entries.some((e: any) => e.speaker === "qa" && e.badge === "⏸ 中断")).toBe(true);
 
-    h2.sentMessages.length = 0;
-    await h2.commands.get("flow")!.handler("continue", ctx2);
-    const resumeOut = JSON.parse(h2.sentMessages.at(-1)!.content);
+    const resumeOut = JSON.parse((await h2.tools.get("enhance_flow")!.execute("res-1", {
+      action: "resume", wait: true,
+    }, null, null, ctx2)).content[0].text);
     expect(resumeOut.status).toBe("completed");
     expect(instance2ExecutedRoles).toEqual(["qa", "reviewer"]);
     expect(qaReceivedUpstreamFrom).toBe("dev");
@@ -286,8 +288,9 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
 
     const h2 = createHarness({ cwd, globalDir, lockPath, runner: h2Runner });
     const ctx2 = { cwd, hasUI: false };
-    await h2.commands.get("flow")!.handler("continue", ctx2);
-    const out = JSON.parse(h2.sentMessages.at(-1)!.content);
+    const out = JSON.parse((await h2.tools.get("enhance_flow")!.execute("res-r1", {
+      action: "resume", wait: true,
+    }, null, null, ctx2)).content[0].text);
     expect(out.status).toBe("stagnated");
 
     const snap = JSON.parse((await h2.tools.get("enhance_flow")!.execute("st", { action: "status" }, null, null, ctx2)).content[0].text);
@@ -307,33 +310,46 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
       },
     };
     const hv = createHarness({ cwd: cwdViol, globalDir, lockPath, runner: violRunner });
-    await hv.commands.get("flow")!.handler("qa Verify protected", { cwd: cwdViol, hasUI: false });
+    await hv.tools.get("enhance_flow")!.execute("f-viol", {
+      action: "start", roles: ["qa"], goal: "Verify protected", wait: true,
+    }, null, null, { cwd: cwdViol, hasUI: false });
     const violStatus = JSON.parse((await hv.tools.get("enhance_flow")!.execute("st-v", { action: "status" }, null, null, { cwd: cwdViol, hasUI: false })).content[0].text);
     expect(violStatus.status).toBe("violation");
     expect(violStatus.resumable).toBe(false);
     await hv.emit("session_shutdown", {}, { cwd: cwdViol, hasUI: false });
   });
 
-  test("persists active /role across omp --continue and falls back to defaultRole when newest custom role was deleted", async () => {
+  test("persists active /role & waiting_input checkpoint across omp --continue and falls back to defaultRole when newest custom role was deleted", async () => {
     const cwd = makeTempDir("p7-role-persist");
     const globalDir = makeTempDir("p7-role-global");
     const lockPath = path.join(makeTempDir("p7-role-lock"), "omp-plugins.lock.json");
-    writeText(lockPath, JSON.stringify({ settings: { "omp-enhance": { defaultRole: "general" } } }));
+    writeText(lockPath, JSON.stringify({ settings: { "omp-enhance": { defaultRole: "coordinator" } } }));
 
     const sharedSessionBranch: any[] = [];
+    const waitInputRunner: RoleSessionRunner = {
+      async runRoleTurn(stepCtx) {
+        const env = createAndVerifyHandoff({
+          store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
+          toTarget: stepCtx.toTarget, verdict: "needs_input", summary: "Confirm deployment region",
+          questionsForUser: ["Deploy to us-east-1 or ap-northeast-1?"],
+        });
+        return { envelope: env, observedCalls: [], assistantText: "ask", usage: null };
+      },
+    };
 
-    const h1 = createHarness({ cwd, globalDir, lockPath, branchEntries: sharedSessionBranch });
+    const h1 = createHarness({ cwd, globalDir, lockPath, runner: waitInputRunner, branchEntries: sharedSessionBranch });
     const ctx1 = {
       cwd, hasUI: false,
       sessionManager: { getSessionId: () => "sess-1", getBranch: () => sharedSessionBranch },
     };
     await h1.emit("session_start", {}, ctx1);
+    await h1.tools.get("enhance_flow")!.execute("fw-1", { roles: ["planner"], goal: "Plan deploy", wait: true }, null, null, ctx1);
     await h1.commands.get("role")!.handler("off", ctx1);
     await h1.commands.get("role")!.handler("create temp-role --project Temporary custom role", ctx1);
-    await h1.commands.get("role")!.handler("temp-role", ctx1);
+    await h1.commands.get("role")!.handler("temp-role --foreground", ctx1);
     await h1.emit("session_shutdown", {}, ctx1);
 
-    // Delete `temp-role` on disk -> resuming `sess-1` stops at newest entry (`temp-role`, missing) and falls back to `general`, NOT older `off`!
+    // Delete `temp-role` on disk -> resuming `sess-1` stops at newest entry (`temp-role`, missing) and falls back to `coordinator`, NOT older `off`!
     rmSync(path.join(cwd, ".omp", "roles", "temp-role.yaml"), { force: true });
 
     const h2 = createHarness({ cwd, globalDir, lockPath, branchEntries: sharedSessionBranch });
@@ -343,8 +359,11 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     };
     await h2.emit("session_start", {}, ctx2);
     h2.sentMessages.length = 0;
-    await h2.commands.get("enhance-status")!.handler("", ctx2);
-    expect(JSON.parse(h2.sentMessages.at(-1)!.content).activeRoleId).toBe("general");
+    await h2.commands.get("coord")!.handler("status", ctx2);
+    expect(h2.sentMessages.at(-1)!.content).toContain("总秘书运行中 (coordinator)");
+    const hydratedWait = JSON.parse((await h2.tools.get("enhance_flow")!.execute("st-w", { action: "status" }, null, null, ctx2)).content[0].text);
+    expect(hydratedWait.status).toBe("waiting_input");
+    expect(hydratedWait.resumable).toBe(true);
     await h2.emit("session_shutdown", {}, ctx2);
   });
 
@@ -396,7 +415,7 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     const cwd = makeTempDir("p7-lifecycle");
     const globalDir = makeTempDir("p7-lifecycle-global");
     const lockPath = path.join(makeTempDir("p7-lifecycle-lock"), "omp-plugins.lock.json");
-    writeText(lockPath, JSON.stringify({ settings: { "omp-enhance": { defaultRole: "general" } } }));
+    writeText(lockPath, JSON.stringify({ settings: { "omp-enhance": { defaultRole: "coordinator" } } }));
 
     let setActiveToolsCalls = 0;
     let activeTools: string[] = [];
@@ -457,21 +476,21 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     await emit("before_agent_start", { systemPrompt: ["Base"] }, ctxA);
     expect(setActiveToolsCalls).toBe(callsAfterStart);
 
-    // 2) Switch to vision in sess-a; verify brand-new sess-c sees NO "__default__" bleed even before session_switch!
-    await commands.get("role")!.handler("vision", ctxA);
+    // 2) Switch to vision (--foreground) in sess-a; verify brand-new sess-c sees NO "__default__" bleed even before session_switch!
+    await commands.get("role")!.handler("vision --foreground", ctxA);
     expect(currentModel).toMatchObject({ provider: "openrouter", id: "qwen-vl" });
     expect(thinkingLevel).toBe("low");
 
     const ctxUnseen = makeCtx("sess-unseen", () => []);
     sentMessages.length = 0;
-    await commands.get("enhance-status")!.handler("", ctxUnseen);
-    expect(JSON.parse(sentMessages.at(-1)!.content).activeRoleId).toBe("general");
+    await commands.get("coord")!.handler("status", ctxUnseen);
+    expect(sentMessages.at(-1)!.content).toContain("总秘书运行中 (coordinator)");
     expect(sentMessages.at(-1)!.excludeFromContext).toBe(true);
 
-    // 3) User manually switches /model & thinking while in vision -> switching back to general preserves user's manual choice!
+    // 3) User manually switches /model & thinking while in vision -> switching back to coordinator preserves user's manual choice!
     currentModel = { provider: "openai-codex", id: "gpt-6.1-sol" };
     thinkingLevel = "max";
-    await commands.get("role")!.handler("general", ctxA);
+    await commands.get("coord")!.handler("", ctxA);
     expect(currentModel).toMatchObject({ provider: "openai-codex", id: "gpt-6.1-sol" });
     expect(thinkingLevel).toBe("max");
 
@@ -481,8 +500,8 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     activeBranch = qaBranch;
     await emit("session_tree", {}, ctxA);
     sentMessages.length = 0;
-    await commands.get("enhance-status")!.handler("", ctxA);
-    expect(JSON.parse(sentMessages.at(-1)!.content).activeRoleId).toBe("qa");
+    await commands.get("coord")!.handler("status", ctxA);
+    expect(sentMessages.at(-1)!.content).toContain("前台覆写角色 (qa)");
     const callsAfterTree = setActiveToolsCalls;
     await emit("before_agent_start", { systemPrompt: ["Base"] }, ctxA);
     expect(setActiveToolsCalls).toBe(callsAfterTree);
@@ -490,11 +509,11 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     activeBranch = ancestorBranch;
     await emit("session_tree", {}, ctxA);
     sentMessages.length = 0;
-    await commands.get("enhance-status")!.handler("", ctxA);
-    expect(JSON.parse(sentMessages.at(-1)!.content).activeRoleId).toBe("general");
+    await commands.get("coord")!.handler("status", ctxA);
+    expect(sentMessages.at(-1)!.content).toContain("总秘书运行中 (coordinator)");
 
     // 5) session_switch (/new) to sess-b resets role/model/thinking immediately while idle!
-    await commands.get("role")!.handler("vision", ctxA);
+    await commands.get("role")!.handler("vision --foreground", ctxA);
     expect(currentModel).toMatchObject({ provider: "openrouter", id: "qwen-vl" });
     currentSessionId = "sess-b";
     const ctxB = makeCtx(currentSessionId, () => []);
@@ -504,5 +523,65 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     expect(activeTools).toContain("enhance_job");
 
     await emit("session_shutdown", {}, ctxB);
+  });
+
+  test("persists secondary project paths in ~/.omp/enhance/hub-projects.json across restarts without writing inside primaryCwd", async () => {
+    const primaryCwd = makeTempDir("p7-hub-primary");
+    const subCwd = makeTempDir("p7-hub-sub");
+    const fakeHome = makeTempDir("p7-hub-home");
+    const globalDir = path.join(fakeHome, ".omp", "enhance", "roles");
+    const lockPath = path.join(makeTempDir("p7-hub-lock"), "omp-plugins.lock.json");
+    writeText(lockPath, JSON.stringify({ settings: { "omp-enhance": { flowRoutingMode: "auto" } } }));
+
+    const prevHome = process.env.OMP_ENHANCE_HOME;
+    process.env.OMP_ENHANCE_HOME = fakeHome;
+    try {
+      const subRunner: RoleSessionRunner = {
+        async runRoleTurn(stepCtx) {
+          const env = createAndVerifyHandoff({
+            store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
+            toTarget: stepCtx.toTarget, verdict: "needs_input", summary: "Subproject awaiting API key",
+            questionsForUser: ["Which sandbox API key should subproject use?"],
+          });
+          return { envelope: env, observedCalls: [], assistantText: "wait", usage: null };
+        },
+      };
+
+      const h1 = createHarness({ cwd: primaryCwd, globalDir, lockPath, runner: subRunner });
+      const ctx1 = { cwd: primaryCwd, hasUI: false };
+      await h1.emit("session_start", {}, ctx1);
+      const startedSub = JSON.parse((await h1.tools.get("enhance_flow")!.execute("f-sub", {
+        cwd: subCwd, roles: ["planner"], goal: "Audit subproject", wait: true,
+      }, null, null, ctx1)).content[0].text);
+      expect(startedSub.status).toBe("waiting_input");
+      await h1.emit("session_shutdown", {}, ctx1);
+
+      // Zero files written inside primaryCwd!
+      expect(readdirSync(primaryCwd)).toEqual([]);
+      const hubProjectsFile = path.join(fakeHome, ".omp", "enhance", "hub-projects.json");
+      expect(existsSync(hubProjectsFile)).toBe(true);
+      const persistedMap = JSON.parse(readFileSync(hubProjectsFile, "utf8")) as Record<string, string[]>;
+      expect(persistedMap[primaryCwd]).toEqual([subCwd]);
+
+      // Reopen omp in primaryCwd -> /flow status & enhance_flow(list) automatically remember subCwd!
+      const h2 = createHarness({ cwd: primaryCwd, globalDir, lockPath });
+      const ctx2 = { cwd: primaryCwd, hasUI: false };
+      await h2.emit("session_start", {}, ctx2);
+      const listOut = JSON.parse((await h2.tools.get("enhance_flow")!.execute("fl-2", {
+        action: "list",
+      }, null, null, ctx2)).content[0].text);
+      expect(listOut.flows.find((f: any) => f.cwd === subCwd)).toMatchObject({
+        status: "waiting_input",
+        resumable: true,
+        goal: "Audit subproject",
+      });
+      await h2.commands.get("flow")!.handler("status", ctx2);
+      expect(h2.sentMessages.at(-1)!.content).toContain(subCwd);
+      expect(h2.sentMessages.at(-1)!.content).toContain("Audit subproject");
+      await h2.emit("session_shutdown", {}, ctx2);
+    } finally {
+      if (prevHome === undefined) delete process.env.OMP_ENHANCE_HOME;
+      else process.env.OMP_ENHANCE_HOME = prevHome;
+    }
   });
 });

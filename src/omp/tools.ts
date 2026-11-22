@@ -1,81 +1,50 @@
-import { canRoleDelegateTo, canRoleUseCompanionTool } from "../core/policy.ts";
+import { canRoleDelegateTo, canRoleUseCompanionTool, isInternalRole } from "../core/policy.ts";
 import { normalizeUsageSummary } from "../core/settings.ts";
 import type { EnhanceStore } from "../core/store.ts";
 import type {
-  EnhanceSettings, EpistemicKind, EpistemicStatus, FlowRunResult, HandoffEnvelope,
-  HandoffVerdict, Mandate, MandateStatus, RoleSpec, UsageSummary, VerifiedFact,
+  EnhanceSettings, EpistemicKind, EpistemicStatus, HandoffEnvelope, HandoffVerdict, Mandate, MandateStatus, RoleSpec, UsageSummary, VerifiedFact,
 } from "../core/types.ts";
 import { BoundaryViolationError, createAndVerifyHandoff } from "../flow/handoff.ts";
-import { executeRoleStep, type RoleSessionRunner, type RoleStepContext, type RoleSupervisorConfig } from "../flow/orchestrator.ts";
-import type { FlowRoomManager } from "../flow/state.ts";
-import type { SessionTrackerRegistry } from "../flow/tracker.ts";
+import { executeRoleStep, type RoleStepContext, type RoleSupervisorConfig } from "../flow/orchestrator.ts";
 import { cancelJob, readJobLogTail, reconcileJobs, startBackgroundJob } from "../jobs/runner.ts";
 import { watchBackgroundJob, type SupervisorInspector } from "../jobs/supervisor.ts";
-
-export interface WorkspaceRuntime {
-  cwd: string; globalRolesDir: string; builtinRolesDir?: string;
-  store: EnhanceStore; trackers: SessionTrackerRegistry; room: FlowRoomManager;
-  roles: Map<string, RoleSpec>; settings: EnhanceSettings;
-  getSessionId(ctx: any): string;
-  getSessionRoleId(ctx: any): string | null;
-  getActiveRole(ctx: any): RoleSpec | null;
-  applyActiveRole(roleId: string | null, ctx: any, persistToSession?: boolean): Promise<void>;
-  refresh(ctx?: any): Map<string, RoleSpec>;
-  syncStatusBar(ctx: any): void;
-  runnerFor(ctx: any): RoleSessionRunner;
-  supervisorFor(ctx: any): RoleSupervisorConfig | undefined;
-  emitMessage(ctx: any, text: string, options?: { excludeFromContext?: boolean }): void;
-  startManagedFlow(input: {
-    ctx: any; flowId?: string; roles: RoleSpec[]; mandate: Mandate;
-    initialHandoff: HandoffEnvelope | null; maxRepairRounds: number;
-    background: boolean; initiatorText?: string; signal?: AbortSignal;
-  }): Promise<{ started: true; flowId: string; background: true; status: "running"; roleChain: string[]; goal: string } | FlowRunResult>;
-  resumeManagedFlow(
-    ctx: any, background: boolean, signal?: AbortSignal,
-  ): Promise<{ resumed: true; flowId: string; startIndex: number; background: true; status: "running"; roleChain: string[] } | FlowRunResult>;
-  dispatchFollowUpFromRoom(ctx: any, rawText: string): Promise<void>;
-}
+import type { WorkspaceHub } from "./hub.ts";
+import type { WorkspaceRuntime } from "./workspace.ts";
+export type { WorkspaceRuntime };
 
 const EPISTEMIC_KINDS: readonly EpistemicKind[] = ["fact", "hypothesis", "inquiry", "decision"];
 const EPISTEMIC_STATUSES: readonly EpistemicStatus[] = ["open", "verified", "falsified", "deferred"];
 const MANDATE_STATUSES: readonly MandateStatus[] = ["active", "completed", "archived"];
-const VERDICTS: readonly HandoffVerdict[] = ["ready", "rejected", "blocked"];
+const VERDICTS: readonly HandoffVerdict[] = ["ready", "needs_input", "rejected", "blocked"];
 
 const asString = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v.trim() : undefined);
-function asStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const items = value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+const asStringArray = (v: unknown): string[] | undefined => {
+  if (!Array.isArray(v)) return undefined;
+  const items = v.filter((it): it is string => typeof it === "string" && it.trim().length > 0);
   return items.length > 0 ? items : undefined;
-}
-function asVerifiedFacts(value: unknown): VerifiedFact[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const facts = value.flatMap((item): VerifiedFact[] => {
-    if (typeof item !== "object" || item === null) return [];
-    const r = item as Record<string, unknown>, claim = asString(r.claim), evidenceRef = asString(r.evidenceRef);
+};
+const asVerifiedFacts = (v: unknown): VerifiedFact[] | undefined => {
+  if (!Array.isArray(v)) return undefined;
+  const facts = v.flatMap((it): VerifiedFact[] => {
+    if (typeof it !== "object" || it === null) return [];
+    const r = it as Record<string, unknown>, claim = asString(r.claim), evidenceRef = asString(r.evidenceRef);
     return claim && evidenceRef ? [{ claim, evidenceRef }] : [];
   });
   return facts.length > 0 ? facts : undefined;
-}
+};
 
 export function schemaKit(pi: any) {
   const T = pi?.typebox?.Type;
-  const opt = (v: unknown): unknown => {
-    if (!T?.Optional) return v;
-    return T.Union && T.Null ? T.Optional(T.Union([v, T.Null()])) : T.Optional(v);
-  };
+  const opt = (v: unknown): unknown => (!T?.Optional ? v : (T.Union && T.Null ? T.Optional(T.Union([v, T.Null()])) : T.Optional(v)));
   return {
     str: (): unknown => (T?.String ? T.String() : { type: "string" }),
     num: (): unknown => (T?.Number ? T.Number() : { type: "number" }),
     bool: (): unknown => (T?.Boolean ? T.Boolean() : { type: "boolean" }),
     arr: (item: unknown): unknown => (T?.Array ? T.Array(item) : { type: "array", items: item }),
-    en: (values: readonly string[]): unknown =>
-      T?.Union ? T.Union(values.map((v: string) => T.Literal(v))) : { type: "string", enum: values },
+    en: (values: readonly string[]): unknown => (T?.Union ? T.Union(values.map((v: string) => T.Literal(v))) : { type: "string", enum: values }),
     obj: (props: Record<string, unknown>, req: string[]): unknown =>
       T?.Object
-        ? T.Object(
-            Object.fromEntries(Object.entries(props).map(([k, v]) => [k, req.includes(k) ? v : opt(v)])),
-            { additionalProperties: false },
-          )
+        ? T.Object(Object.fromEntries(Object.entries(props).map(([k, v]) => [k, req.includes(k) ? v : opt(v)])), { additionalProperties: false })
         : { type: "object", properties: props, required: req, additionalProperties: false },
   };
 }
@@ -86,17 +55,13 @@ function extractForegroundUsage(ctx: any): UsageSummary | null {
   const entries: any[] = ctx?.sessionManager?.getBranch?.() ?? ctx?.sessionManager?.getEntries?.() ?? [];
   for (let i = entries.length - 1; i >= 0; i--) {
     const e = entries[i], msg = e?.type === "message" ? e.message : e;
-    if (msg?.role === "assistant" && msg?.usage) {
-      const u = normalizeUsageSummary(msg.usage);
-      if (u) return u;
-    }
+    const u = msg?.role === "assistant" && msg?.usage ? normalizeUsageSummary(msg.usage) : null;
+    if (u) return u;
   }
   return null;
 }
 
-const toolResult = (payload: unknown, isError = false) => ({
-  content: [{ type: "text", text: JSON.stringify(payload, null, 2) }], ...(isError ? { isError: true } : {}),
-});
+const toolResult = (payload: unknown, isError = false) => ({ content: [{ type: "text", text: JSON.stringify(payload, null, 2) }], ...(isError ? { isError: true } : {}) });
 const toolError = (error: unknown) => toolResult({ error: error instanceof Error ? error.message : String(error) }, true);
 
 function executeMandateParams(
@@ -201,10 +166,7 @@ async function executeJobParams(input: {
 }
 
 export function buildStageCompanionTools(
-  pi: any,
-  stepCtx: RoleStepContext,
-  settings: EnhanceSettings,
-  onJobStarted?: (jobId: string) => void,
+  pi: any, stepCtx: RoleStepContext, settings: EnhanceSettings, onJobStarted?: (jobId: string) => void,
 ): any[] {
   const kit = schemaKit(pi);
   const tools: any[] = [{
@@ -244,7 +206,7 @@ export function buildStageCompanionTools(
   return tools;
 }
 
-export function registerEnhanceTools(pi: any, getWorkspace: (ctx: any) => WorkspaceRuntime): void {
+export function registerEnhanceTools(pi: any, hub: WorkspaceHub): void {
   const kit = schemaKit(pi);
   const registerTool = (input: {
     name: string; label: string; description: string; approval?: "read" | "write" | "exec"; parameters: unknown;
@@ -260,16 +222,18 @@ export function registerEnhanceTools(pi: any, getWorkspace: (ctx: any) => Worksp
 
   registerTool({
     name: "enhance_mandate", label: "Enhance Mandate",
-    description: "Set or read the active Mandate, and add/update epistemic-board items.",
+    description: "Set or read the active Mandate, and add/update epistemic-board items (optionally scoped to cwd).",
     parameters: kit.obj({
-      action: kit.en(["set", "get", "add_item", "update_item"]), goal: kit.str(),
+      action: kit.en(["set", "get", "add_item", "update_item"]), cwd: kit.str(), goal: kit.str(),
       constraints: kit.arr(kit.str()), acceptance: kit.arr(kit.str()), mandateId: kit.str(),
       status: kit.en([...MANDATE_STATUSES, ...EPISTEMIC_STATUSES]), kind: kit.en(EPISTEMIC_KINDS),
       statement: kit.str(), evidenceRef: kit.str(), verificationPlan: kit.str(), itemId: kit.str(),
     }, ["action"]),
     async execute(params, ctx) {
-      try { const ws = getWorkspace(ctx); return toolResult(executeMandateParams(ws.store, params, { sessionId: ws.getSessionId(ctx) })); }
-      catch (err) { return toolError(err); }
+      try {
+        const originWs = hub.getWorkspace(ctx), ws = hub.resolveTargetWorkspace(originWs, asString(params.cwd), ctx);
+        return toolResult({ cwd: ws.cwd, ...executeMandateParams(ws.store, params, { sessionId: originWs.getSessionId(ctx) }) });
+      } catch (err) { return toolError(err); }
     },
   });
 
@@ -279,15 +243,20 @@ export function registerEnhanceTools(pi: any, getWorkspace: (ctx: any) => Worksp
     parameters: kit.obj({
       verdict: kit.en(VERDICTS), summary: kit.str(), toTarget: kit.str(), artifactPaths: kit.arr(kit.str()),
       verifiedFacts: kit.arr(kit.obj({ claim: kit.str(), evidenceRef: kit.str() }, ["claim", "evidenceRef"])),
-      openRisks: kit.arr(kit.str()), feedbackForUpstream: kit.str(), delegateNow: kit.bool(),
+      openRisks: kit.arr(kit.str()), questionsForUser: kit.arr(kit.str()),
+      feedbackForUpstream: kit.str(), delegateNow: kit.bool(),
     }, ["verdict", "summary"]),
     async execute(params, ctx, signal) {
       try {
-        const ws = getWorkspace(ctx); ws.refresh(ctx);
-        const active = ws.getActiveRole(ctx), role = active ?? ws.roles.get("general") ?? ws.roles.get("dev");
+        const ws = hub.getWorkspace(ctx); ws.refresh(ctx);
+        const active = ws.getActiveRole(ctx), role = active ?? ws.roles.get("dev");
         if (!role) throw new Error("No active role and no builtin fallback role available.");
+        const handoffPerm = canRoleUseCompanionTool(active, "enhance_handoff");
+        if (!handoffPerm.allowed) throw new Error(handoffPerm.reason);
         const verdict = asString(params.verdict), summary = asString(params.summary);
-        if (!verdict || !VERDICTS.includes(verdict as HandoffVerdict)) throw new Error("enhance_handoff requires verdict ready|rejected|blocked.");
+        if (!verdict || !VERDICTS.includes(verdict as HandoffVerdict)) {
+          throw new Error("enhance_handoff requires verdict ready|needs_input|rejected|blocked.");
+        }
         if (!summary) throw new Error("enhance_handoff requires a summary.");
         const toTarget = asString(params.toTarget) ?? "user", wantDelegate = params.delegateNow === true && toTarget !== "user";
         let targetRole: RoleSpec | undefined;
@@ -299,7 +268,7 @@ export function registerEnhanceTools(pi: any, getWorkspace: (ctx: any) => Worksp
           if (ws.settings.flowRoutingMode === "manual" && targetRole!.id !== "vision") {
             return toolResult({
               started: false, blockedByRoutingMode: "manual",
-              suggestion: `Automatic delegation is disabled (flowRoutingMode=manual). Ask the user to run /enhance-handoff ${toTarget}`,
+              suggestion: "Automatic delegation is disabled (flowRoutingMode=manual). Enable auto or ask in /settings → Plugins → omp-enhance.",
             });
           }
         }
@@ -311,8 +280,8 @@ export function registerEnhanceTools(pi: any, getWorkspace: (ctx: any) => Worksp
           verdict: verdict as HandoffVerdict, summary, artifactPaths: asStringArray(params.artifactPaths),
           baselineSnapshot: tracker.getBaselineSnapshot(ws.cwd), baselineConfigSnapshot: tracker.getBaselineConfigSnapshot(ws.cwd),
           observedCalls: tracker.getObservedCalls(), verifiedFacts: asVerifiedFacts(params.verifiedFacts),
-          openRisks: asStringArray(params.openRisks), feedbackForUpstream: asString(params.feedbackForUpstream),
-          observedUsage: extractForegroundUsage(ctx),
+          openRisks: asStringArray(params.openRisks), questionsForUser: asStringArray(params.questionsForUser),
+          feedbackForUpstream: asString(params.feedbackForUpstream), observedUsage: extractForegroundUsage(ctx),
         });
 
         if (wantDelegate && targetRole) {
@@ -333,88 +302,147 @@ export function registerEnhanceTools(pi: any, getWorkspace: (ctx: any) => Worksp
 
   registerTool({
     name: "enhance_flow", label: "Enhance Flow", approval: "exec",
-    description: "Start, resume, inspect status, steer, or cancel a Markov-isolated multi-role collaboration Flow.",
+    description: "Start, resume, list/inspect status, steer, or cancel Markov-isolated specialist Flows across one or multiple project directories (cwd).",
     parameters: kit.obj({
-      action: kit.en(["start", "status", "steer", "cancel", "resume"]),
-      roles: kit.arr(kit.str()), goal: kit.str(), message: kit.str(),
-      maxRepairRounds: kit.num(), initialHandoffId: kit.str(), wait: kit.bool(),
+      action: kit.en(["start", "status", "list", "steer", "cancel", "resume"]),
+      cwd: kit.str(), flowId: kit.str(), roles: kit.arr(kit.str()), goal: kit.str(),
+      message: kit.str(), maxRepairRounds: kit.num(), initialHandoffId: kit.str(), wait: kit.bool(),
     }, []),
     async execute(params, ctx, signal) {
       try {
-        const ws = getWorkspace(ctx); ws.refresh(ctx);
-        const action = asString(params.action) ?? "start", activeRole = ws.getActiveRole(ctx);
-        if (action === "status") return toolResult({ ...ws.room.getSnapshot(), resumable: ws.room.isResumable() });
-        if (action === "cancel") { const cancelled = await ws.room.cancelActiveFlow(ctx); ws.syncStatusBar(ctx); return toolResult({ cancelled, status: ws.room.getSnapshot().status }); }
+        const originWs = hub.getWorkspace(ctx); originWs.refresh(ctx);
+        const action = asString(params.action) ?? "start", activeRole = originWs.getActiveRole(ctx);
+        const reqFlowId = asString(params.flowId), reqCwd = asString(params.cwd);
+
+        if (action === "list") {
+          hub.markAllSettledFlowsObserved();
+          return toolResult({ cwd: originWs.cwd, flows: hub.getAllFlowSummaries(), runningJobs: hub.getAllRunningJobs() });
+        }
+        if (action === "status") {
+          if (reqFlowId || reqCwd) {
+            const targetWs = hub.resolveFlowWorkspace(originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx);
+            hub.markFlowSnapshotObserved(targetWs);
+            return toolResult({ cwd: targetWs.cwd, ...targetWs.room.getSnapshot(), resumable: targetWs.room.isResumable() });
+          }
+          hub.markAllSettledFlowsObserved();
+          return toolResult({
+            cwd: originWs.cwd, ...originWs.room.getSnapshot(), resumable: originWs.room.isResumable(),
+            flows: hub.getAllFlowSummaries(), runningJobs: hub.getAllRunningJobs(),
+          });
+        }
+        if (action === "cancel") {
+          const targetWs = hub.resolveFlowWorkspace(originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx, (w) => w.room.isRunning());
+          const cancelled = await targetWs.room.cancelActiveFlow(ctx);
+          hub.syncGlobalUi(ctx, originWs);
+          const snap = targetWs.room.getSnapshot();
+          return toolResult({ cancelled, cwd: targetWs.cwd, flowId: snap.flowId, status: snap.status });
+        }
         if (action === "resume") {
           const perm = canRoleUseCompanionTool(activeRole, "enhance_flow", "resume");
           if (!perm.allowed) throw new Error(perm.reason);
+          const targetWs = hub.resolveFlowWorkspace(originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx, (w) => w.room.isResumable());
+          targetWs.refresh(ctx);
+          const msg = asString(params.message);
+          if (msg) await targetWs.room.postUserSteer(msg, ctx);
           const background = params.wait === true ? false : Boolean(ctx?.hasUI);
-          return toolResult(await ws.resumeManagedFlow(ctx, background, background ? undefined : signal));
+          const res = await targetWs.resumeManagedFlow(ctx, background, background ? undefined : signal, originWs);
+          hub.syncGlobalUi(ctx, originWs);
+          return toolResult(res);
         }
         if (action === "steer") {
           const perm = canRoleUseCompanionTool(activeRole, "enhance_flow", "steer");
           if (!perm.allowed) throw new Error(perm.reason);
           const msg = asString(params.message) ?? asString(params.goal);
           if (!msg) throw new Error("enhance_flow steer requires a message.");
-          const res = await ws.room.postUserSteer(msg, ctx);
-          return toolResult({ ok: true, ...res, status: ws.room.getSnapshot().status });
+          const targetWs = hub.resolveFlowWorkspace(originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx, (w) => w.room.isRunning() || w.room.isResumable());
+          const res = await targetWs.room.postUserSteer(msg, ctx);
+          const snap = targetWs.room.getSnapshot();
+          return toolResult({ ok: true, cwd: targetWs.cwd, flowId: snap.flowId, ...res, status: snap.status });
         }
         if (action !== "start") throw new Error(`Unknown enhance_flow action "${action}".`);
 
+        const targetWs = hub.resolveTargetWorkspace(originWs, reqCwd, ctx);
+        targetWs.refresh(ctx);
         const roleIds = asStringArray(params.roles);
         if (!roleIds) throw new Error("enhance_flow start requires a non-empty roles array.");
         const roles = roleIds.map((id) => {
-          if (id === "supervisor") throw new Error('Role "supervisor" is an internal monitor and cannot run as a Flow stage.');
-          const r = ws.roles.get(id); if (!r) throw new Error(`Unknown role "${id}".`); return r;
+          const r = targetWs.roles.get(id);
+          if (id === "supervisor" || (r && isInternalRole(r))) throw new Error(`Role "${id}" is an internal monitor and cannot run as a Flow stage.`);
+          if (!r) throw new Error(`Unknown role "${id}".`);
+          return r;
         });
         const perm = canRoleUseCompanionTool(activeRole, "enhance_flow", "start", roles);
         if (!perm.allowed) throw new Error(perm.reason);
-        if (ws.room.isRunning()) throw new Error("已有正在运行的协作 Flow；可通过 steer 插话、/flow 查看或 cancel 取消。");
+        if (targetWs.room.isRunning()) throw new Error(`项目 ${targetWs.cwd} 已有正在运行的协作 Flow；可通过 steer 留言、/flow 查看或 cancel 取消。`);
 
-        const sid = ws.getSessionId(ctx), goal = asString(params.goal);
-        const existingMandate = goal ? null : ws.store.getActiveMandate({ sessionId: sid });
+        const sid = originWs.getSessionId(ctx), goal = asString(params.goal);
+        const priorSessionMandate = targetWs.store.getActiveMandate({ sessionId: sid });
+        const existingMandate = goal ? null : priorSessionMandate;
         const previewGoal = goal ?? existingMandate?.goal;
         if (!previewGoal) throw new Error("enhance_flow requires a goal or an active mandate.");
 
-        if (ws.settings.flowRoutingMode === "manual") {
+        if (originWs.settings.flowRoutingMode === "manual") {
           return toolResult({
             started: false, blockedByRoutingMode: "manual",
-            suggestion: `Automatic Flow dispatch is disabled (flowRoutingMode=manual). Handle directly or ask the user to run: /flow ${roleIds.join(",")} ${previewGoal}`,
+            suggestion: "Automatic Flow dispatch is disabled (flowRoutingMode=manual). Enable auto or ask in /settings → Plugins → omp-enhance.",
           });
         }
-        if (ws.settings.flowRoutingMode === "ask" && ctx?.hasUI) {
+        if (originWs.settings.flowRoutingMode === "ask" && ctx?.hasUI) {
           if (typeof ctx?.ui?.confirm !== "function") return toolResult({ started: false, declined: true, reason: "Interactive confirmation unavailable under flowRoutingMode=ask." });
-          const ok = (await ctx.ui.confirm("启动多角色协作 Flow？", `角色链: ${roleIds.join(" → ")}\n目标: ${previewGoal}\n(可在 /settings → Plugins → omp-enhance 切换 flowRoutingMode)`)) === true;
-          if (!ok) return toolResult({ started: false, declined: true, reason: "User declined multi-role Flow dispatch; continue in single-agent mode." });
+          const ok = (await ctx.ui.confirm("启动后台专员协作 Flow？", `目录: ${targetWs.cwd}\n专员链: ${roleIds.join(" → ")}\n目标: ${previewGoal}`)) === true;
+          if (!ok) return toolResult({ started: false, declined: true, reason: "User declined multi-role Flow dispatch." });
         }
-        if (ws.room.isRunning()) throw new Error("已有正在运行的协作 Flow；可通过 steer 插话、/flow 查看或 cancel 取消。");
+        if (targetWs.room.isRunning()) throw new Error(`项目 ${targetWs.cwd} 已有正在运行的协作 Flow；可通过 steer 留言、/flow 查看或 cancel 取消。`);
 
         const flowId = `flow-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-        const mandate = goal ? ws.store.upsertMandate({ goal, flowId }) : existingMandate!;
+        const mandate = goal ? targetWs.store.upsertMandate({ goal, flowId }) : existingMandate!;
         const initialHandoffId = asString(params.initialHandoffId);
-        const initialHandoff = initialHandoffId ? ws.store.getHandoff(initialHandoffId) : (!goal ? ws.store.getLatestHandoff(mandate.id) : null);
-        const maxRepairRounds = typeof params.maxRepairRounds === "number" ? params.maxRepairRounds : ws.settings.flowMaxRepairRounds;
+        let initialHandoff: HandoffEnvelope | null = initialHandoffId
+          ? (targetWs.store.getHandoff(initialHandoffId) ?? (originWs !== targetWs ? originWs.store.getHandoff(initialHandoffId) : null))
+          : (!goal ? targetWs.store.getLatestHandoff(mandate.id) : (priorSessionMandate ? targetWs.store.getLatestHandoff(priorSessionMandate.id) : null));
+        if (!initialHandoff && targetWs.cwd === originWs.cwd) {
+          initialHandoff = hub.seedLocalChangesHandoff(originWs, sid, mandate, roles[0]!.id);
+        }
+
+        const maxRepairRounds = typeof params.maxRepairRounds === "number" ? params.maxRepairRounds : targetWs.settings.flowMaxRepairRounds;
         const background = params.wait === true ? false : Boolean(ctx?.hasUI);
-        return toolResult(await ws.startManagedFlow({ ctx, flowId, roles, mandate, initialHandoff, maxRepairRounds, background, ...(background ? {} : { signal }) }));
+        const started = await targetWs.startManagedFlow({
+          ctx, originWs, flowId, roles, mandate, initialHandoff, maxRepairRounds, background, ...(background ? {} : { signal }),
+        });
+        hub.syncGlobalUi(ctx, originWs);
+        return toolResult(started);
       } catch (error) { return toolError(error); }
     },
   });
 
   registerTool({
     name: "enhance_job", label: "Enhance Job", approval: "exec",
-    description: "Start, watch with adaptive supervision, list, reconcile, tail, or cancel background jobs.",
+    description: "Start, watch with adaptive supervision, list, reconcile, tail, or cancel background jobs (optionally scoped to cwd).",
     parameters: kit.obj({
       action: kit.en(["start", "watch", "list", "reconcile", "tail", "cancel"]),
-      command: kit.str(), jobId: kit.str(), mandateId: kit.str(), hypothesisId: kit.str(), initialDelaySec: kit.num(), goal: kit.str(),
+      cwd: kit.str(), command: kit.str(), jobId: kit.str(), mandateId: kit.str(),
+      hypothesisId: kit.str(), initialDelaySec: kit.num(), goal: kit.str(),
     }, ["action"]),
     async execute(params, ctx, signal) {
       try {
-        const ws = getWorkspace(ctx); ws.refresh(ctx);
-        const sid = ws.getSessionId(ctx), activeMandate = ws.store.getActiveMandate({ sessionId: sid });
-        return toolResult(await executeJobParams({
-          store: ws.store, cwd: ws.cwd, role: ws.getActiveRole(ctx), params, settings: ws.settings,
-          supervisor: ws.supervisorFor(ctx), defaultMandateId: activeMandate?.id ?? null, defaultGoal: activeMandate?.goal, signal,
-        }));
+        const originWs = hub.getWorkspace(ctx); originWs.refresh(ctx);
+        const reqCwd = asString(params.cwd), reqJobId = asString(params.jobId), action = asString(params.action);
+        const targetWs = reqCwd
+          ? hub.resolveTargetWorkspace(originWs, reqCwd, ctx)
+          : (reqJobId ? (hub.findWorkspaceByJobId(reqJobId) ?? originWs) : originWs);
+        targetWs.refresh(ctx);
+        if ((action === "list" || action === "reconcile") && !reqCwd && hub.listWorkspaces().length > 1) {
+          const perm = canRoleUseCompanionTool(originWs.getActiveRole(ctx), "enhance_job", action);
+          if (!perm.allowed) throw new Error(perm.reason);
+          return toolResult({ jobs: hub.getAllJobs() });
+        }
+        const sid = originWs.getSessionId(ctx), activeMandate = targetWs.store.getActiveMandate({ sessionId: sid });
+        const res = await executeJobParams({
+          store: targetWs.store, cwd: targetWs.cwd, role: originWs.getActiveRole(ctx), params, settings: targetWs.settings,
+          supervisor: targetWs.supervisorFor(ctx), defaultMandateId: activeMandate?.id ?? null, defaultGoal: activeMandate?.goal, signal,
+        });
+        hub.syncGlobalUi(ctx, originWs);
+        return toolResult(res);
       } catch (error) { return toolError(error); }
     },
   });

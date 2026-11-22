@@ -8,7 +8,8 @@ import ompEnhance from "../../src/entry.ts";
 import { createAndVerifyHandoff } from "../../src/flow/handoff.ts";
 import type { RoleSessionRunner } from "../../src/flow/orchestrator.ts";
 import {
-  parseFlowOverlayInput, renderChatBubbleLines, renderRoomCardLines, type FlowRoomSnapshot,
+  flowStatusIcon, openFlowRoomOverlay, parseFlowOverlayInput, renderChatBubbleLines,
+  renderMultiProjectWidgetLines, renderRoomCardLines, FlowRoomManager, type FlowRoomSnapshot,
 } from "../../src/ui/flow-room.ts";
 
 const builtinRolesDir = path.resolve(import.meta.dir, "..", "..", "roles");
@@ -85,9 +86,30 @@ describe("Left-Right Group Chat rendering & CJK alignment", () => {
       expect(Bun.stringWidth(line)).toBe(72);
     }
     expect(collapsed.join("\n")).not.toContain("1. ✓ read src/auth.ts");
-    expect(expanded.join("\n")).toContain("🔎 Agent 动作轨迹");
+    expect(expanded.join("\n")).toContain("🔎 专员动作轨迹");
     expect(expanded.join("\n")).toContain("1. ✓ read src/auth.ts");
     expect(expanded.join("\n")).toContain("2. ✓ edit src/auth.ts");
+
+    // High-3: read-only audit flow (status=completed + finalEnvelope.verdict=rejected) renders "✓ 审查完成（发现阻断项）" & "[inspected]"!
+    const auditSnap: FlowRoomSnapshot = {
+      ...snap,
+      roleChain: ["reviewer"],
+      stages: [{
+        ...snap.stages[0]!,
+        roleId: "reviewer",
+        status: "rejected",
+        envelope: {
+          id: "h-audit", mandateId: "m-1", mandateRev: 1, parentHandoffId: null,
+          fromRole: "reviewer", toTarget: "user", verdict: "rejected",
+          summary: "Found null dereference", feedbackForUpstream: "Line 12 dereferences null",
+          artifacts: [{ path: "src/auth.ts", sha256: "1234567890abcdef", byteSize: 42, role: "inspected" }],
+          verifiedFacts: [], openRisks: [], observedUsage: null, createdAt: new Date().toISOString(),
+        },
+      }],
+    };
+    const auditExpanded = renderRoomCardLines(auditSnap, 84, true).join("\n");
+    expect(auditExpanded).toContain("✓ 审查完成（发现阻断项）");
+    expect(auditExpanded).toContain("src/auth.ts#12345678 [inspected]");
   });
 });
 
@@ -274,7 +296,7 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
     const widgetComp = activeWidgetFactory({ requestRender() {} }, {});
     const widgetLines: string[] = widgetComp.render(76);
     for (const line of widgetLines) expect(Bun.stringWidth(line)).toBe(76);
-    expect(widgetLines.join("\n")).toContain("◀ 你");
+    expect(widgetLines.join("\n")).toContain("后台专员动态 (1 个项目活跃");
     expect(widgetLines.join("\n")).toContain("edit src/auth.ts");
 
     // 1) General steer goes immediately to dev AND propagates downstream to qa!
@@ -293,7 +315,7 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
     expect(steeredMessages).toEqual(["dev:别动旧 RefreshToken 表"]);
 
     releaseDev!();
-    for (let i = 0; i < 40 && sentMessages.length === 0; i++) await Bun.sleep(10);
+    for (let i = 0; i < 40 && !sentMessages.some((m) => m.customType === "omp-enhance-flow-event"); i++) await Bun.sleep(10);
 
     // Downstream qa received BOTH the general steer AND its queued [@qa] steer in conditioning!
     expect(qaConditioningPrompt).toContain("## User Interjections");
@@ -301,9 +323,9 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
     expect(qaConditioningPrompt).toContain("[@qa] 重点压测过期边界");
 
     expect(activeWidgetFactory).toBeUndefined();
-    expect(sentMessages.length).toBe(1);
-    const cardMsg = sentMessages[0]!;
-    expect(cardMsg.customType).toBe("omp-enhance-room");
+    const cardMsg = sentMessages.find((m) => m.customType === "omp-enhance-room")!;
+    expect(cardMsg).toBeDefined();
+    expect(cardMsg.excludeFromContext).toBe(true);
     const snap = cardMsg.details as FlowRoomSnapshot;
     expect(snap.status).toBe("completed");
     expect(snap.entries.map((e) => `${e.side}:${e.speaker}:${e.badge}`)).toEqual([
@@ -320,56 +342,97 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
     expect(renderedExpanded.join("\n")).toContain('bash "bun test"');
   });
 
-  test("drives split-pane /flow overlay: ↑↓ inspector, [@role] bracket typing, Alt+[/] scroll, Ctrl+X cancel, and multiline @role input", async () => {
-    let releaseStage = null as (() => void) | null;
-    let aborted = false;
-    const steered: string[] = [];
+  test("runs concurrent multi-project Flows (cwdA & cwdB), drives read-only /flow monitor switcher, pauses on needs_input, wakes coordinator with triggerTurn: true, and resumes with user answer", async () => {
+    const cwdA = makeTempDir("hub-proj-a");
+    const cwdB = makeTempDir("hub-proj-b");
+    const globalDir = makeTempDir("hub-global");
+    const lockPath = path.join(cwdA, "omp-plugins.lock.json");
+    writeText(lockPath, JSON.stringify({ settings: { "omp-enhance": { flowRoutingMode: "auto" } } }));
 
-    const slowRunner: RoleSessionRunner = {
+    let releaseA = null as (() => void) | null;
+    let abortedA = false;
+    let bTurnCount = 0;
+    let bResumedPrompt = "";
+
+    const hubRunner: RoleSessionRunner = {
       async runRoleTurn(stepCtx) {
         const stageId = stepCtx.stageId ?? stepCtx.role.id;
-        const c1: ObservedToolCall = {
-          toolCallId: "t1", toolName: "read", isError: false,
+        const call: ObservedToolCall = {
+          toolCallId: `tc-${path.basename(stepCtx.cwd)}-${bTurnCount}`, toolName: "read", isError: false,
           touchedPaths: [], timestamp: new Date().toISOString(), summary: "read src/index.ts",
         };
-        stepCtx.observer?.onToolEnd?.(stageId, c1);
-        stepCtx.observer?.bindControls?.({
-          steer: async (m) => { steered.push(m); },
-          abort: async () => { aborted = true; releaseStage?.(); },
-        }, stageId);
-        await new Promise<void>((resolve) => { releaseStage = resolve; });
-        return {
-          envelope: null, observedCalls: [c1], assistantText: "", usage: null,
-          ...(aborted ? { cancelledByUser: true } : {}),
-        };
+        stepCtx.observer?.onToolEnd?.(stageId, call);
+        if (stepCtx.cwd === cwdA) {
+          stepCtx.observer?.bindControls?.({
+            steer: async () => {},
+            abort: async () => { abortedA = true; releaseA?.(); },
+          }, stageId);
+          await new Promise<void>((resolve) => { releaseA = resolve; });
+          if (abortedA) return { envelope: null, observedCalls: [call], assistantText: "", usage: null, cancelledByUser: true };
+          const env = createAndVerifyHandoff({
+            store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
+            toTarget: stepCtx.toTarget, verdict: "ready", summary: "Project A finished", observedCalls: [call],
+          });
+          return { envelope: env, observedCalls: [call], assistantText: "A ok", usage: null };
+        }
+
+        bTurnCount += 1;
+        if (bTurnCount === 1) {
+          const env = createAndVerifyHandoff({
+            store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
+            toTarget: stepCtx.toTarget, verdict: "needs_input", summary: "Project B needs DB choice",
+            questionsForUser: ["Use SQLite or Postgres for Project B?"], observedCalls: [call],
+          });
+          return { envelope: env, observedCalls: [call], assistantText: "need input", usage: null };
+        }
+        bResumedPrompt = stepCtx.conditioningPrompt;
+        const env = createAndVerifyHandoff({
+          store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
+          parentHandoffId: stepCtx.upstreamHandoff?.id ?? null, toTarget: stepCtx.toTarget,
+          verdict: "ready", summary: "Project B shipped with SQLite", observedCalls: [call],
+        });
+        return { envelope: env, observedCalls: [call], assistantText: "B done", usage: null };
       },
     };
 
-    const { cwd, handlers, commands } = setupHarness({ flowRoutingMode: "auto" }, slowRunner);
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const tools = new Map<string, any>();
+    const commands = new Map<string, any>();
+    const sentCalls: Array<{ msg: any; opts: any }> = [];
 
-    // Verify multiline @<roleId> <task> preservation vs @file pass-through!
-    const inputFn = handlers.get("input")![0]!;
-    expect(inputFn({ text: "@qa 跑一下鉴权测试\n- 空串\n- 过期" }, { cwd })).toEqual({
-      text: "/flow qa 跑一下鉴权测试\n- 空串\n- 过期",
-    });
-    expect(inputFn({ text: "@src/auth.ts 解释一下这段代码" }, { cwd })).toBeUndefined();
-    expect(inputFn({ text: "@supervisor 检查" }, { cwd })).toBeUndefined();
+    const pi = {
+      cwd: cwdA,
+      on(ev: string, fn: (...args: any[]) => any) { handlers.set(ev, [...(handlers.get(ev) ?? []), fn]); },
+      registerTool(spec: any) { tools.set(spec.name, spec); },
+      registerCommand(name: string, spec: any) { commands.set(name, spec); },
+      registerMessageRenderer() {},
+      sendMessage(msg: any, opts: any) { sentCalls.push({ msg, opts }); },
+      getAllTools: () => [{ name: "read" }, { name: "grep" }, { name: "write" }, { name: "bash" }],
+      async setActiveTools() {},
+      pi: { settings: {} },
+    };
 
-    // Verify Kitty CSI-u, literal `[` / `]` typing when draft is empty, and Alt+[/] / PgUp scrolling!
+    ompEnhance(pi, { globalRolesDir: globalDir, builtinRolesDir, pluginLockPath: lockPath, runnerFactory: () => hubRunner });
+
+    // Verify read-only monitor key bindings (Tab, [, ], ←, →, PgUp/PgDn, Ctrl+X, Esc/q, no text events!)
+    expect(parseFlowOverlayInput("\t")).toEqual({ kind: "next_project" });
+    expect(parseFlowOverlayInput("]")).toEqual({ kind: "next_project" });
+    expect(parseFlowOverlayInput("[")).toEqual({ kind: "prev_project" });
+    expect(parseFlowOverlayInput("\x1b[C")).toEqual({ kind: "next_project" });
+    expect(parseFlowOverlayInput("\x1b[D")).toEqual({ kind: "prev_project" });
+    expect(parseFlowOverlayInput("\x1b[")).toEqual({ kind: "scroll_up" });
+    expect(parseFlowOverlayInput("\x1b]")).toEqual({ kind: "scroll_down" });
+    expect(parseFlowOverlayInput("\x1b[5~")).toEqual({ kind: "scroll_up" });
     expect(parseFlowOverlayInput("\x1b[120;5u")).toEqual({ kind: "cancel_flow" });
-    expect(parseFlowOverlayInput("\x1b[27::27;1:1u")).toEqual({ kind: "escape" });
-    expect(parseFlowOverlayInput("[", undefined, false)).toEqual({ kind: "text", text: "[" });
-    expect(parseFlowOverlayInput("]", undefined, false)).toEqual({ kind: "text", text: "]" });
-    expect(parseFlowOverlayInput("\x1b[", undefined, false)).toEqual({ kind: "scroll_up" });
-    expect(parseFlowOverlayInput("\x1b]", undefined, false)).toEqual({ kind: "scroll_down" });
-    expect(parseFlowOverlayInput("\x1b[5~", undefined, false)).toEqual({ kind: "scroll_up" });
-    expect(parseFlowOverlayInput("\x1b[200~请加单飞锁\x1b[201~")).toEqual({ kind: "text", text: "请加单飞锁" });
+    expect(parseFlowOverlayInput("q")).toEqual({ kind: "escape" });
 
-    let capturedComp = null as any;
+    let capturedComp: any = null;
+    let liveWidgetFactory: any = null;
     const ctx = {
-      cwd, hasUI: true,
+      cwd: cwdA,
+      hasUI: true,
       ui: {
-        setWidget() {},
+        setWidget(_k: string, factory: any) { liveWidgetFactory = factory; },
         setStatus() {},
         notify() {},
         async custom(factory: any) {
@@ -380,46 +443,234 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
       },
     };
 
-    await commands.get("flow")!.handler("dev,qa 修复并发锁", ctx);
-    for (let i = 0; i < 20 && !releaseStage; i++) await Bun.sleep(5);
+    // Activate /coord first so coordinator auto-wakeup (triggerTurn: true) is active!
+    await commands.get("coord")!.handler("", ctx);
+    sentCalls.length = 0;
 
+    const flowTool = tools.get("enhance_flow")!;
+    // 1) Start Flow A in cwdA (stays running) AND Flow B in cwdB concurrently!
+    const startA = JSON.parse((await flowTool.execute("fa", { roles: ["dev"], goal: "Build Service A" }, null, null, ctx)).content[0].text);
+    expect(startA).toMatchObject({ started: true, cwd: cwdA, status: "running" });
+    for (let i = 0; i < 20 && !releaseA; i++) await Bun.sleep(5);
+
+    // Per-project single-writer guard blocks a second Flow on cwdA while cwdA is running...
+    const dupA = await flowTool.execute("fa-dup", { roles: ["dev"], goal: "Conflict A" }, null, null, ctx);
+    expect(dupA.isError).toBe(true);
+
+    // ...but allows Flow B in cwdB to run concurrently!
+    const startB = JSON.parse((await flowTool.execute("fb", { cwd: cwdB, roles: ["planner"], goal: "Plan Service B" }, null, null, ctx)).content[0].text);
+    expect(startB).toMatchObject({ started: true, cwd: cwdB, status: "running" });
+
+    // Wait for Flow B to settle into waiting_input and fire silent coordinator auto-wakeup (display: false)!
+    for (let i = 0; i < 40 && !sentCalls.some((c) => c.msg.customType === "omp-enhance-flow-event"); i++) await Bun.sleep(10);
+    const wakeEvent = sentCalls.find((c) => c.msg.customType === "omp-enhance-flow-event")!;
+    expect(wakeEvent.msg.display).toBe(false);
+    expect(wakeEvent.msg.excludeFromContext).toBe(false);
+    expect(wakeEvent.msg.content).toContain("waiting_input");
+    expect(wakeEvent.msg.content).toContain("Use SQLite or Postgres for Project B?");
+    expect(wakeEvent.opts).toEqual({ triggerTurn: true, deliverAs: "followUp" });
+
+    // Medium-3: Multi-project aboveEditor widget renders BOTH running cwdA (●) and waiting_input cwdB (?) simultaneously!
+    expect(liveWidgetFactory).not.toBeNull();
+    const multiWidgetLines: string[] = liveWidgetFactory({ requestRender() {} }, {}).render(92);
+    for (const line of multiWidgetLines) expect(Bun.stringWidth(line)).toBe(92);
+    const multiWidgetText = multiWidgetLines.join("\n");
+    expect(multiWidgetText).toContain("2 个项目活跃");
+    expect(multiWidgetText).toContain(`● [${path.basename(cwdA)}]`);
+    expect(multiWidgetText).toContain(`? [${path.basename(cwdB)}]`);
+
+    // Verify enhance_flow(action="list") reports both cwdA (running) and cwdB (waiting_input, resumable: true)
+    const listed = JSON.parse((await flowTool.execute("fl", { action: "list" }, null, null, ctx)).content[0].text);
+    expect(listed.flows).toHaveLength(2);
+    expect(listed.flows.find((f: any) => f.cwd === cwdA)?.status).toBe("running");
+    expect(listed.flows.find((f: any) => f.cwd === cwdB)).toMatchObject({ status: "waiting_input", resumable: true });
+
+    // Verify coordinator conditioning includes Multi-Project Active Workloads!
+    const startHookOut = await handlers.get("before_agent_start")![0]!({ systemPrompt: [] }, ctx);
+    await handlers.get("agent_end")![0]!({ messages: [] }, ctx);
+    const coordSys = (startHookOut as { systemPrompt: string[] }).systemPrompt.join("\n");
+    expect(coordSys).toContain("## Multi-Project Active Workloads");
+    expect(coordSys).toContain(startA.flowId);
+    expect(coordSys).toContain(startB.flowId);
+
+    // 2) Open read-only /flow monitor: switch between Project A and Project B with Tab, inspect traces, cancel Project A with Ctrl+X, close with q!
     const overlayPromise = commands.get("flow")!.handler("", ctx);
     await Bun.sleep(5);
     expect(capturedComp).not.toBeNull();
-    expect(capturedComp.capturesInput()).toBe(true);
+    const frameA: string[] = capturedComp.render(96);
+    for (const line of frameA) expect(Bun.stringWidth(line)).toBe(96);
+    expect(frameA.join("\n")).toContain("只读监控窗");
+    expect(frameA.join("\n")).not.toContain("💬");
+    expect(frameA.join("\n")).toContain(path.basename(cwdA));
 
-    const initialFrame: string[] = capturedComp.render(92);
-    for (const line of initialFrame) expect(Bun.stringWidth(line)).toBe(92);
-    expect(initialFrame.join("\n")).toContain("1. ✓ read src/index.ts");
+    capturedComp.handleInput("\t");
+    const frameB = capturedComp.render(104).join("\n");
+    expect(frameB).toContain("? 待你确认");
+    expect(frameB).toContain("待用户确认问题 (1):");
+    expect(frameB).toContain("Use SQLite or Postgres for Project B?");
 
-    capturedComp.handleInput("\x1b[A");
-    expect(capturedComp.render(92).join("\n")).toContain("发言者: 你 (目标)");
-    capturedComp.handleInput("\x1b[B");
-    expect(capturedComp.render(92).join("\n")).toContain("Agent: dev");
-
-    // Typing `[@dev]` at empty draft works without swallowing `[`!
+    // Switch back to Project A with `[` and emergency-stop it with Ctrl+X!
     capturedComp.handleInput("[");
-    capturedComp.handleInput("@dev] ");
-    capturedComp.handleInput("\x1b[200~加单飞锁X\x1b[201~");
-    capturedComp.handleInput("\x1b[127;1:1u");
-    expect(capturedComp.render(92).join("\n")).toContain("💬 你: [@dev] 加单飞锁█");
-    capturedComp.handleInput("\x1b[13;1:1u");
-    await Bun.sleep(10);
-    expect(steered).toEqual(["加单飞锁"]);
-    expect(capturedComp.render(92).join("\n")).toContain("你插话: 加单飞锁");
-
-    capturedComp.handleInput("temp");
-    capturedComp.handleInput("\x1b[27;1:1u");
     capturedComp.handleInput("\x1b[120;5u");
     await Bun.sleep(15);
-    expect(aborted).toBe(true);
-    expect(capturedComp.render(92).join("\n")).toContain("⏹ 已取消");
-
-    capturedComp.handleInput("\x1b[27;1:1u");
+    expect(abortedA).toBe(true);
+    expect(capturedComp.render(96).join("\n")).toContain("⏹ 已取消");
+    capturedComp.handleInput("q");
     await overlayPromise;
+
+    // 3) Resume Flow B by flowId with user's answer in `message` -> wakes coordinator silently (display: false) on completion!
+    sentCalls.length = 0;
+    const resumedB = JSON.parse((await flowTool.execute("fb-res", {
+      action: "resume", flowId: startB.flowId, message: "Use SQLite with WAL mode",
+    }, null, null, ctx)).content[0].text);
+    expect(resumedB).toMatchObject({ resumed: true, flowId: startB.flowId, cwd: cwdB });
+
+    for (let i = 0; i < 40 && !sentCalls.some((c) => c.msg.customType === "omp-enhance-flow-event"); i++) await Bun.sleep(10);
+    expect(bResumedPrompt).toContain("## User Interjections");
+    expect(bResumedPrompt).toContain("Use SQLite with WAL mode");
+    const completedWake = sentCalls.find((c) => c.msg.customType === "omp-enhance-flow-event")!;
+    expect(completedWake.msg.display).toBe(false);
+    expect(completedWake.msg.excludeFromContext).toBe(false);
+    expect(completedWake.msg.content).toContain("[Flow Event · completed]");
+    expect(completedWake.msg.content).toContain("Project B shipped with SQLite");
+    expect(completedWake.opts).toEqual({ triggerTurn: true, deliverAs: "followUp" });
+
+    // 4) Medium-4: coordinator blocks enhance_job(start), while /coord off allows enhance_job(start, cwd=cwdB)!
+    const blockedJob = await tools.get("enhance_job")!.execute("jb-block", {
+      action: "start", cwd: cwdB, command: "echo no-direct-shell",
+    }, null, null, ctx);
+    expect(blockedJob.isError).toBe(true);
+    await commands.get("coord")!.handler("off", ctx);
+    const jobRes = JSON.parse((await tools.get("enhance_job")!.execute("jb-b", {
+      action: "start", cwd: cwdB, command: "echo multi-project-ok",
+    }, null, null, ctx)).content[0].text);
+    expect(jobRes.job.cwd).toBe(cwdB);
+    await handlers.get("session_shutdown")?.[0]?.({}, ctx);
   });
 
-  test("applies defaultRole on session_start, steers @role mid-flow, queues followUp when foreground streams, and keeps /role ANSI-safe", async () => {
+  test("deduplicates mid-turn pendingWakeups when enhance_flow(status) already observed settlement, merges remaining wakeups on agent_end, and selects active /flow tab + error icons", async () => {
+    const cwdHub = makeTempDir("dedup-hub");
+    const cwdOne = makeTempDir("dedup-one");
+    const cwdTwo = makeTempDir("dedup-two");
+    const cwdThree = makeTempDir("dedup-three");
+    const globalDir = makeTempDir("dedup-global");
+    const lockPath = path.join(cwdHub, "omp-plugins.lock.json");
+    writeText(lockPath, JSON.stringify({ settings: { "omp-enhance": { flowRoutingMode: "auto" } } }));
+
+    // Verify status icons mapping (Medium-3)
+    expect(flowStatusIcon("running")).toBe("●");
+    expect(flowStatusIcon("waiting_input")).toBe("?");
+    expect(flowStatusIcon("completed")).toBe("✓");
+    expect(flowStatusIcon("interrupted")).toBe("⏸");
+    expect(flowStatusIcon("cancelled")).toBe("⏸");
+    for (const errSt of ["blocked", "rejected_max_rounds", "stagnated", "violation", "aborted_by_supervisor", "failed"]) {
+      expect(flowStatusIcon(errSt)).toBe("!");
+    }
+    expect(flowStatusIcon("idle")).toBe("○");
+
+    // Verify openFlowRoomOverlay defaults initial projectIdx to first active/non-idle project and renders `!` on failed/blocked!
+    const idleRoom = new FlowRoomManager(undefined, undefined, cwdHub);
+    const failedRoom = new FlowRoomManager(undefined, undefined, cwdOne);
+    failedRoom.beginFlow({ goal: "Broken deploy", roleChain: ["dev"] });
+    failedRoom.failFlow(new Error("boom"));
+    let overlayFrame = "";
+    await openFlowRoomOverlay({
+      ctx: {
+        cwd: cwdHub, hasUI: true,
+        ui: {
+          async custom(factory: any) {
+            await new Promise<void>((resolve) => {
+              const comp = factory({ requestRender() {} }, {}, null, () => resolve());
+              overlayFrame = comp.render(92).join("\n");
+              comp.handleInput("q");
+            });
+          },
+        },
+      },
+      targets: [
+        { cwd: cwdHub, room: idleRoom },
+        { cwd: cwdOne, room: failedRoom },
+      ],
+    });
+    // Selected tab defaults to index 1 (failedRoom, non-idle) with `!` error icon instead of idle index 0!
+    expect(overlayFrame).toContain(`▸[2/2 ! ${path.basename(cwdOne)}]`);
+    expect(overlayFrame).toContain("Broken deploy");
+
+    // Verify renderMultiProjectWidgetLines caps at 4 active projects cleanly
+    const fiveRooms = [0, 1, 2, 3, 4].map((i) => {
+      const r = new FlowRoomManager(undefined, undefined, `/tmp/proj-${i}`);
+      r.beginFlow({ goal: `Goal ${i}`, roleChain: ["dev"] });
+      return { cwd: `/tmp/proj-${i}`, room: r };
+    });
+    const cappedWidget = renderMultiProjectWidgetLines(fiveRooms, 80);
+    expect(cappedWidget).toHaveLength(6); // top border + 4 project lines + footer
+    expect(cappedWidget.at(-1)).toContain("(+1 个项目)");
+
+    // High-2: Mid-turn pendingWakeups deduplication + single merged agent_end flush!
+    const fastRunner: RoleSessionRunner = {
+      async runRoleTurn(stepCtx) {
+        const call: ObservedToolCall = { toolCallId: `c-${path.basename(stepCtx.cwd)}`, toolName: "read", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+        const env = createAndVerifyHandoff({
+          store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
+          toTarget: stepCtx.toTarget, verdict: "ready", summary: `Done ${path.basename(stepCtx.cwd)}`, observedCalls: [call],
+        });
+        return { envelope: env, observedCalls: [call], assistantText: "ok", usage: null };
+      },
+    };
+
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const tools = new Map<string, any>();
+    const commands = new Map<string, any>();
+    const sentEvents: Array<{ msg: any; opts: any }> = [];
+    const pi = {
+      cwd: cwdHub,
+      on(ev: string, fn: (...args: any[]) => any) { handlers.set(ev, [...(handlers.get(ev) ?? []), fn]); },
+      registerTool(spec: any) { tools.set(spec.name, spec); },
+      registerCommand(name: string, spec: any) { commands.set(name, spec); },
+      registerMessageRenderer() {},
+      sendMessage(msg: any, opts: any) { if (msg.customType === "omp-enhance-flow-event") sentEvents.push({ msg, opts }); },
+      getAllTools: () => [{ name: "read" }],
+      async setActiveTools() {},
+      pi: { settings: {} },
+    };
+    ompEnhance(pi, { globalRolesDir: globalDir, builtinRolesDir, pluginLockPath: lockPath, runnerFactory: () => fastRunner });
+
+    let streaming = false;
+    const ctx = { cwd: cwdHub, hasUI: true, isIdle: () => !streaming, ui: { setWidget() {}, setStatus() {}, notify() {} } };
+    await commands.get("coord")!.handler("", ctx);
+
+    // Open a foreground coordinator turn (streaming = true)
+    streaming = true;
+    await handlers.get("before_agent_start")![0]!({ systemPrompt: [] }, ctx);
+
+    const flowTool = tools.get("enhance_flow")!;
+    const s1 = JSON.parse((await flowTool.execute("d1", { cwd: cwdOne, roles: ["reviewer"], goal: "Audit 1" }, null, null, ctx)).content[0].text);
+    const s2 = JSON.parse((await flowTool.execute("d2", { cwd: cwdTwo, roles: ["reviewer"], goal: "Audit 2" }, null, null, ctx)).content[0].text);
+    const s3 = JSON.parse((await flowTool.execute("d3", { cwd: cwdThree, roles: ["reviewer"], goal: "Audit 3" }, null, null, ctx)).content[0].text);
+
+    // Wait for all 3 background flows to finish while coordinator is STILL mid-turn -> held in pendingWakeups, 0 sentEvents!
+    await Bun.sleep(40);
+    expect(sentEvents).toHaveLength(0);
+
+    // Coordinator calls enhance_flow(status, flowId=s1.flowId) mid-turn -> s1 is ALREADY seen and consumed!
+    const status1 = JSON.parse((await flowTool.execute("st-1", { action: "status", flowId: s1.flowId }, null, null, ctx)).content[0].text);
+    expect(status1.status).toBe("completed");
+
+    // Turn ends (agent_end) -> s2 and s3 flush together in ONE single merged omp-enhance-flow-event (and s1 is NOT duplicated)!
+    streaming = false;
+    await handlers.get("agent_end")![0]!({ messages: [] }, ctx);
+    expect(sentEvents).toHaveLength(1);
+    expect(sentEvents[0]!.msg.display).toBe(false);
+    expect(sentEvents[0]!.msg.excludeFromContext).toBe(false);
+    expect(sentEvents[0]!.opts).toEqual({ triggerTurn: true, deliverAs: "followUp" });
+    expect(sentEvents[0]!.msg.content).not.toContain(s1.flowId);
+    expect(sentEvents[0]!.msg.content).toContain(s2.flowId);
+    expect(sentEvents[0]!.msg.content).toContain(s3.flowId);
+
+    await handlers.get("session_shutdown")?.[0]?.({}, ctx);
+  });
+
+  test("applies configured defaultRole on session_start, queues followUp when foreground streams, and keeps /role ANSI-safe", async () => {
     let releaseRun = null as (() => void) | null;
     const activeToolSets: string[][] = [];
     const sentCalls: Array<{ msg: any; opts: any }> = [];
@@ -431,12 +682,13 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
 
     const handlers = new Map<string, Array<(...args: any[]) => any>>();
     const commands = new Map<string, any>();
+    const tools = new Map<string, any>();
     const pi = {
       cwd,
       on(ev: string, fn: (...args: any[]) => any) {
         const list = handlers.get(ev) ?? []; list.push(fn); handlers.set(ev, list);
       },
-      registerTool() {},
+      registerTool(spec: any) { tools.set(spec.name, spec); },
       registerCommand(name: string, spec: any) { commands.set(name, spec); },
       registerMessageRenderer() {},
       sendMessage(msg: any, opts: any) { sentCalls.push({ msg, opts }); },
@@ -494,22 +746,16 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
     };
 
     await commands.get("role")!.handler("", ctx);
-    await commands.get("flow")!.handler("dev 实现缓存层", ctx);
+    // Start read-only reviewer Flow while activeRole is reviewer (non-dispatch -> triggerTurn: false on event!)
+    await tools.get("enhance_flow")!.execute("f-rev", { roles: ["reviewer"], goal: "审查缓存层" }, null, null, ctx);
     for (let i = 0; i < 20 && !releaseRun; i++) await Bun.sleep(5);
 
-    const inputFn = handlers.get("input")![0]!;
-    expect(inputFn({ text: "@dev 记得加 LRU 上限" }, ctx)).toEqual({
-      text: "/flow steer [@dev] 记得加 LRU 上限",
-    });
-
     releaseRun!();
-    for (let i = 0; i < 30 && sentCalls.length === 0; i++) await Bun.sleep(10);
+    for (let i = 0; i < 30 && sentCalls.length < 2; i++) await Bun.sleep(10);
     expect(sentCalls[0]?.msg.customType).toBe("omp-enhance-room");
     expect(sentCalls[0]?.opts).toEqual({ triggerTurn: false, deliverAs: "followUp" });
-
-    expect(inputFn({ text: "@qa 验证 LRU 淘汰" }, ctx)).toEqual({
-      text: "/flow qa 验证 LRU 淘汰",
-    });
+    expect(sentCalls[1]?.msg.customType).toBe("omp-enhance-flow-event");
+    expect(sentCalls[1]?.opts).toEqual({ triggerTurn: false, deliverAs: "followUp" });
   });
 
   test("supports algo mid-turn visual consultation to vision (@vision) with stacked controls & verifiedFacts", async () => {

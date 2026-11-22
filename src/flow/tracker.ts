@@ -2,9 +2,10 @@ import { TurnTracker } from "../core/policy.ts";
 
 export {
   COMPANION_TOOL_NAMES, DEFAULT_READONLY_TOOLS, MUTATING_HOST_TOOLS, READONLY_SUBAGENTS, TurnTracker,
-  WRITE_TOOLS, canRoleDelegateTo, canRoleUseCompanionTool, checkToolCallAllowed, extractTaskSubagents,
-  extractWriteTargetPaths, hasWriteBoundary, isCompanionTool, isRoleReadOnly, isValidExecutionEvidence,
-  resolveRoleActiveTools, roleAllowsBash, summarizeToolCall,
+  WRITE_TOOLS, canRoleDelegateTo, canRoleDispatch, canRoleUseCompanionTool, checkToolCallAllowed,
+  extractTaskSubagents, extractWriteTargetPaths, hasWriteBoundary, isCompanionTool, isInternalRole,
+  isRoleReadOnly, isValidExecutionEvidence, resolveEffectiveActiveTools, resolveRoleActiveTools,
+  roleAllowsBash, summarizeToolCall,
 } from "../core/policy.ts";
 
 /** Per-session TurnTracker registry isolating workspace baselines & calls across conversations. */

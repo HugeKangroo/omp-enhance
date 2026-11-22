@@ -4,7 +4,7 @@ import {
   diffSnapshots, findBoundaryViolations, matchesGlobList, normalizeRelPath, snapshotWorkspace,
   type SnapshotEntry,
 } from "../core/fs.ts";
-import { hasWriteBoundary, isValidExecutionEvidence } from "../core/policy.ts";
+import { hasWriteBoundary, isRoleReadOnly, isValidExecutionEvidence } from "../core/policy.ts";
 import type { EnhanceStore } from "../core/store.ts";
 import type {
   ArtifactRecord, HandoffEnvelope, HandoffVerdict, Mandate, ObservedToolCall, RoleSpec,
@@ -64,6 +64,7 @@ export interface CreateHandoffInput {
   observedCalls?: readonly ObservedToolCall[];
   verifiedFacts?: readonly VerifiedFact[];
   openRisks?: readonly string[];
+  questionsForUser?: readonly string[];
   feedbackForUpstream?: string | null;
   observedUsage?: UsageSummary | null;
 }
@@ -75,6 +76,8 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
   if (input.verdict === "rejected" && !feedbackForUpstream) {
     throw new Error("A rejected handoff requires concrete reproduction/mismatch feedback in feedbackForUpstream.");
   }
+  const rawQuestions = (input.questionsForUser ?? []).map((q) => q.trim()).filter(Boolean);
+  const questionsForUser = rawQuestions.length > 0 ? rawQuestions : (input.verdict === "needs_input" ? [summary] : []);
   const observedCalls = input.observedCalls ?? [];
   if (
     input.verdict === "ready" && input.role.exit.requireToolEvidence &&
@@ -112,9 +115,11 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
     .filter((relPath) => after.has(relPath))
     .map((relPath): ArtifactRecord => {
       const entry = after.get(relPath)!;
+      const beforeSha = input.baselineSnapshot?.get(relPath)?.sha256;
+      const unchanged = beforeSha !== undefined ? beforeSha === entry.sha256 : isRoleReadOnly(input.role);
       return {
         path: relPath, sha256: entry.sha256, byteSize: entry.byteSize,
-        role: matchesGlobList(relPath, TEST_GLOBS) ? "test" : "changed",
+        role: unchanged ? "inspected" : (matchesGlobList(relPath, TEST_GLOBS) ? "test" : "changed"),
       };
     })
     .sort((left, right) => left.path.localeCompare(right.path));
@@ -191,8 +196,9 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
     parentHandoffId: input.parentHandoffId ?? null, fromRole: input.role.id,
     toTarget: input.toTarget ?? "user", verdict: input.verdict, summary, artifacts,
     ...(deletedFiles.length > 0 ? { deletedFiles } : {}), verifiedFacts,
-    openRisks: [...(input.openRisks ?? [])], feedbackForUpstream,
-    observedUsage: input.observedUsage ?? null, createdAt: new Date().toISOString(),
+    openRisks: [...(input.openRisks ?? [])],
+    ...(questionsForUser.length > 0 ? { questionsForUser } : {}),
+    feedbackForUpstream, observedUsage: input.observedUsage ?? null, createdAt: new Date().toISOString(),
   };
   input.store.recordArtifacts(mandate.id, artifacts);
   input.store.saveHandoff(envelope);

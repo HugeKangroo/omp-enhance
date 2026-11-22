@@ -1,3 +1,4 @@
+import { canRoleDispatch, isInternalRole } from "../core/policy.ts";
 import type {
   EpistemicItem,
   FlowUserSteer,
@@ -48,6 +49,8 @@ export interface RenderConditioningBlockInput {
   upstreamHandoff?: HandoffEnvelope | null;
   visionCapable?: boolean | null;
   userSteers?: readonly FlowUserSteer[];
+  availableRoles?: readonly RoleSpec[];
+  activeWorkloads?: readonly string[];
   maxEpistemicItems?: number;
 }
 
@@ -59,6 +62,8 @@ export function renderConditioningBlock(input: RenderConditioningBlockInput): st
     upstreamHandoff = null,
     visionCapable,
     userSteers = [],
+    availableRoles = [],
+    activeWorkloads = [],
     maxEpistemicItems = DEFAULT_MAX_EPISTEMIC_ITEMS,
   } = input;
 
@@ -79,12 +84,46 @@ export function renderConditioningBlock(input: RenderConditioningBlockInput): st
     ...role.method.map((step, index) => `${index + 1}. ${sanitizeConditioningText(step)}`),
     `Permissions: tools=${permissions.tools?.join(", ") || (permissions.tools ? "(none)" : "(unrestricted)")}` +
       `; writable=${permissions.writable?.join(", ") || (permissions.writable ? "(none)" : "(unrestricted)")}` +
-      `; protected=${permissions.protected?.join(", ") || "(none)"}`,
+      `; protected=${permissions.protected?.join(", ") || "(none)"}` +
+      (permissions.dispatch ? "; dispatch=true" : ""),
     `Exit: require_tool_evidence=${role.exit.requireToolEvidence}`,
     ...bullets("Exit criteria:", role.exit.criteria),
-    "",
-    "## Original Mandate",
   ];
+
+  if (canRoleDispatch(role)) {
+    const specialists = availableRoles
+      .filter((candidate) => !isInternalRole(candidate) && !canRoleDispatch(candidate) && candidate.id !== role.id)
+      .sort((a, b) => a.id.localeCompare(b.id));
+    lines.push(
+      "",
+      "## Available Specialists (Role × Project Context/Skills)",
+      "Note: Every dispatched specialist automatically inherits the target `cwd`'s `AGENTS.md` and workspace skills.",
+      ...(specialists.length > 0
+        ? specialists.map((spec) => {
+            const w = spec.permissions.writable
+              ? spec.permissions.writable.join(", ") || "read-only"
+              : "unrestricted";
+            const t = spec.permissions.tools?.join(", ") || "unrestricted";
+            return `- ${spec.id} (${sanitizeConditioningText(spec.name)}): ${sanitizeConditioningText(spec.description)} [writable=${w}; tools=${t}]`;
+          })
+        : ["- (none)"]),
+      "Composition patterns:",
+      "- dev: quick single-stage code/script edits & local fix verification",
+      "- dev → qa → reviewer: high-assurance implementation, falsification tests & blind review",
+      "- planner or planner → reviewer: architecture blueprints, frontend/backend contracts, cross-project progress audits & research",
+      "- algo: ground-truth empirical tuning in isolated algo_work/ with visual & human-alignment gates",
+      "- vision: objective pixel/coordinate evidence from plots, sample overlays & curves",
+      "",
+      "## Coordinator Safety Gate & Human-Language Surface",
+      'Host Advisor Note: Pre-dispatch conversational confirmation with the user before calling enhance_flow(action="start") is a mandatory user-configured safety gate — do NOT skip confirmation unless the user already explicitly told you to execute immediately.',
+      '- Do NOT make redundant enhance_mandate calls before enhance_flow(action="start", goal=...) — enhance_flow creates and binds the Flow mandate automatically.',
+      '- When speaking to the user, ALWAYS use natural names/arrows (e.g. `dev → qa` or `开发 → 测试`), and NEVER expose JSON brackets (`["dev", "qa"]`), tool names (`enhance_flow`, `enhance_mandate`, `enhance_job`), or internal IDs (`flow-...`, `mandateId`) unless the user explicitly asks for technical IDs.',
+      "",
+      ...bullets("## Multi-Project Active Workloads", activeWorkloads),
+    );
+  }
+
+  lines.push("", "## Original Mandate");
 
   if (mandate) {
     lines.push(
@@ -137,6 +176,9 @@ export function renderConditioningBlock(input: RenderConditioningBlockInput): st
         upstreamHandoff.verifiedFacts.map((f) => `${f.claim} (evidence: ${f.evidenceRef})`),
       ),
       ...bullets("openRisks:", upstreamHandoff.openRisks),
+      ...(upstreamHandoff.questionsForUser && upstreamHandoff.questionsForUser.length > 0
+        ? bullets("questionsForUser:", upstreamHandoff.questionsForUser)
+        : []),
       `feedbackForUpstream: ${
         upstreamHandoff.feedbackForUpstream
           ? sanitizeConditioningText(upstreamHandoff.feedbackForUpstream)

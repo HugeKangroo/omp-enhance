@@ -1,14 +1,14 @@
 import path from "node:path";
-import type { FlowRunResult } from "../core/types.ts";
-import { createAndVerifyHandoff } from "../flow/handoff.ts";
-import { executeRoleStep } from "../flow/orchestrator.ts";
+import { canRoleDispatch, isInternalRole } from "../core/policy.ts";
 import { reconcileJobs } from "../jobs/runner.ts";
 import {
-  cloneRoleSpec, deleteCustomRole, discoverRoles, hasBuiltinRole, scaffoldRoleFile,
+  cloneRoleSpec, deleteCustomRole, discoverRoles, hasBuiltinRole, listUserVisibleRoles,
+  scaffoldRoleFile, serializeRoleYaml,
 } from "../roles/loader.ts";
 import { openFlowRoomOverlay } from "../ui/flow-room.ts";
 import { openRoleEditor, openRoleStudioHome, type RoleStudioDeps } from "../ui/role-studio.ts";
-import type { WorkspaceRuntime } from "./tools.ts";
+import type { WorkspaceHub } from "./hub.ts";
+import { defaultRoleId, type ManagedWorkspace } from "./workspace.ts";
 
 const KNOWN_CREATE_FLAGS = new Set(["--project", "--readonly", "--overwrite"]);
 const KNOWN_COPY_FLAGS = new Set(["--project", "--overwrite"]);
@@ -19,9 +19,76 @@ function splitHeadAndRest(raw: string): { head: string; rest: string } {
   return idx < 0 ? { head: trimmed, rest: "" } : { head: trimmed.slice(0, idx), rest: trimmed.slice(idx).trim() };
 }
 
+function renderMultiProjectFlowStatus(hub: WorkspaceHub, primaryWs: ManagedWorkspace): string {
+  const targets = hub.getMonitorTargets(primaryWs);
+  const lines = ["跨项目后台专员监控 (/flow status)"];
+  for (const t of targets) {
+    const snap = t.room.getSnapshot();
+    const chain = snap.roleChain.length > 0 ? snap.roleChain.join(" → ") : "待命";
+    const stageInfo = snap.roleChain.length > 0 ? ` · 阶段 ${(snap.currentIndex ?? 0) + 1}/${snap.roleChain.length}` : "";
+    lines.push(`• ${t.cwd}`);
+    lines.push(`  状态: ${snap.status}${t.room.isResumable() ? " (可续跑)" : ""} · Flow: ${snap.flowId ?? "无"} · 专员链: ${chain}${stageInfo}`);
+    if (snap.goal) lines.push(`  目标: ${snap.goal}`);
+    if (snap.reason) lines.push(`  说明: ${snap.reason}`);
+  }
+  lines.push("提示: 派发或续跑任务请敲 /coord 用自然语言吩咐总秘书 · 紧急停止敲 /flow cancel [flowId]");
+  return lines.join("\n");
+}
+
+function renderCoordStatusCard(
+  hub: WorkspaceHub, ws: ManagedWorkspace, ctx: any,
+): { uiText: string; cmdOutText: string } {
+  const activeId = ws.getSessionRoleId(ctx);
+  const visible = listUserVisibleRoles(ws.roles);
+  const s = ws.settings;
+  const targets = hub.getMonitorTargets(ws);
+  const uiProjects: string[] = [];
+  const metaProjects: string[] = [];
+
+  for (const t of targets) {
+    const w = hub.getWorkspace(t.cwd, ctx);
+    if (!w.store.isClosed()) {
+      try { reconcileJobs(w.store); } catch {}
+    }
+    const snap = w.room.getSnapshot();
+    const jobs = !w.store.isClosed() ? w.store.listJobs() : [];
+    const runningJobs = jobs.filter((j) => j.status === "running").length;
+    const flowDetail = snap.flowId ? `${snap.status} (${snap.roleChain.join(" → ")})` : snap.status;
+    uiProjects.push(`  - ${w.cwd} · 协作流=${flowDetail} · 后台任务=${runningJobs}/${jobs.length}`);
+    metaProjects.push(`- ${w.cwd} · flow=${snap.flowId ? `${snap.status} (${snap.flowId}: ${snap.roleChain.join("→")})` : snap.status} · jobs=${runningJobs}/${jobs.length}`);
+  }
+
+  const modeDesc = activeId === "coordinator"
+    ? "总秘书运行中 (coordinator)"
+    : activeId
+      ? `前台覆写角色 (${activeId})`
+      : "标准原生 OMP (off)";
+
+  const uiText = [
+    "SuperAgent 总控状态",
+    `• 当前模式: ${modeDesc}`,
+    `• 可用编制: ${visible.length} 个角色 (${visible.map((r) => r.id).join(", ")})`,
+    `• 运行设置: 默认模式=${s.defaultRole ?? "off"} · 督导模型=${s.supervisorModel} (${s.supervisorThinking}) · 最大返修=${s.flowMaxRepairRounds}轮 · 派单确认=${s.flowRoutingMode}`,
+    "• 受管项目:",
+    ...uiProjects,
+    "提示: /coord 开启总秘书 · /coord off 退回标准 OMP · /role 配置专员模型 · /flow 打开只读监控窗",
+  ].join("\n");
+
+  const cmdOutText = [
+    uiText,
+    `Active role: ${activeId ?? "off"}`,
+    `Visible roles: ${visible.length} (${visible.map((r) => r.id).join(", ")})`,
+    `Settings: defaultRole=${s.defaultRole ?? "off"}, supervisorModel=${s.supervisorModel}, supervisorThinking=${s.supervisorThinking}, flowMaxRepairRounds=${s.flowMaxRepairRounds}, flowRoutingMode=${s.flowRoutingMode}`,
+    "Projects:",
+    ...metaProjects,
+  ].join("\n");
+
+  return { uiText, cmdOutText };
+}
+
 export function registerEnhanceCommands(
   pi: any,
-  getWorkspace: (ctx: any) => WorkspaceRuntime,
+  hub: WorkspaceHub,
   options: { globalRolesDir: string; builtinRolesDir?: string },
 ): void {
   const completeRoleIds = (prefix: string, extras: readonly string[] = []) => {
@@ -34,90 +101,60 @@ export function registerEnhanceCommands(
       const q = prefix.trim().toLowerCase();
       return [
         ...extras.map((v) => ({ value: v, label: v })),
-        ...[...roles.values()]
-          .sort((a, b) => a.id.localeCompare(b.id))
-          .map((r) => ({ value: r.id, label: r.id, description: `[${r.source}] ${r.description || r.name}` })),
+        ...listUserVisibleRoles(roles).map((r) => ({
+          value: r.id, label: r.id, description: `[${r.source}] ${r.description || r.name}`,
+        })),
       ].filter((item) => !q || item.value.toLowerCase().startsWith(q));
     } catch {
       return [];
     }
   };
 
-  const handoffHandler = async (args: string, ctx: any): Promise<void> => {
-    const ws = getWorkspace(ctx);
-    ws.refresh(ctx);
-    let targetId = args.trim().split(/\s+/)[0] ?? "";
-    if (!targetId && ctx?.hasUI && typeof ctx?.ui?.select === "function") {
-      const candidates = [...ws.roles.values()]
-        .filter((r) => r.id !== "supervisor")
-        .sort((a, b) => a.id.localeCompare(b.id));
-      const picked: string | undefined = await ctx.ui.select(
-        "Handoff current work to which isolated stage role?",
-        candidates.map((r) => `${r.id} — ${r.description || r.name}`),
-        { outline: true },
-      );
-      if (!picked) return;
-      targetId = picked.split(" — ", 1)[0]?.trim() ?? "";
-    }
-    if (targetId === "supervisor") {
-      return ws.emitMessage(ctx, 'Role "supervisor" is an internal monitor and cannot be a handoff target.');
-    }
-    const target = ws.roles.get(targetId);
-    if (!target) {
-      return ws.emitMessage(ctx, targetId ? `Unknown role "${targetId}".` : "Usage: /enhance-handoff [targetRole]");
-    }
-    try {
-      const sid = ws.getSessionId(ctx);
-      const tracker = ws.trackers.get(sid);
-      const mandate =
-        ws.store.getActiveMandate({ sessionId: sid }) ??
-        ws.store.upsertMandate({ goal: "Handoff initiated from current workspace state", sessionId: sid });
-      const seedRole = ws.getActiveRole(ctx) ?? ws.roles.get("dev") ?? ws.roles.get("general")!;
-      const upstream =
-        ws.store.getLatestHandoff(mandate.id) ??
-        createAndVerifyHandoff({
-          store: ws.store,
-          role: { ...seedRole, exit: { requireToolEvidence: false, criteria: [] } },
-          cwd: ws.cwd,
-          mandate,
-          sessionId: sid,
-          toTarget: target.id,
-          verdict: "ready",
-          summary: "Automatic workspace snapshot handoff",
-          baselineSnapshot: tracker.getBaselineSnapshot(ws.cwd),
-          baselineConfigSnapshot: tracker.getBaselineConfigSnapshot(ws.cwd),
-          observedCalls: tracker.getObservedCalls(),
-        });
-      const result = await executeRoleStep({
-        cwd: ws.cwd,
-        store: ws.store,
-        role: target,
-        mandate: ws.store.getMandate(upstream.mandateId) ?? mandate,
-        upstreamHandoff: upstream,
-        toTarget: "user",
-        runner: ws.runnerFor(ctx),
-        supervisor: ws.supervisorFor(ctx),
-      });
-      ws.emitMessage(
-        ctx,
-        JSON.stringify(
-          {
-            ok: result.ok,
-            targetRole: target.id,
-            upstreamHandoffId: upstream.id,
-            ...(result.ok ? { envelope: result.envelope } : { status: result.status, reason: result.reason }),
-          },
-          null,
-          2,
-        ),
-      );
-    } catch (error) {
-      ws.emitMessage(ctx, JSON.stringify({ ok: false, targetRole: target.id, error: String(error) }, null, 2));
-    }
-  };
+  pi.registerCommand("coord", {
+    description: "开启或退出 SuperAgent 总秘书模式 (/coord, /coord off, /coord status).",
+    getArgumentCompletions: (prefix: string) => {
+      const q = prefix.trim().toLowerCase();
+      return ["on", "off", "status", "toggle"]
+        .filter((v) => !q || v.startsWith(q))
+        .map((v) => ({ value: v, label: v }));
+    },
+    handler: async (args: string, ctx: any) => {
+      try {
+        const ws = hub.getWorkspace(ctx);
+        ws.refresh(ctx);
+        const { head } = splitHeadAndRest(args);
+        const sub = head.toLowerCase();
+        if (sub === "status") {
+          const { uiText, cmdOutText } = renderCoordStatusCard(hub, ws, ctx);
+          return ws.emitMessage(ctx, uiText, { cmdOutText });
+        }
+        const curRoleId = ws.getSessionRoleId(ctx);
+        if (sub === "off" || (sub === "toggle" && curRoleId === "coordinator")) {
+          await ws.applyActiveRole(null, ctx, true);
+          const uiText = "○ 已关闭总秘书模式，退回标准原生 OMP。";
+          return ws.emitMessage(ctx, uiText, { cmdOutText: `${uiText}\nActive role: off` });
+        }
+        if (!sub || sub === "on" || sub === "toggle") {
+          const coord = ws.roles.get("coordinator");
+          if (!coord) return ws.emitMessage(ctx, '未找到内置角色 "coordinator"。');
+          if (curRoleId === coord.id) {
+            ws.syncStatusBar(ctx);
+            const uiText = "✓ 总秘书模式已在运行中 — 直接用自然语言吩咐任务即可（输入 /coord off 退回标准 OMP）。";
+            return ws.emitMessage(ctx, uiText, { cmdOutText: `${uiText}\nActive role: ${coord.id} [${coord.source}]` });
+          }
+          await ws.applyActiveRole(coord.id, ctx, true);
+          const uiText = "✓ 总秘书模式已开启 — 直接用自然语言描述需求，方案确认后自动派发后台专员（输入 /coord off 退回标准 OMP）。";
+          return ws.emitMessage(ctx, uiText, { cmdOutText: `${uiText}\nActive role: ${coord.id} [${coord.source}]` });
+        }
+        return ws.emitMessage(ctx, "用法: /coord (开启总秘书) | /coord off (退回标准 OMP) | /coord status (跨项目状态概览)");
+      } catch (err) {
+        hub.getWorkspace(ctx).emitMessage(ctx, err instanceof Error ? err.message : String(err));
+      }
+    },
+  });
 
   pi.registerCommand("role", {
-    description: "Open split-pane Role Studio, or switch, copy, delete, edit, create, list, show, and disable YAML roles.",
+    description: "打开专员配置工作台 (/role)，或创建、拷贝、删除、查看角色编制.",
     getArgumentCompletions: (prefix: string) => {
       if (/^(?:show|edit|copy)\s+/i.test(prefix)) {
         const head = prefix.match(/^(?:show|edit|copy)\s+/i)![0];
@@ -135,7 +172,7 @@ export function registerEnhanceCommands(
     },
     handler: async (args: string, ctx: any) => {
       try {
-        const ws = getWorkspace(ctx);
+        const ws = hub.getWorkspace(ctx);
         ws.refresh(ctx);
         const studioDeps = (): RoleStudioDeps => ({
           cwd: ws.cwd,
@@ -148,40 +185,38 @@ export function registerEnhanceCommands(
           getSettings: () => ws.settings,
           getActiveRoleId: () => ws.getSessionRoleId(ctx),
           activateRole: (id) => ws.applyActiveRole(id, ctx, true),
-          runHandoff: (id) => handoffHandler(id, ctx),
         });
         const { head, rest } = splitHeadAndRest(args);
         const trimmed = args.trim();
         if (ctx?.hasUI && (!trimmed || head === "studio")) return openRoleStudioHome(studioDeps());
         if (head === "edit") {
           if (!ctx?.hasUI) return ws.emitMessage(ctx, "Interactive UI required for /role edit.");
-          return rest && ws.roles.has(rest) ? openRoleEditor(rest, studioDeps()) : openRoleStudioHome(studioDeps());
+          const candidate = rest ? ws.roles.get(rest) : undefined;
+          if (rest && (rest === "supervisor" || isInternalRole(candidate))) {
+            return ws.emitMessage(ctx, '角色 "supervisor" 为内部督导组件，请在 /settings → Plugins → omp-enhance 中配置。');
+          }
+          return candidate ? openRoleEditor(rest, studioDeps()) : openRoleStudioHome(studioDeps());
         }
         if (!trimmed || head === "list") {
           const activeId = ws.getSessionRoleId(ctx);
-          const lines = [`Roles (${ws.roles.size})`];
-          for (const r of [...ws.roles.values()].sort((a, b) => a.id.localeCompare(b.id))) {
+          const visible = listUserVisibleRoles(ws.roles);
+          const lines = [`专员与总控编制 (${visible.length}) · 当前前台: ${activeId ?? "off"}`];
+          for (const r of visible) {
+            const tag = canRoleDispatch(r) ? "[总控入口]" : "[后台专员]";
             lines.push(
-              `${activeId === r.id ? "*" : " "} ${r.id} [${r.source}]${r.model ? ` (${r.model})` : ""} ${r.description}`.trimEnd(),
+              `${activeId === r.id ? "*" : " "} ${r.id} ${tag} [${r.source}]${r.model ? ` (${r.model})` : ""} — ${r.description || r.name}`.trimEnd(),
             );
           }
           return ws.emitMessage(ctx, lines.join("\n"));
         }
         if (head === "show") {
           const r = ws.roles.get(rest);
+          if (rest === "supervisor" || (r && isInternalRole(r))) {
+            return ws.emitMessage(ctx, '角色 "supervisor" 为内部督导组件，不可直接查看或激活；请在 /settings → Plugins → omp-enhance 中配置。');
+          }
           if (!r) return ws.emitMessage(ctx, `Unknown role "${rest}".`);
-          return ws.emitMessage(
-            ctx,
-            JSON.stringify(
-              {
-                id: r.id, name: r.name, description: r.description, source: r.source,
-                model: r.model ?? null, thinking: r.thinking ?? null, filePath: r.filePath,
-                stance: r.stance, method: r.method, permissions: r.permissions, exit: r.exit,
-              },
-              null,
-              2,
-            ),
-          );
+          const header = `# Role: ${r.id} [${r.source}] (${r.filePath})`;
+          return ws.emitMessage(ctx, `${header}\n${serializeRoleYaml(r).trimEnd()}`);
         }
         if (head === "create") {
           const tokens = rest.split(/\s+/).filter(Boolean);
@@ -190,6 +225,9 @@ export function registerEnhanceCommands(
           const [roleId, ...desc] = positional;
           if (!roleId || desc.length === 0) {
             return ws.emitMessage(ctx, "Usage: /role create <id> [--project] [--readonly] <description>");
+          }
+          if (roleId === "supervisor") {
+            return ws.emitMessage(ctx, 'Role id "supervisor" is reserved for the internal supervisor.');
           }
           try {
             const targetDir = flags.has("--project") ? path.join(ws.cwd, ".omp", "roles") : ws.globalRolesDir;
@@ -213,7 +251,7 @@ export function registerEnhanceCommands(
           const [srcId, newId, ...desc] = tokens.filter((t) => !KNOWN_COPY_FLAGS.has(t));
           if (!srcId || !newId) return ws.emitMessage(ctx, "Usage: /role copy <sourceId> <newId> [--project] [description]");
           const srcRole = ws.roles.get(srcId);
-          if (!srcRole) return ws.emitMessage(ctx, `Unknown source role "${srcId}".`);
+          if (!srcRole || isInternalRole(srcRole)) return ws.emitMessage(ctx, `Unknown source role "${srcId}".`);
           try {
             const targetDir = flags.has("--project") ? path.join(ws.cwd, ".omp", "roles") : ws.globalRolesDir;
             const cloned = cloneRoleSpec({
@@ -232,14 +270,7 @@ export function registerEnhanceCommands(
             deleteCustomRole({ id: rest, cwd: ws.cwd, globalRolesDir: ws.globalRolesDir, builtinRolesDir: ws.builtinRolesDir });
             ws.refresh(ctx);
             if (ws.getSessionRoleId(ctx) === rest) {
-              const fb = ws.settings.defaultRole === null
-                ? null
-                : ws.roles.has(ws.settings.defaultRole)
-                  ? ws.settings.defaultRole
-                  : ws.roles.has("general")
-                    ? "general"
-                    : null;
-              await ws.applyActiveRole(fb, ctx, true);
+              await ws.applyActiveRole(defaultRoleId(ws.roles, ws.settings), ctx, true);
             }
             return ws.emitMessage(ctx, `Deleted custom role "${rest}".`);
           } catch (err) {
@@ -248,160 +279,92 @@ export function registerEnhanceCommands(
         }
         if (head === "off") {
           await ws.applyActiveRole(null, ctx, true);
-          return ws.emitMessage(ctx, "Role conditioning disabled.");
+          const uiText = "○ 已关闭总秘书模式，退回标准原生 OMP。";
+          return ws.emitMessage(ctx, uiText, { cmdOutText: `${uiText}\nActive role: off` });
         }
-        const role = ws.roles.get(trimmed);
-        if (!role) return ws.emitMessage(ctx, `Unknown role "${trimmed}". Use /role list.`);
+
+        const rawTokens = trimmed.split(/\s+/).filter(Boolean);
+        const forceForeground = rawTokens.includes("--foreground");
+        const roleIdToken = rawTokens.find((t) => t !== "--foreground") ?? "";
+        const role = ws.roles.get(roleIdToken);
+        if (roleIdToken === "supervisor" || (role && isInternalRole(role))) {
+          return ws.emitMessage(ctx, '角色 "supervisor" 为内部督导组件，不可直接激活；请在 /settings → Plugins → omp-enhance 中配置。');
+        }
+        if (!role) return ws.emitMessage(ctx, `Unknown role "${roleIdToken}". Use /role list.`);
+
+        if (!canRoleDispatch(role) && !forceForeground) {
+          if (ctx?.hasUI && typeof ctx?.ui?.select === "function") return openRoleEditor(role.id, studioDeps());
+          return ws.emitMessage(
+            ctx,
+            [
+              `# Role: ${role.id} [${role.source}] — ${role.description || role.name}`,
+              `模型=${role.model ?? "inherit"} · 推理=${role.thinking ?? "inherit"}`,
+              "提示: 后台专员由 /coord 总秘书自动调度，不会接管当前前台会话；如需定制模型请在 /role 面板配置。",
+            ].join("\n"),
+          );
+        }
+
         await ws.applyActiveRole(role.id, ctx, true);
+        if (canRoleDispatch(role)) {
+          const uiText = "✓ 总秘书模式已开启 — 直接用自然语言描述需求，方案确认后自动派发后台专员（输入 /coord off 退回标准 OMP）。";
+          return ws.emitMessage(ctx, uiText, { cmdOutText: `${uiText}\nActive role: ${role.id} [${role.source}]` });
+        }
         ws.emitMessage(ctx, `Active role: ${role.id} [${role.source}]`);
       } catch (err) {
-        getWorkspace(ctx).emitMessage(ctx, err instanceof Error ? err.message : String(err));
+        hub.getWorkspace(ctx).emitMessage(ctx, err instanceof Error ? err.message : String(err));
       }
     },
-  });
-
-  pi.registerCommand("enhance-handoff", {
-    description: "Hand the latest verified work (or a workspace snapshot) to an isolated stage role.",
-    getArgumentCompletions: (prefix: string) =>
-      prefix.includes(" ") ? [] : completeRoleIds(prefix).filter((c) => c.value !== "supervisor"),
-    handler: handoffHandler,
   });
 
   pi.registerCommand("flow", {
-    description: "Open split-pane Flow Room & Action Inspector (/flow), or start, continue, steer, inspect, and cancel multi-role Flows.",
+    description: "打开跨项目只读监控窗 (/flow)、查看进度 (/flow status) 或紧急停止 (/flow cancel [flowId]).",
     getArgumentCompletions: (prefix: string) => {
-      if (prefix.includes(" ")) return [];
-      const idx = prefix.lastIndexOf(",");
-      if (idx >= 0) {
-        const head = prefix.slice(0, idx + 1), tail = prefix.slice(idx + 1);
-        return completeRoleIds(tail).filter((c) => c.value !== "supervisor").map((c) => ({ ...c, value: `${head}${c.value}` }));
+      if (/^cancel\s+/i.test(prefix)) {
+        const head = prefix.match(/^cancel\s+/i)![0];
+        const q = prefix.slice(head.length).trim().toLowerCase();
+        return hub.getAllFlowSummaries()
+          .filter((s) => s.status === "running" && s.flowId && (!q || s.flowId.toLowerCase().startsWith(q)))
+          .map((s) => ({ value: `${head}${s.flowId}`, label: s.flowId!, description: s.cwd }));
       }
-      return completeRoleIds(prefix, ["hub", "continue", "resume", "status", "steer ", "cancel"]).filter((c) => c.value !== "supervisor");
+      const q = prefix.trim().toLowerCase();
+      return ["status", "cancel"]
+        .filter((v) => !q || v.startsWith(q))
+        .map((v) => ({ value: v, label: v }));
     },
     handler: async (args: string, ctx: any) => {
-      const ws = getWorkspace(ctx);
-      ws.refresh(ctx);
-      const { head: first, rest: restRaw } = splitHeadAndRest(args);
-      if (!first || first === "hub" || first === "room") {
-        return ctx?.hasUI
-          ? openFlowRoomOverlay({
-              ctx, room: ws.room,
-              onFollowUp: (msg) => ws.dispatchFollowUpFromRoom(ctx, msg),
-              onResume: async () => { await ws.resumeManagedFlow(ctx, true); },
-            })
-          : ws.emitMessage(ctx, JSON.stringify({ ...ws.room.getSnapshot(), resumable: ws.room.isResumable() }, null, 2));
-      }
-      if (first === "status") {
-        return ws.emitMessage(ctx, JSON.stringify({ ...ws.room.getSnapshot(), resumable: ws.room.isResumable() }, null, 2));
-      }
-      if (first === "continue" || first === "resume") {
-        try {
-          if (ctx?.hasUI) {
-            const r = (await ws.resumeManagedFlow(ctx, true)) as { startIndex: number; roleChain: string[] };
-            ctx?.ui?.notify?.(`已从阶段 ${r.startIndex + 1}/${r.roleChain.length} (${r.roleChain[r.startIndex]}) 断点续跑 Flow`, "info");
-            return;
-          }
-          const result = (await ws.resumeManagedFlow(ctx, false)) as FlowRunResult;
-          return ws.emitMessage(ctx, JSON.stringify({
-            status: result.status, reason: result.reason,
-            steps: result.steps.map((s) => ({
-              stepIndex: s.stepIndex, roleId: s.roleId, round: s.round,
-              verdict: s.envelope.verdict, summary: s.envelope.summary, envelopeId: s.envelope.id,
-            })),
-            finalEnvelopeId: result.finalEnvelope?.id ?? null,
-          }, null, 2));
-        } catch (error) {
-          return ws.emitMessage(ctx, JSON.stringify({ status: "error", error: String(error) }, null, 2));
-        }
-      }
-      if (first === "cancel" || first === "stop") {
-        const ok = await ws.room.cancelActiveFlow(ctx);
-        ws.syncStatusBar(ctx);
-        return ws.emitMessage(ctx, ok ? "已中止当前协作 Flow。" : "当前没有运行中的协作 Flow。");
-      }
-      if (first === "steer") {
-        if (!restRaw) return ws.emitMessage(ctx, "Usage: /flow steer <message>");
-        const res = await ws.room.postUserSteer(restRaw, ctx);
-        const label = res.delivered
-          ? `已实时插话至当前阶段 (${res.activeStageId}): ${restRaw}`
-          : res.queuedForRole
-            ? `已为 @${res.queuedForRole} 排队定向留言: ${restRaw}`
-            : `已记录群聊留言: ${restRaw}`;
-        return ws.emitMessage(ctx, label);
-      }
-
-      const roleIds = first.split(",").map((id) => id.trim()).filter(Boolean);
-      if (roleIds.length === 0) {
-        return ws.emitMessage(ctx, "Usage: /flow [hub|continue|status|steer <msg>|cancel|<role1,role2,...> [goal]]");
-      }
       try {
-        const roles = roleIds.map((id) => {
-          if (id === "supervisor") throw new Error('Role "supervisor" cannot run as a Flow stage.');
-          const r = ws.roles.get(id);
-          if (!r) throw new Error(`Unknown role "${id}".`);
-          return r;
-        });
-        if (ws.room.isRunning()) {
-          throw new Error("已有正在运行的协作 Flow；可通过 steer 插话、/flow 查看或 cancel 取消。");
+        const ws = hub.getWorkspace(ctx);
+        ws.refresh(ctx);
+        const { head: first, rest: restRaw } = splitHeadAndRest(args);
+        if (!first || first === "hub" || first === "room" || first === "monitor") {
+          return ctx?.hasUI
+            ? openFlowRoomOverlay({ ctx, getTargets: () => hub.getMonitorTargets(ws) })
+            : ws.emitMessage(ctx, renderMultiProjectFlowStatus(hub, ws));
         }
-        const sid = ws.getSessionId(ctx);
-        const existingMandate = restRaw ? null : ws.store.getActiveMandate({ sessionId: sid });
-        if (!restRaw && !existingMandate) throw new Error("Provide a goal or set an active mandate first.");
-        const flowId = `flow-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-        const mandate = restRaw ? ws.store.upsertMandate({ goal: restRaw, flowId }) : existingMandate!;
-        const initialHandoff = !restRaw ? ws.store.getLatestHandoff(mandate.id) : null;
-        if (ctx?.hasUI) {
-          await ws.startManagedFlow({
-            ctx, flowId, roles, mandate, initialHandoff,
-            maxRepairRounds: ws.settings.flowMaxRepairRounds, background: true, initiatorText: restRaw || mandate.goal,
-          });
-          ctx?.ui?.notify?.(`已启动协作 Flow: ${roleIds.join(" → ")} (输入 /flow 打开双栏群聊与检查器)`, "info");
-          return;
+        if (first === "status") {
+          return ws.emitMessage(ctx, renderMultiProjectFlowStatus(hub, ws));
         }
-        const result = (await ws.startManagedFlow({
-          ctx, flowId, roles, mandate, initialHandoff,
-          maxRepairRounds: ws.settings.flowMaxRepairRounds, background: false, initiatorText: restRaw || mandate.goal,
-        })) as FlowRunResult;
-        ws.emitMessage(ctx, JSON.stringify({
-          status: result.status, reason: result.reason,
-          steps: result.steps.map((s) => ({
-            stepIndex: s.stepIndex, roleId: s.roleId, round: s.round,
-            verdict: s.envelope.verdict, summary: s.envelope.summary, envelopeId: s.envelope.id,
-          })),
-          finalEnvelopeId: result.finalEnvelope?.id ?? null,
-        }, null, 2));
-      } catch (error) {
-        ws.emitMessage(ctx, JSON.stringify({ status: "error", error: String(error) }, null, 2));
+        if (first === "cancel" || first === "stop") {
+          const targetWs = hub.resolveFlowWorkspace(
+            ws,
+            { flowId: restRaw || undefined },
+            ctx,
+            (w) => w.room.isRunning(),
+          );
+          const ok = await targetWs.room.cancelActiveFlow(ctx);
+          hub.syncGlobalUi(ctx, ws);
+          return ws.emitMessage(
+            ctx,
+            ok ? `已中止项目 ${targetWs.cwd} 的协作 Flow。` : "当前没有正在运行的协作 Flow。",
+          );
+        }
+        return ws.emitMessage(
+          ctx,
+          "用法: /flow (打开跨项目只读监控窗) | /flow status | /flow cancel [flowId] — 派发或续跑任务请敲 /coord 用自然语言吩咐总秘书。",
+        );
+      } catch (err) {
+        hub.getWorkspace(ctx).emitMessage(ctx, err instanceof Error ? err.message : String(err));
       }
-    },
-  });
-
-  pi.registerCommand("enhance-status", {
-    description: "Show active role, settings, mandate, epistemic board, latest handoff, flow room, and jobs.",
-    handler: async (_args: string, ctx: any) => {
-      const ws = getWorkspace(ctx);
-      ws.refresh(ctx);
-      reconcileJobs(ws.store);
-      const sid = ws.getSessionId(ctx);
-      const mandate = ws.store.getActiveMandate({ sessionId: sid }) ?? ws.store.getActiveMandate();
-      const latest = mandate ? ws.store.getLatestHandoff(mandate.id) : ws.store.getLatestHandoff();
-      const flowSnap = ws.room.getSnapshot();
-      ws.emitMessage(ctx, JSON.stringify({
-        activeRoleId: ws.getSessionRoleId(ctx),
-        roleCount: ws.roles.size,
-        settings: ws.settings,
-        flow: {
-          flowId: flowSnap.flowId, status: flowSnap.status, currentIndex: flowSnap.currentIndex,
-          resumable: ws.room.isResumable(), roleChain: flowSnap.roleChain,
-        },
-        activeMandate: mandate ? { id: mandate.id, rev: mandate.rev, goal: mandate.goal, status: mandate.status } : null,
-        epistemicCount: mandate ? ws.store.listEpistemicItems(mandate.id).length : 0,
-        latestHandoff: latest ? {
-          id: latest.id, fromRole: latest.fromRole, toTarget: latest.toTarget,
-          verdict: latest.verdict, summary: latest.summary, createdAt: latest.createdAt,
-        } : null,
-        jobs: ws.store.listJobs().map((j) => ({ jobId: j.jobId, status: j.status, exitCode: j.exitCode, command: j.command })),
-      }, null, 2));
     },
   });
 }

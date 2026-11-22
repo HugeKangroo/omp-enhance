@@ -3,6 +3,7 @@ name: 运行期巡检与止损监控员
 description: 周期性巡检长耗时后台作业或角色会话的增量脉搏，执行继续观察、实时纠偏（steer）或异常中断（abort）
 model: "@advisor"
 thinking: inherit
+internal: true
 
 stance: |
   保护正常长时推进、果断阻断无效空转：任务耗时久本身绝不是中断理由；

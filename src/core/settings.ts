@@ -42,14 +42,14 @@ const clampInt = (value: number, min: number, max: number): number =>
   Math.min(max, Math.max(min, Math.round(value)));
 
 export const DEFAULT_ENHANCE_SETTINGS: EnhanceSettings = {
-  defaultRole: "general",
+  defaultRole: null,
   showStatusBar: true,
   supervisorEnabled: true,
   supervisorModel: "@advisor",
   supervisorThinking: "inherit",
   supervisorInitialDelaySec: 30,
   flowMaxRepairRounds: 2,
-  flowRoutingMode: "ask",
+  flowRoutingMode: "auto",
 };
 
 export interface LoadEnhanceSettingsOptions {

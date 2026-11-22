@@ -37,6 +37,7 @@ export interface RolePermissions {
   tools?: string[];
   writable?: string[];
   protected?: string[];
+  dispatch?: boolean;
 }
 
 export interface RoleExitSpec {
@@ -51,6 +52,7 @@ export interface RoleSpec {
   /** Explicit "inherit" overrides builtin defaults (e.g. supervisor) to inherit session model. */
   model?: "inherit" | (string & {});
   thinking?: RoleThinkingLevel;
+  internal?: boolean;
   stance: string;
   method: string[];
   permissions: RolePermissions;
@@ -95,7 +97,7 @@ export interface EpistemicItem {
   createdAt: string;
 }
 
-export type ArtifactRole = "input" | "changed" | "test" | "report" | "metrics";
+export type ArtifactRole = "input" | "inspected" | "changed" | "test" | "report" | "metrics";
 
 export interface ArtifactRecord {
   path: string;
@@ -115,7 +117,7 @@ export interface UsageSummary {
   costUsd: number;
 }
 
-export type HandoffVerdict = "ready" | "rejected" | "blocked";
+export type HandoffVerdict = "ready" | "needs_input" | "rejected" | "blocked";
 
 export interface HandoffEnvelope {
   id: string;
@@ -130,6 +132,7 @@ export interface HandoffEnvelope {
   deletedFiles?: string[];
   verifiedFacts: VerifiedFact[];
   openRisks: string[];
+  questionsForUser?: string[];
   feedbackForUpstream: string | null;
   observedUsage: UsageSummary | null;
   createdAt: string;
@@ -161,7 +164,7 @@ export interface FlowStageTrace {
   roleId: string;
   roleName: string;
   round: number;
-  status: "running" | "ready" | "rejected" | "blocked" | "violation" | "aborted";
+  status: "running" | "ready" | "needs_input" | "rejected" | "blocked" | "violation" | "aborted";
   modelLabel: string;
   startedAt: string;
   endedAt: string | null;
@@ -238,6 +241,7 @@ export interface FlowUserSteer {
 export type FlowRoomStatus =
   | "idle"
   | "running"
+  | "waiting_input"
   | "interrupted"
   | "completed"
   | "blocked"
@@ -249,6 +253,7 @@ export interface PersistedFlowCheckpoint {
   flowId: string;
   mandateId: string;
   goal: string;
+  cwd?: string;
   roleChain: string[];
   status: string;
   currentIndex: number;
@@ -274,12 +279,14 @@ export interface FlowStepResult {
 export interface FlowRunResult {
   status:
     | "completed"
+    | "waiting_input"
     | "rejected_max_rounds"
     | "stagnated"
     | "blocked"
     | "violation"
     | "aborted_by_supervisor"
     | "cancelled";
+  cwd?: string;
   steps: FlowStepResult[];
   finalEnvelope: HandoffEnvelope | null;
   reason?: string;

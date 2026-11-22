@@ -26,8 +26,12 @@ const STRICT_READONLY_BLOCKED_TOOLS = new Set<string>([
   "write", "edit", "apply_patch", "ast_edit", "eval",
   "manage_skill", "learn", "memory_edit", "retain", "context_notes", "new_context",
 ]);
+const COORDINATOR_BLOCKED_DIRECT_TOOLS = new Set<string>([...MUTATING_HOST_TOOLS]);
+const FG_COORD_HINT = "(/coord off 退回标准 OMP，或 /coord 切回总秘书)";
 
 export const isCompanionTool = (toolName: string): boolean => (COMPANION_TOOL_NAMES as readonly string[]).includes(toolName);
+export const isInternalRole = (role: RoleSpec | null | undefined): boolean => Boolean(role?.internal || role?.id === "supervisor");
+export const canRoleDispatch = (role: RoleSpec | null | undefined): boolean => Boolean(role?.permissions.dispatch);
 export function isRoleReadOnly(role: RoleSpec | null | undefined): boolean {
   if (!role) return false;
   return role.permissions.writable !== undefined ? role.permissions.writable.length === 0 : (role.permissions.protected ?? []).includes("**");
@@ -41,9 +45,9 @@ export function roleAllowsBash(role: RoleSpec | null | undefined): boolean {
 
 export function canRoleDelegateTo(fromRole: RoleSpec | null | undefined, targetRole: RoleSpec | null | undefined): { allowed: boolean; reason?: string } {
   if (!targetRole) return { allowed: false, reason: "Unknown delegation target role." };
-  if (targetRole.id === "supervisor") return { allowed: false, reason: 'Role "supervisor" is an internal monitor and cannot be delegated to.' };
+  if (isInternalRole(targetRole)) return { allowed: false, reason: `Role "${targetRole.id}" is an internal monitor and cannot be delegated to.` };
   if (fromRole && fromRole.id === targetRole.id) return { allowed: false, reason: `Role "${fromRole.id}" cannot delegate to itself.` };
-  if (fromRole && isRoleReadOnly(fromRole) && !isRoleReadOnly(targetRole)) {
+  if (fromRole && isRoleReadOnly(fromRole) && !canRoleDispatch(fromRole) && !isRoleReadOnly(targetRole)) {
     return { allowed: false, reason: `Read-only role "${fromRole.id}" cannot escalate write privileges by delegating to "${targetRole.id}".` };
   }
   return { allowed: true };
@@ -52,7 +56,20 @@ export function canRoleDelegateTo(fromRole: RoleSpec | null | undefined, targetR
 export function canRoleUseCompanionTool(
   role: RoleSpec | null | undefined, toolName: string, action?: string, targetRoles?: readonly RoleSpec[],
 ): { allowed: boolean; reason?: string } {
-  if (!role || toolName === "enhance_mandate" || toolName === "enhance_handoff") return { allowed: true };
+  if (!role || toolName === "enhance_mandate") return { allowed: true };
+  if (canRoleDispatch(role)) {
+    if (toolName === "enhance_handoff") {
+      return { allowed: false, reason: `Role "${role.id}" dispatches specialists via enhance_flow and never submits stage handoffs directly.` };
+    }
+    if (toolName === "enhance_flow") return { allowed: true };
+    if (toolName === "enhance_job") {
+      const norm = action?.trim().toLowerCase();
+      if (norm === "list" || norm === "reconcile" || norm === "tail" || norm === "watch" || norm === "cancel") return { allowed: true };
+      return { allowed: false, reason: `Role "${role.id}" never spawns shell commands directly — dispatch specialist ["algo"] or ["dev"] via enhance_flow to run background jobs.` };
+    }
+    return { allowed: false, reason: `Unknown companion tool "${toolName}".` };
+  }
+  if (toolName === "enhance_handoff") return { allowed: true };
   if (toolName === "enhance_job") {
     const norm = action?.trim().toLowerCase();
     if (norm === "list" || norm === "tail" || norm === "reconcile") return { allowed: true };
@@ -73,95 +90,68 @@ export function canRoleUseCompanionTool(
   return { allowed: false, reason: `Unknown companion tool "${toolName}".` };
 }
 
-export function resolveRoleActiveTools(
-  role: RoleSpec,
-  allAvailableToolNames: readonly string[],
-  mode: "foreground" | "stage" = "foreground",
-): string[] {
-  const readOnly = isRoleReadOnly(role);
-  const explicitTools = role.permissions.tools ? new Set<string>(role.permissions.tools) : null;
+export function resolveEffectiveActiveTools(
+  role: RoleSpec | null | undefined, allAvailableToolNames: readonly string[], mode: "foreground" | "stage" = "foreground",
+): string[] | null {
+  return role ? resolveRoleActiveTools(role, allAvailableToolNames, mode) : null;
+}
 
+export function resolveRoleActiveTools(
+  role: RoleSpec, allAvailableToolNames: readonly string[], mode: "foreground" | "stage" = "foreground",
+): string[] {
+  const readOnly = isRoleReadOnly(role), dispatch = canRoleDispatch(role);
+  const explicitTools = role.permissions.tools ? new Set<string>(role.permissions.tools) : null;
   const hostFiltered = allAvailableToolNames.filter((toolName) => {
     if (isCompanionTool(toolName)) return false;
-    if (explicitTools) {
-      if (!explicitTools.has(toolName)) return false;
-      if (readOnly && STRICT_READONLY_BLOCKED_TOOLS.has(toolName)) return false;
-      return true;
-    }
-    if (readOnly && (MUTATING_HOST_TOOLS as readonly string[]).includes(toolName)) return false;
-    return true;
+    if (explicitTools) return explicitTools.has(toolName) && !(readOnly && STRICT_READONLY_BLOCKED_TOOLS.has(toolName));
+    return !(readOnly && (MUTATING_HOST_TOOLS as readonly string[]).includes(toolName));
   });
-
-  if (mode === "stage") {
-    const stageCompanions = ["enhance_handoff", "enhance_mandate"];
-    if (canRoleUseCompanionTool(role, "enhance_job", "start").allowed) stageCompanions.push("enhance_job");
-    return [...new Set([...hostFiltered, ...stageCompanions])];
-  }
-
-  const fgCompanions = ["enhance_mandate", "enhance_handoff", "enhance_flow"];
-  if (canRoleUseCompanionTool(role, "enhance_job", "start").allowed) fgCompanions.push("enhance_job");
-  return [...new Set([...hostFiltered, ...fgCompanions])];
+  const baseCompanions = dispatch
+    ? ["enhance_mandate", "enhance_flow", "enhance_job"]
+    : (mode === "stage" ? ["enhance_handoff", "enhance_mandate"] : ["enhance_mandate", "enhance_handoff", "enhance_flow"]);
+  if (!dispatch && canRoleUseCompanionTool(role, "enhance_job", "start").allowed) baseCompanions.push("enhance_job");
+  return [...new Set([...hostFiltered, ...baseCompanions])];
 }
 
 export function extractTaskSubagents(input: unknown): string[] {
-  const record = typeof input === "object" && input !== null && !Array.isArray(input)
-    ? (input as Record<string, unknown>) : {};
-  if (Array.isArray(record.tasks) && record.tasks.length > 0) {
-    return record.tasks.map((item) => {
-      const a = typeof item === "object" && item !== null ? (item as Record<string, unknown>).agent : undefined;
+  const r = typeof input === "object" && input !== null && !Array.isArray(input) ? (input as Record<string, unknown>) : {};
+  if (Array.isArray(r.tasks) && r.tasks.length > 0) {
+    return r.tasks.map((it) => {
+      const a = typeof it === "object" && it !== null ? (it as Record<string, unknown>).agent : undefined;
       return typeof a === "string" && a.trim() ? a.trim() : "task";
     });
   }
-  return [typeof record.agent === "string" && record.agent.trim() ? record.agent.trim() : "task"];
+  return [typeof r.agent === "string" && r.agent.trim() ? r.agent.trim() : "task"];
 }
 
 export function summarizeToolCall(toolName: string, input: unknown): string {
-  const r = typeof input === "object" && input !== null && !Array.isArray(input)
-    ? (input as Record<string, unknown>) : {};
-  const clip = (s: string, n = 44): string => {
-    const clean = s.replace(/\s+/g, " ").trim();
-    return clean.length > n ? `${clean.slice(0, n - 1)}…` : clean;
-  };
+  const r = typeof input === "object" && input !== null && !Array.isArray(input) ? (input as Record<string, unknown>) : {};
+  const clip = (s: string, n = 44): string => { const c = s.replace(/\s+/g, " ").trim(); return c.length > n ? `${c.slice(0, n - 1)}…` : c; };
   if (toolName === "task") return `task → ${extractTaskSubagents(input).join(", ")}`;
   for (const key of ["command", "cmd", "path", "file_path", "filePath", "pattern", "query", "summary"] as const) {
     if (typeof r[key] === "string" && r[key]!.trim()) return `${toolName} ${clip(String(r[key]))}`;
   }
-  if (Array.isArray(r.paths) && typeof r.paths[0] === "string") return `${toolName} ${clip(String(r.paths[0]))}`;
-  return toolName;
+  return Array.isArray(r.paths) && typeof r.paths[0] === "string" ? `${toolName} ${clip(String(r.paths[0]))}` : toolName;
 }
 
 function extractRawWriteTargets(toolName: string, input: unknown): { targets: string[]; invalid: boolean } {
   if (!WRITE_TOOLS[toolName]) return { targets: [], invalid: false };
-  const record = typeof input === "object" && input !== null && !Array.isArray(input)
-    ? (input as Record<string, unknown>) : {};
+  const record = typeof input === "object" && input !== null && !Array.isArray(input) ? (input as Record<string, unknown>) : {};
   const targets: string[] = [];
   let invalid = false;
-  const add = (value: unknown): void => {
-    if (typeof value === "string" && value.trim()) targets.push(value.trim());
-  };
+  const add = (v: unknown): void => { if (typeof v === "string" && v.trim()) targets.push(v.trim()); };
   const addArray = (arr: unknown): void => {
     if (!Array.isArray(arr)) return;
     if (arr.length === 0) { invalid = true; return; }
-    for (const item of arr) {
-      if (typeof item !== "string" || !item.trim()) invalid = true;
-      else targets.push(item.trim());
-    }
+    for (const item of arr) { if (typeof item !== "string" || !item.trim()) invalid = true; else targets.push(item.trim()); }
   };
   const rawPath = typeof record.path === "string" && record.path.trim() ? record.path.trim() : undefined;
-  const rawGlob = record.glob;
-  if (rawGlob !== undefined) {
-    if (typeof rawGlob !== "string" || !rawGlob.trim()) invalid = true;
-    else if (rawPath) targets.push(`${rawPath.replace(/\/+$/, "")}/${rawGlob.trim().replace(/^\/+/, "")}`);
-    else targets.push(rawGlob.trim());
-  } else if (rawPath) {
-    targets.push(rawPath);
-  }
-  add(record.file_path);
-  add(record.filePath);
-  add(record.target_file);
-  add(record.destination);
-  addArray(record.paths);
-  addArray(record.files);
+  if (record.glob !== undefined) {
+    if (typeof record.glob !== "string" || !record.glob.trim()) invalid = true;
+    else targets.push(rawPath ? `${rawPath.replace(/\/+$/, "")}/${record.glob.trim().replace(/^\/+/, "")}` : record.glob.trim());
+  } else if (rawPath) targets.push(rawPath);
+  for (const k of ["file_path", "filePath", "target_file", "destination"] as const) add(record[k]);
+  addArray(record.paths); addArray(record.files);
   if (Array.isArray(record.edits)) {
     for (const edit of record.edits) {
       if (typeof edit === "object" && edit !== null) {
@@ -174,8 +164,8 @@ function extractRawWriteTargets(toolName: string, input: unknown): { targets: st
     for (const key of ["patch", "input", "diff"] as const) {
       const text = record[key];
       if (typeof text !== "string") continue;
-      for (const match of text.matchAll(/^\*\*\* (?:Update|Add|Delete) File:\s*(.+)$/gm)) add(match[1]);
-      for (const match of text.matchAll(/^\*\*\* Move to:\s*(.+)$/gm)) add(match[1]);
+      for (const m of text.matchAll(/^\*\*\* (?:Update|Add|Delete) File:\s*(.+)$/gm)) add(m[1]);
+      for (const m of text.matchAll(/^\*\*\* Move to:\s*(.+)$/gm)) add(m[1]);
     }
   }
   return { targets, invalid };
@@ -187,10 +177,7 @@ function staticPrefixOfGlob(raw: string): string {
   const norm = raw.trim().replaceAll("\\", "/").replace(/^(?:\.\/)+/, "").replace(/\/+$/, "");
   if (!norm || norm === ".") return "";
   const segs: string[] = [];
-  for (const seg of norm.split("/")) {
-    if (GLOB_META.test(seg)) break;
-    segs.push(seg);
-  }
+  for (const seg of norm.split("/")) { if (GLOB_META.test(seg)) break; segs.push(seg); }
   return segs.join("/");
 }
 
@@ -283,10 +270,12 @@ export function checkToolCallAllowed(
   role: RoleSpec | null,
   event: { toolName: string; input?: unknown },
   rolesMap?: ReadonlyMap<string, RoleSpec>,
+  mode: "foreground" | "stage" = "foreground",
 ): { block: boolean; reason?: string } {
   if (!role) return { block: false };
   const record = typeof event.input === "object" && event.input !== null && !Array.isArray(event.input)
     ? (event.input as Record<string, unknown>) : {};
+  const addFgHint = (reason: string): string => (mode === "foreground" ? `${reason} ${FG_COORD_HINT}` : reason);
 
   if (isCompanionTool(event.toolName)) {
     const action = typeof record.action === "string" ? record.action : undefined;
@@ -304,24 +293,35 @@ export function checkToolCallAllowed(
     const targetRoles = event.toolName === "enhance_flow" && rolesMap && Array.isArray(record.roles)
       ? record.roles.map((id) => (typeof id === "string" ? rolesMap.get(id.trim()) : undefined)).filter((r): r is RoleSpec => Boolean(r))
       : undefined;
+    const spawnsViaWatch = event.toolName === "enhance_job" && action?.trim().toLowerCase() === "watch"
+      && typeof record.command === "string" && Boolean(record.command.trim()) && !(typeof record.jobId === "string" && record.jobId.trim());
     const compCheck = canRoleUseCompanionTool(
-      role, event.toolName, action ?? (event.toolName === "enhance_job" ? "start" : undefined), targetRoles,
+      role, event.toolName, spawnsViaWatch ? "start" : (action ?? (event.toolName === "enhance_job" ? "start" : undefined)), targetRoles,
     );
     return compCheck.allowed ? { block: false } : { block: true, reason: compCheck.reason };
   }
 
+  if (canRoleDispatch(role) && COORDINATOR_BLOCKED_DIRECT_TOOLS.has(event.toolName)) {
+    return {
+      block: true,
+      reason: `Role "${role.id}" is a pure coordinator and never mutates files or runs shell commands directly — dispatch a background specialist (e.g. ["dev"] or ["dev","qa"]) via enhance_flow instead.`,
+    };
+  }
+
   const allowedTools = role.permissions.tools;
   if (allowedTools && !allowedTools.includes(event.toolName)) {
-    return { block: true, reason: `Role "${role.id}" does not permit tool "${event.toolName}".` };
+    const base = `Role "${role.id}" does not permit tool "${event.toolName}".`;
+    const isMut = Boolean(WRITE_TOOLS[event.toolName] || COORDINATOR_BLOCKED_DIRECT_TOOLS.has(event.toolName));
+    return { block: true, reason: !canRoleDispatch(role) && isMut ? addFgHint(base) : base };
   }
 
   const readOnly = isRoleReadOnly(role);
   if (readOnly) {
     if (STRICT_READONLY_BLOCKED_TOOLS.has(event.toolName)) {
-      return { block: true, reason: `Role "${role.id}" is read-only; tool "${event.toolName}" is not permitted.` };
+      return { block: true, reason: addFgHint(`Role "${role.id}" is read-only; tool "${event.toolName}" is not permitted.`) };
     }
     if (event.toolName === "bash" && !allowedTools) {
-      return { block: true, reason: `Role "${role.id}" is read-only; bash is not permitted.` };
+      return { block: true, reason: addFgHint(`Role "${role.id}" is read-only; bash is not permitted.`) };
     }
   }
 
@@ -342,20 +342,20 @@ export function checkToolCallAllowed(
   if (!WRITE_TOOLS[event.toolName] || !boundary) return { block: false };
   const writable = role.permissions.writable;
   if (writable?.length === 0) {
-    return { block: true, reason: `Role "${role.id}" is read-only; write operations are not permitted.` };
+    return { block: true, reason: addFgHint(`Role "${role.id}" is read-only; write operations are not permitted.`) };
   }
 
   const { targets: rawTargets, invalid } = extractRawWriteTargets(event.toolName, event.input);
   if (invalid || rawTargets.length === 0) {
     return {
       block: true,
-      reason: `Role "${role.id}" restricts write paths and could not verify target path for "${event.toolName}".`,
+      reason: addFgHint(`Role "${role.id}" restricts write paths and could not verify target path for "${event.toolName}".`),
     };
   }
 
   for (const rawTarget of rawTargets) {
     const res = validateWriteTarget(cwd, rawTarget, role);
-    if (res.block) return res;
+    if (res.block) return { block: true, reason: res.reason ? addFgHint(res.reason) : undefined };
   }
   return { block: false };
 }
@@ -394,9 +394,10 @@ export class TurnTracker {
   isTurnFailed(): boolean { return this.turnFailed; }
 
   checkToolCallAllowed(
-    cwd: string, role: RoleSpec | null, event: { toolName: string; input?: unknown }, rolesMap?: ReadonlyMap<string, RoleSpec>,
+    cwd: string, role: RoleSpec | null, event: { toolName: string; input?: unknown },
+    rolesMap?: ReadonlyMap<string, RoleSpec>, mode: "foreground" | "stage" = "foreground",
   ): { block: boolean; reason?: string } {
-    return checkToolCallAllowed(cwd, role, event, rolesMap);
+    return checkToolCallAllowed(cwd, role, event, rolesMap, mode);
   }
 
   recordToolExecutionStart(toolName: string, input?: unknown): void {

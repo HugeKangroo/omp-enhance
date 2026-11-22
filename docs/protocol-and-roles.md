@@ -24,6 +24,9 @@ description: 基于原始需求独立构造正常、边界与异常测试，证�
 model: "@slow"
 thinking: high
 
+# 可选：标记为系统内部角色（默认 false；设为 true 时如 supervisor 从用户角色选择器、Role Studio 与 /role 激活入口中隐藏）
+internal: false
+
 # 必填：认知立场（决定模型默认关注点与怀疑先验，序列化统一采用 |2 块标量无损保留前导空格）
 stance: |2
   证伪优先：在看到本轮真实测试运行输出前，默认上游实现存在未覆盖边界或缺陷；
@@ -38,13 +41,13 @@ method:
 # 可选：物理工具与路径边界（整块省略表示沿用常规全量权限）
 permissions:
   # 可选：允许的宿主工具列表；只读脚手架 (--readonly) 默认收敛为只读工具白名单
-  # 伴随工具按角色边界同构授权：enhance_mandate / enhance_handoff 常驻可用；
-  # enhance_job (start/watch/cancel) 仅对非只读且允许 bash 的角色开放；只读角色禁止通过委托提权修改文件
-  tools: [read, grep, lsp, edit, write, apply_patch, bash]
+  tools: [read, grep, glob, find, lsp, edit, write, apply_patch, bash, task, wait]
   # 可选：允许被写入或改动的相对路径 glob（支持 {a,b} 花括号语法）；[] 表示纯只读
   writable: ["test/**", "tests/**", "**/*.test.*", "**/*.spec.*"]
   # 可选：运行期间严禁发生任何字节变更的相对路径 glob（落库前自动校验 protected + writable + .omp 完整性）
   protected: ["src/**"]
+  # 可选：纯总控派单权（默认 false；coordinator 设为 true 时物理拦截一切直接文件写/Shell 命令、禁用 enhance_handoff 与 enhance_job(action="start")，仅开放跨项目 enhance_flow 派单、enhance_job 状态巡检/取消与 enhance_mandate）
+  dispatch: false
 
 # 可选：准出硬判据
 exit:
@@ -56,47 +59,52 @@ exit:
     - 受保护目录 src/** 未发生任何字节变动
 ```
 
-### 1.2 最小合法角色示例（30 秒手写）
+### 1.2 最小合法自定义专员示例（30 秒手写）
 
-不需要物理限制时，仅写 `id`、`stance`、`method` 即可直接加载运行：
+> **设计建议（`Role × Project Context/Skills`）**：项目专属的框架规范、代码风格、接口约定与常用命令应写在项目根目录的 `AGENTS.md` 或领域 `Skills` 中（后台专员进入该目录时会自动加载）。仅当需要**新的认知立场或硬物理权限锁**时，才新建 `Role YAML`。
 
 ```yaml
-id: api-designer
-description: 接口契约与兼容性设计角色
+id: docs-writer
+description: 只读源码核实契约、仅允许修改文档目录的技术文档专员
 stance: |2
-  优先保证接口最小惊讶原则、向后兼容与错误码语义清晰。
+  文档中的每个配置项、命令与参数必须与真实源码逐一核对，绝不凭印象编造未实现特性。
 method:
-  - 明确调用方场景、输入不变量与失败模式
-  - 给出清晰的类型签名与边界示例
-  - 标注潜在破坏性变更风险
+  - 使用只读工具核对目标源码中的真实接口、默认值与错误提示
+  - 在 docs/** 与 README.md 范围内完成精确更新
+  - 调用 enhance_handoff 提交变更产物与核实依据
+permissions:
+  tools: [read, grep, glob, find, ls, lsp, edit, write, apply_patch]
+  writable: ["README.md", "docs/**"]
+  protected: ["src/**", "test/**"]
+exit:
+  require_tool_evidence: true
 ```
 
-### 1.3 三级发现目录与安全优先级
+### 1.3 三级发现目录与内置第一性编制
 
-按以下优先级从高到低合并（单文件语法错误隔离记录告警，绝不阻塞其余合法角色加载）：
-1. **项目级 (`project`)**：`<当前工作区>/.omp/roles/*.{yaml,yml}`（**仅在当前工作区通过 OMP `ctx.isProjectTrusted()` 信任校验时加载**，防止克隆未信任仓库时被静默注入系统提示词或设置）
+按以下优先级从高到低合并（支持指向合法 YAML 文件的符号链接；单文件语法错误隔离记录告警，绝不阻塞其余角色加载）：
+1. **项目级 (`project`)**：`<目标工作区>/.omp/roles/*.{yaml,yml}`（**仅在工作区通过 OMP `ctx.isProjectTrusted()` 信任校验时加载**）
 2. **个人全局级 (`global`)**：`~/.omp/enhance/roles/*.{yaml,yml}`（支持 OMP `--profile` 隔离目录，`/role create` 默认保存位置）
-3. **插件内置 (`builtin`)**：`<omp-enhance>/roles/{general,algo,vision,dev,qa,reviewer,ml-engineer,supervisor}.yaml`（默认会话基态为 `general`）
+3. **插件内置 (`builtin`)**：`<omp-enhance>/roles/*.yaml`，共 **8 个内置文件**（默认开机会话处于 `"off"` 标准模式，敲 `/coord` 激活 `coordinator`）：
+   - **总控入口（1 个）**：`coordinator`（`dispatch: true`，纯只读探路 + 跨项目派发专员链）
+   - **正交后台专员（6 个）**：`planner`（探查与规划）、`dev`（构建与修改）、`algo`（带真值防泄漏实验与四道报告门禁）、`qa`（测试目录限定动态证伪）、`reviewer`（代码与架构方案静态盲审）、`vision`（默认 `@vision` 视觉图表诊断）
+   - **内部巡检角色（1 个）**：`supervisor`（`internal: true`、默认 `@advisor` + `thinking: inherit`）
 
-### 1.4 内置监督角色 (`supervisor`) 与 `@advisor` 默认继承
+### 1.4 内部监督角色 (`supervisor`) 裁决契约
 
-`roles/supervisor.yaml` 是只读、无工具的运行期巡检角色：`model: "@advisor"`、`thinking: inherit`、`permissions.tools: []`、`permissions.writable: []`、`permissions.protected: ["**"]`（不参与 `/flow` 或 `/enhance-handoff` 业务阶段转手）。默认自动继承用户在 OMP 中配置的 **`@advisor`** 模型角色及其 `:thinking` 推理档位（`supervisorThinking: "inherit"`，支持 `off` 至 `max` / `auto` 全部档位），也可在 **`/settings → Plugins → omp-enhance`** 修改 `supervisorModel` / `supervisorThinking`，或在 `/role edit supervisor` 中单独覆盖。
-
-它周期性读取 `SupervisorPulse`（包含目标、巡检序号、总耗时、静默时长、本周期增量、阶段权限元数据 `roleId` / `readOnly` / `allowedTools`、OMP 原生后台异步任务数 `activeAsyncJobs`、定界隔离的 `untrusted_log_tail`、正在运行的 `activeTool` 及最近 5 次 `priorDecisions`），严禁要求只读或无 `bash` 阶段运行 Shell 命令，并输出单个 JSON 对象：
+`roles/supervisor.yaml` 是隐藏的无工具运行期巡检角色（`internal: true`、`model: "@advisor"`、`thinking: inherit`、`permissions.tools: []`）。它周期性读取 `SupervisorPulse`（包含巡检序号、总耗时、静默时长、阶段权限 `roleId` / `readOnly` / `allowedTools`、原生异步任务数 `activeAsyncJobs`、定界隔离的 `untrusted_log_tail`、运行中 `activeTool` 及最近 5 次 `priorDecisions`），严禁要求只读或无 `bash` 阶段执行 Shell 命令，并输出单个 JSON 对象：
 
 | 裁决 | 适用目标 | 行为 |
 | --- | --- | --- |
 | `continue` | `role_session` / `job` | 保持任务运行；`nextCheckSec` 钳制到 `[5, 600]` 秒作为下次巡检间隔 |
 | `steer` | 仅 `role_session` | 保持子会话运行，将纠偏指令以 `[Supervisor]: ...` 前缀注入 `session.steer` |
-| `abort` | `role_session` / `job` | 必须提供非空异常依据；后台作业经进程启动指纹核验后终止进程组（超时自动升级 `SIGKILL`），角色子会话调用 `session.abort()`，若目标尚未自然完成则返回 `aborted_by_supervisor` |
-
-运行期安全语义：初始延迟默认 30 秒，任务在首次巡检前结束则产生 **0 次**监督调用；监督模型报错或返回非法 JSON 时 **fail-open** 并按 `30s → 60s → 120s...` 指数退避重试。
+| `abort` | `role_session` / `job` | 必须提供非空异常依据；后台作业经进程启动指纹核验后终止进程组（超时升级 `SIGKILL`），专员子会话中止并清理其启动的残留 `enhance_job` |
 
 ---
 
 ## 2. 标准交接包 (`HandoffEnvelope`)
 
-无论是日常单角色向用户收尾（`toTarget: "user"`），还是通过 `/enhance-handoff` / `/flow` 跨角色转手（如 `toTarget: "qa"`），均在通过边界完整性核验后生成同一结构：
+所有后台专员收束阶段结论、中途咨询 `vision`（`delegateNow: true`）或挂起请示用户时，均在通过物理读写边界核验后生成同一结构：
 
 | 字段 | 类型 | 含义与校验规则 |
 | --- | --- | --- |
@@ -105,11 +113,12 @@ method:
 | `parentHandoffId` | `string \| null` | 上游交接包 ID（构成可追溯的完整交接链） |
 | `fromRole` | `string` | 产出该交接包的角色 ID |
 | `toTarget` | `"user" \| string` | 接收目标（`"user"`、下游角色 ID，或 `rejected` 时指向首个可写返修角色） |
-| `verdict` | `"ready" \| "rejected" \| "blocked"` | `ready`：完成可向下游推进；`rejected`：证伪打回返修；`blocked`：外部前置条件缺失 |
-| `summary` | `string` | 交付成果或打回结论的精炼摘要 |
-| `artifacts` | `ArtifactRecord[]` | 自动扫描工作区新增/修改文件并计算 `{ path, sha256, byteSize, role }` |
+| `verdict` | `"ready" \| "needs_input" \| "rejected" \| "blocked"` | `ready`：完成并向下游推进；`needs_input`：遇业务分叉点挂起为 `waiting_input`（0 Token 空耗）并唤醒 `coordinator` 请示用户；`rejected`：发现阻断缺陷——若前序存在可写专员（如 `dev → qa`）则自动打回返修，若整条前序均为只读审计专员（如单跑 `reviewer` 或 `planner → reviewer`）则审计流程本身正常完结为 `status: "completed"` 并完整保留 `rejected` 审查结论交付汇报；`blocked`：外部前置条件缺失 |
+| `summary` | `string` | 交付成果、挂起背景或打回结论的精炼摘要 |
+| `questionsForUser` | `string[] \| undefined` | 当 `verdict === "needs_input"` 时附带的简明通俗待决策问题列表，自动透传唤醒 `coordinator` 并在用户答复 `resume` 后注入续跑上下文 |
+| `artifacts` | `ArtifactRecord[]` | 自动扫描工作区新增/修改文件并记录 `{ path, sha256, byteSize, role }`（`role` 支持 `"input" \| "inspected" \| "changed" \| "test" \| "report" \| "metrics"`；只读专员引用未发生 `sha256` 变更的被审文件时精准标为 `"inspected"` 而非 `"changed"`） |
 | `deletedFiles` | `string[] \| undefined` | 本阶段相对基线被删除的文件路径列表，随条件块同步告知下游 |
-| `verifiedFacts` | `{ claim, evidenceRef }[]` | 已验证结论列表，`evidenceRef` 必须命中本轮**非报错真实执行 `toolCallId`** 或当前有效产物哈希/路径，并透传注入下游条件块 |
+| `verifiedFacts` | `{ claim, evidenceRef }[]` | 已验证结论列表，`evidenceRef` 必须命中本轮**非报错真实执行 `toolCallId`** 或有效工作区路径/选择器（支持 `:line`、`#Lline`、`:raw` 与目录前缀） |
 | `openRisks` | `string[]` | 诚实披露的未覆盖边界、已知限制或待下游重点核查的疑点 |
 | `feedbackForUpstream` | `string \| null` | 当 `verdict === "rejected"` 时必填最小复现步骤与期望/实际差异 |
 | `observedUsage` | `UsageSummary \| null` | 被动归一化的实测 `{ inputTokens, outputTokens, costUsd }`（不作阻断限制） |
@@ -118,11 +127,11 @@ method:
 
 ## 3. SQLite 持久化表结构 (`.omp-enhance/state.sqlite`)
 
-数据库启用 `PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;` 及二级索引，共包含 **6 张表**：
+每个目标项目下的 `.omp-enhance/state.sqlite` 按需惰性创建（纯只读查询不建空库、不脏写 WAL；首次创建 `.omp-enhance/` 目录时自动写入 `.omp-enhance/.gitignore` `*` 防止污染目标仓库 `git status`；跨子项目路径索引单独保存在 `~/.omp/enhance/hub-projects.json`），启用 `PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;` 及二级索引，共包含 **6 张表**：
 
-1. **`mandates`**：保存原始用户目标、硬约束数组、验收标准数组、版本号 `rev`、状态（`active` | `completed` | `archived`）以及 `session_id` / `flow_id` 作用域隔离字段（Flow 正常完成时自动收束为 `completed`，避免跨会话污染后续无关对话）。
+1. **`mandates`**：保存原始目标、硬约束数组、验收标准数组、版本号 `rev`、状态（`active` | `completed` | `archived`）以及 `session_id` / `flow_id` 作用域隔离字段。
 2. **`epistemic_items`**：外键关联 `mandates(id)` 的认知黑板条目（`fact` | `hypothesis` | `inquiry` | `decision`）；数据库级 `CHECK` 约束强制 `fact` 必须附带非空 `evidence_ref`。
 3. **`artifacts`**：外键关联 `mandates(id)`，按 `(mandate_id, path, sha256)` 记录文件指纹，读取时按路径聚合最新快照版本。
-4. **`handoffs`**：外键关联 `mandates(id)`，完整持久化历次 `HandoffEnvelope`（含 `deleted_files`、`verified_facts` 与 `observed_usage`）及父子链路。
-5. **`jobs`**：记录后台无时限长作业（`job_id, mandate_id, hypothesis_id, command, cwd, pid, pgid, owner_pid, process_start_token, log_path, exit_file_path, status, exit_code, started_at, ended_at`），通过原子 `.exit` 写入、条件状态迁移与进程启动指纹支撑跨重启精准对账。
-6. **`flow_runs`**：外键关联 `mandates(id)`，持久化双流协同房间检查点（`flow_id, role_chain, status, current_index, repair_round, last_handoff_id, owner_pid, owner_start_token, next_stage_seq, last_rejection_sig, user_steers, snapshot_json`），自动保留最近 50 条历史记录并保护正在活跃运行的属主进程不被新开终端误标为中断。
+4. **`handoffs`**：外键关联 `mandates(id)`，完整持久化历次 `HandoffEnvelope`（含 `deleted_files`、`verified_facts`、`questions_for_user` 与 `observed_usage`）及父子链路。
+5. **`jobs`**：记录后台无时限长作业（`job_id, mandate_id, hypothesis_id, command, cwd, pid, pgid, owner_pid, process_start_token, log_path, exit_file_path, status, exit_code, started_at, ended_at`），通过原子 `.exit` 写入与进程启动指纹支撑跨重启精准对账。
+6. **`flow_runs`**：外键关联 `mandates(id)`，持久化后台 Flow 检查点（支持 `running`、`waiting_input`、`interrupted`、`failed` 等状态及 `cwd` 记录），自动保留最近 50 条历史记录并保护活跃属主进程不被其他终端误标为中断。

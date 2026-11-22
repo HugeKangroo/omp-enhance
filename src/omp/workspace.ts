@@ -1,18 +1,62 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import { resolveRoleActiveTools } from "../core/policy.ts";
+import { isCompanionTool, isInternalRole, resolveRoleActiveTools } from "../core/policy.ts";
 import {
   extractModelSpecThinking, loadEnhanceSettings, resolveDefaultGlobalRolesDir, resolveModelSpec,
 } from "../core/settings.ts";
 import { EnhanceStore } from "../core/store.ts";
 import type { EnhanceSettings, FlowRunResult, HandoffEnvelope, Mandate, RoleSpec } from "../core/types.ts";
-import { executeRoleFlow, type RoleSessionRunner } from "../flow/orchestrator.ts";
+import { executeRoleFlow, type RoleSessionRunner, type RoleSupervisorConfig } from "../flow/orchestrator.ts";
 import { FlowRoomManager } from "../flow/state.ts";
 import { SessionTrackerRegistry } from "../flow/tracker.ts";
 import { discoverRolesWithDiagnostics } from "../roles/loader.ts";
-import { createFlowRoomUiAdapter } from "../ui/flow-room.ts";
+import { createFlowRoomUiAdapter, type FlowMonitorTarget } from "../ui/flow-room.ts";
 import { createOmpRoleSessionRunner, createOmpSupervisorInspector } from "./session.ts";
-import type { WorkspaceRuntime } from "./tools.ts";
+
+export interface EmitMessageOptions {
+  excludeFromContext?: boolean;
+  cmdOutText?: string;
+}
+
+export interface WorkspaceRuntime {
+  cwd: string; globalRolesDir: string; builtinRolesDir?: string;
+  store: EnhanceStore; trackers: SessionTrackerRegistry; room: FlowRoomManager;
+  roles: Map<string, RoleSpec>; settings: EnhanceSettings;
+  getSessionId(ctx: any): string;
+  getSessionRoleId(ctx: any): string | null;
+  getActiveRole(ctx: any): RoleSpec | null;
+  applyActiveRole(roleId: string | null, ctx: any, persistToSession?: boolean): Promise<void>;
+  refresh(ctx?: any): Map<string, RoleSpec>;
+  syncStatusBar(ctx: any): void;
+  runnerFor(ctx: any): RoleSessionRunner;
+  supervisorFor(ctx: any): RoleSupervisorConfig | undefined;
+  emitMessage(ctx: any, text: string, options?: EmitMessageOptions): void;
+  startManagedFlow(input: {
+    ctx: any; originWs?: ManagedWorkspace; flowId?: string; roles: RoleSpec[]; mandate: Mandate;
+    initialHandoff: HandoffEnvelope | null; maxRepairRounds: number;
+    background: boolean; initiatorText?: string; signal?: AbortSignal;
+  }): Promise<{ started: true; flowId: string; cwd: string; background: true; status: "running"; roleChain: string[]; goal: string } | FlowRunResult>;
+  resumeManagedFlow(
+    ctx: any, background: boolean, signal?: AbortSignal, originWs?: ManagedWorkspace,
+  ): Promise<{ resumed: true; flowId: string; cwd: string; startIndex: number; background: true; status: "running"; roleChain: string[] } | FlowRunResult>;
+}
+
+export interface BackgroundFlowSettlement {
+  targetWs: ManagedWorkspace;
+  originWs: ManagedWorkspace;
+  ctx: any;
+  flowId: string;
+  mandate: Mandate;
+  roleChain: string[];
+  result?: FlowRunResult;
+  error?: unknown;
+}
+
+export interface WorkspaceHubHooks {
+  syncGlobalUi?: (ctx: any, ws: ManagedWorkspace) => void;
+  getActiveTargets?: () => readonly FlowMonitorTarget[];
+  onBackgroundFlowSettled?: (settlement: BackgroundFlowSettlement) => void;
+}
 
 export const sessionKey = (ctx: any): string =>
   ctx?.sessionManager?.getSessionId?.() ?? ctx?.sessionManager?.getSessionFile?.() ?? "__default__";
@@ -20,9 +64,12 @@ export const sessionKey = (ctx: any): string =>
 export const isProjectTrusted = (ctx: any): boolean =>
   typeof ctx?.isProjectTrusted === "function" ? Boolean(ctx.isProjectTrusted()) : true;
 
-export const defaultRoleId = (roles: Map<string, RoleSpec>, settings: EnhanceSettings): string | null =>
-  settings.defaultRole === null ? null
-    : (roles.has(settings.defaultRole) ? settings.defaultRole : (roles.has("general") ? "general" : (roles.has("dev") ? "dev" : null)));
+export const defaultRoleId = (roles: Map<string, RoleSpec>, settings: EnhanceSettings): string | null => {
+  if (settings.defaultRole === null) return null;
+  const configured = roles.get(settings.defaultRole);
+  if (configured && !isInternalRole(configured)) return configured.id;
+  return roles.has("coordinator") ? "coordinator" : null;
+};
 
 export function readSessionRoleOverride(
   ctx: any, roles: ReadonlyMap<string, RoleSpec>,
@@ -33,7 +80,8 @@ export function readSessionRoleOverride(
     if (e?.type === "custom" && e?.customType === "omp-enhance-role") {
       const id = e?.data?.roleId;
       if (id === null) return { found: true, roleId: null };
-      return typeof id === "string" && roles.has(id) ? { found: true, roleId: id } : { found: false, roleId: null };
+      const role = typeof id === "string" ? roles.get(id) : undefined;
+      return role && !isInternalRole(role) ? { found: true, roleId: role.id } : { found: false, roleId: null };
     }
   }
   return { found: false, roleId: null };
@@ -58,13 +106,18 @@ function sameModel(a: unknown, b: unknown): boolean {
   return Boolean(ma.id && ma.provider === mb.provider && ma.id === mb.id);
 }
 
+const bindCtxToCwd = (ctx: any, cwd: string): any =>
+  ctx && typeof ctx === "object" && ctx.cwd !== cwd ? Object.create(ctx, { cwd: { value: cwd, enumerable: true } }) : (ctx ?? { cwd });
+
 export class SessionBaselineManager {
   private baseModel: unknown = undefined;
   private baseThinking: string | undefined = undefined;
+  private baseActiveTools: string[] | undefined = undefined;
   private modelOverridden = false;
   private overriddenModel: unknown = undefined;
   private thinkingOverridden = false;
   private overriddenThinking: string | undefined = undefined;
+  private toolsOverridden = false;
 
   reconcileManualChanges(pi: any, ctx: any): void {
     const curModel = ctx?.model;
@@ -83,6 +136,36 @@ export class SessionBaselineManager {
         }
       } else { this.baseThinking = curThinking; }
     }
+  }
+
+  async applyToolOverrides(role: RoleSpec | null, pi: any): Promise<void> {
+    if (!role) {
+      if (this.toolsOverridden) {
+        if (this.baseActiveTools !== undefined) {
+          await pi.setActiveTools?.([...this.baseActiveTools]);
+        }
+        this.toolsOverridden = false;
+        return;
+      }
+      if (typeof pi?.getActiveTools === "function") {
+        const curActive = pi.getActiveTools();
+        if (Array.isArray(curActive) && curActive.some((n) => isCompanionTool(n))) {
+          await pi.setActiveTools?.(curActive.filter((n) => !isCompanionTool(n)));
+        }
+      }
+      return;
+    }
+    if (!this.toolsOverridden) {
+      const initialActive: string[] | undefined = typeof pi?.getActiveTools === "function"
+        ? pi.getActiveTools()
+        : pi?.getAllTools?.().map((t: any) => t.name);
+      this.baseActiveTools = Array.isArray(initialActive)
+        ? initialActive.filter((n) => !isCompanionTool(n))
+        : undefined;
+      this.toolsOverridden = true;
+    }
+    const allNames: string[] = pi?.getAllTools?.().map((t: any) => t.name) ?? [];
+    await pi.setActiveTools?.(resolveRoleActiveTools(role, allNames, "foreground"));
   }
 
   async applyRoleOverrides(_sessionId: string, role: RoleSpec | null, pi: any, ctx: any): Promise<void> {
@@ -117,18 +200,20 @@ export class SessionBaselineManager {
   }
 
   clear(): void {
-    this.baseModel = undefined; this.baseThinking = undefined;
+    this.baseModel = undefined; this.baseThinking = undefined; this.baseActiveTools = undefined;
     this.modelOverridden = false; this.overriddenModel = undefined;
     this.thinkingOverridden = false; this.overriddenThinking = undefined;
+    this.toolsOverridden = false;
   }
 }
 
-export function emitMessage(pi: any, ctx: any, text: string, options?: { excludeFromContext?: boolean }): void {
+export function emitMessage(pi: any, ctx: any, text: string, options?: EmitMessageOptions): void {
   const outPath = process.env.OMP_ENHANCE_CMD_OUT;
   if (outPath) {
+    const outPayload = options?.cmdOutText ?? text;
     try {
       mkdirSync(path.dirname(path.resolve(outPath)), { recursive: true });
-      appendFileSync(outPath, text.endsWith("\n") ? text : `${text}\n`, "utf8");
+      appendFileSync(outPath, outPayload.endsWith("\n") ? outPayload : `${outPayload}\n`, "utf8");
     } catch {}
   }
   try {
@@ -158,26 +243,39 @@ export type WorkspaceState = ManagedWorkspace;
 export function createManagedWorkspace(
   pi: any, cwd: string, trusted: boolean,
   options: { globalRolesDir?: string; builtinRolesDir?: string; pluginLockPath?: string; runnerFactory?: (pi: any, ctx: any) => RoleSessionRunner },
+  hooks?: WorkspaceHubHooks,
 ): ManagedWorkspace {
   const resolveGlobalDir = () => options.globalRolesDir ?? resolveDefaultGlobalRolesDir();
   const { roles } = discoverRolesWithDiagnostics({ cwd, globalRolesDir: resolveGlobalDir(), builtinRolesDir: options.builtinRolesDir, isProjectTrusted: trusted });
   const settings = loadEnhanceSettings({ cwd, pluginLockPath: options.pluginLockPath, isProjectTrusted: trusted });
   const store = new EnhanceStore(path.join(cwd, ".omp-enhance", "state.sqlite"));
   const trackers = new SessionTrackerRegistry(), baselines = new SessionBaselineManager();
-  const room = new FlowRoomManager(createFlowRoomUiAdapter(pi), store);
+  const room = new FlowRoomManager(createFlowRoomUiAdapter(pi, hooks?.getActiveTargets), store, cwd);
   const rolesBySession = new Map<string, string | null>();
 
-  const runFlowTask = (fCtx: any, flowId: string, execInput: {
+  const runFlowTask = (fCtx: any, originWs: ManagedWorkspace, background: boolean, flowId: string, execInput: {
     roles: RoleSpec[]; mandate: Mandate; initialHandoff: HandoffEnvelope | null; maxRepairRounds: number;
     startIndex?: number; initialRepairRound?: number; initialStageSeq?: number; initialLastRejectionSig?: string | null; signal?: AbortSignal;
   }): Promise<FlowRunResult> => {
+    const roleChain = execInput.roles.map((r) => r.id);
     ws.syncStatusBar(fCtx);
     return (async () => {
       try {
         const res = await executeRoleFlow({ cwd, store, flowId, ...execInput, runner: ws.runnerFor(fCtx), supervisor: ws.supervisorFor(fCtx), observer: room.createObserver(fCtx) });
-        room.finishFlow(res, fCtx); return res;
-      } catch (err) { room.failFlow(err, fCtx); throw err; }
-      finally { ws.syncStatusBar(fCtx); }
+        room.finishFlow(res, fCtx);
+        if (background && res.status !== "cancelled") {
+          hooks?.onBackgroundFlowSettled?.({ targetWs: ws, originWs, ctx: fCtx, flowId, mandate: execInput.mandate, roleChain, result: res });
+        }
+        return res;
+      } catch (err) {
+        room.failFlow(err, fCtx);
+        if (background) {
+          hooks?.onBackgroundFlowSettled?.({ targetWs: ws, originWs, ctx: fCtx, flowId, mandate: execInput.mandate, roleChain, error: err });
+        }
+        throw err;
+      } finally {
+        ws.syncStatusBar(fCtx);
+      }
     })();
   };
 
@@ -200,18 +298,28 @@ export function createManagedWorkspace(
       return ws.roles;
     },
     syncStatusBar: (c) => {
+      if (hooks?.syncGlobalUi) { hooks.syncGlobalUi(c, ws); return; }
       const role = ws.getActiveRole(c), snap = room.getSnapshot();
-      const roleBadge = role ? `enhance:${role.id}${role.model ? ` (${role.model})` : ""}` : "enhance:off";
-      const flowBadge = room.isRunning() ? ` · flow:${snap.roleChain.join("→")}` : snap.status === "interrupted" ? " · flow:paused" : "";
-      c?.ui?.setStatus?.("omp-enhance", ws.settings.showStatusBar ? `${roleBadge}${flowBadge}` : undefined);
+      const hasBg = room.isRunning() || snap.status === "waiting_input";
+      if (!role && !hasBg) {
+        c?.ui?.setStatus?.("omp-enhance", undefined);
+        c?.ui?.setWidget?.("omp-enhance-flow", undefined);
+        return;
+      }
+      if (!ws.settings.showStatusBar) { c?.ui?.setStatus?.("omp-enhance", undefined); return; }
+      const roleBadge = role ? `enhance:${role.id}${role.model ? ` (${role.model})` : ""}` : "enhance:bg";
+      const flowBadge = room.isRunning() ? ` · flow:${snap.roleChain.join("→")}` : snap.status === "waiting_input" ? " · waiting_input" : "";
+      c?.ui?.setStatus?.("omp-enhance", `${roleBadge}${flowBadge}`);
     },
     applyActiveRole: async (roleId, c, persist = false) => {
       const sid = sessionKey(c);
-      rolesBySession.set(sid, roleId);
-      if (persist) { try { pi.appendEntry?.("omp-enhance-role", { roleId }); } catch {} }
+      const validRole = roleId ? ws.roles.get(roleId) ?? null : null;
+      const effectiveId = validRole && !isInternalRole(validRole) ? validRole.id : null;
+      const role = effectiveId ? validRole : null;
+      rolesBySession.set(sid, effectiveId);
+      if (persist) { try { pi.appendEntry?.("omp-enhance-role", { roleId: effectiveId }); } catch {} }
       ws.lastSessionId = sid; ws.lastBranchOverrideSig = branchOverrideSignature(c);
-      const role = roleId ? ws.roles.get(roleId) ?? null : null, allNames = pi.getAllTools?.().map((t: any) => t.name) ?? [];
-      await pi.setActiveTools?.(role ? resolveRoleActiveTools(role, allNames, "foreground") : allNames);
+      await baselines.applyToolOverrides(role, pi);
       await baselines.applyRoleOverrides(sid, role, pi, c);
       ws.syncStatusBar(c);
     },
@@ -222,44 +330,33 @@ export function createManagedWorkspace(
       const ov = readSessionRoleOverride(c, ws.roles);
       await ws.applyActiveRole(ov.found ? ov.roleId : defaultRoleId(ws.roles, ws.settings), c, false);
     },
-    runnerFor: (c) => options.runnerFactory?.(pi, c) ?? createOmpRoleSessionRunner(pi, c, ws.settings, ws.roles),
+    runnerFor: (c) => {
+      const scopedCtx = bindCtxToCwd(c, cwd);
+      return options.runnerFactory?.(pi, scopedCtx) ?? createOmpRoleSessionRunner(pi, scopedCtx, ws.settings, ws.roles);
+    },
     supervisorFor: (c) => {
       const sup = ws.settings.supervisorEnabled ? ws.roles.get("supervisor") : undefined;
-      return sup ? { role: sup, inspector: createOmpSupervisorInspector(pi, c, ws.settings), initialDelayMs: ws.settings.supervisorInitialDelaySec * 1000 } : undefined;
+      if (!sup) return undefined;
+      return { role: sup, inspector: createOmpSupervisorInspector(pi, bindCtxToCwd(c, cwd), ws.settings), initialDelayMs: ws.settings.supervisorInitialDelaySec * 1000 };
     },
     emitMessage: (c, text, emitOpts) => emitMessage(pi, c, text, emitOpts),
-    startManagedFlow: async ({ ctx: c, flowId: explicitId, roles: rList, mandate, initialHandoff, maxRepairRounds, background, initiatorText, signal }) => {
+    startManagedFlow: async ({ ctx: c, originWs, flowId: explicitId, roles: rList, mandate, initialHandoff, maxRepairRounds, background, initiatorText, signal }) => {
       const roleChain = rList.map((r) => r.id);
       const flowId = room.beginFlow({ flowId: explicitId, mandateId: mandate.id, goal: mandate.goal, roleChain, maxRepairRounds, lastHandoffId: initialHandoff?.id ?? null, initiatorText, ctx: c });
-      const p = runFlowTask(c, flowId, { roles: rList, mandate, initialHandoff, maxRepairRounds, signal });
+      const p = runFlowTask(c, originWs ?? ws, background, flowId, { roles: rList, mandate, initialHandoff, maxRepairRounds, signal });
       if (!background) return await p;
       void p.catch(() => {});
-      return { started: true, flowId, background: true, status: "running", roleChain, goal: mandate.goal };
+      return { started: true, flowId, cwd, background: true, status: "running", roleChain, goal: mandate.goal };
     },
-    resumeManagedFlow: async (c, background, signal) => {
+    resumeManagedFlow: async (c, background, signal, originWs) => {
       const plan = room.resumeFlow(c);
       const rList = plan.roleChain.map((id) => { const r = ws.roles.get(id); if (!r) throw new Error(`Unknown role "${id}".`); return r; });
       const mandate = store.getMandate(plan.mandateId) ?? store.upsertMandate({ goal: room.getSnapshot().goal || "Resumed Flow", flowId: plan.flowId });
       const initialHandoff = plan.lastHandoffId ? store.getHandoff(plan.lastHandoffId) : null;
-      const p = runFlowTask(c, plan.flowId, { roles: rList, mandate, initialHandoff, maxRepairRounds: plan.maxRepairRounds, startIndex: plan.startIndex, initialRepairRound: plan.repairRound, initialStageSeq: plan.initialStageSeq, initialLastRejectionSig: plan.lastRejectionSig, signal });
+      const p = runFlowTask(c, originWs ?? ws, background, plan.flowId, { roles: rList, mandate, initialHandoff, maxRepairRounds: plan.maxRepairRounds, startIndex: plan.startIndex, initialRepairRound: plan.repairRound, initialStageSeq: plan.initialStageSeq, initialLastRejectionSig: plan.lastRejectionSig, signal });
       if (!background) return await p;
       void p.catch(() => {});
-      return { resumed: true, flowId: plan.flowId, startIndex: plan.startIndex, background: true, status: "running", roleChain: plan.roleChain };
-    },
-    dispatchFollowUpFromRoom: async (c, rawText) => {
-      ws.refresh(c);
-      const at = /^@([a-zA-Z0-9][a-zA-Z0-9_-]*)\s+([\s\S]+)$/.exec(rawText.trim());
-      const prev = room.getSnapshot().roleChain.filter((id) => id !== "supervisor" && ws.roles.has(id));
-      const activeId = ws.getActiveRole(c)?.id, fallback = activeId && activeId !== "supervisor" ? [activeId] : ["dev"];
-      const roleIds = at && at[1] !== "supervisor" && ws.roles.has(at[1]!) ? [at[1]!] : (prev.length > 0 ? prev : fallback.filter((id) => ws.roles.has(id)));
-      const goalText = (at && at[1] !== "supervisor" && ws.roles.has(at[1]!) ? at[2]! : rawText).trim();
-      const rList = roleIds.map((id) => ws.roles.get(id)!).filter(Boolean);
-      if (rList.length === 0 || !goalText) return;
-      const prevHandoffId = room.getLastHandoffId();
-      const initialHandoff = prevHandoffId ? store.getHandoff(prevHandoffId) : null;
-      const flowId = `flow-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-      const mandate = store.upsertMandate({ goal: goalText, flowId });
-      await ws.startManagedFlow({ ctx: c, flowId, roles: rList, mandate, initialHandoff, maxRepairRounds: ws.settings.flowMaxRepairRounds, background: true, initiatorText: rawText.trim() });
+      return { resumed: true, flowId: plan.flowId, cwd, startIndex: plan.startIndex, background: true, status: "running", roleChain: plan.roleChain };
     },
   };
   return ws;

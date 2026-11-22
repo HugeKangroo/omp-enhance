@@ -1,90 +1,106 @@
 # omp-enhance
 
-面向 **Oh My Pi (`omp`)** 的轻量级第一性增强插件：基于同一套 **“纯 YAML 角色内规范条件化 ($M_r$) + 马尔可夫屏障交接包 ($H$)”** 统一日常单 Agent 工作与多角色协同工作流，100% 自动继承你在 OMP 中已登录的账号、模型选择与设置。
+面向 **Oh My Pi (`omp`)** 的零侵入 **SuperAgent 单窗口跨项目协同插件**：平时是 100% 原版标准 `omp`；需要统筹复杂任务或多项目开发时，敲下 `/coord` 唤起你的专属**总秘书**——你只需跟一个人用大白话聊天，总秘书自动往后台各项目派发专员小队，遇事主动问你、干完主动汇报。
 
-文档：[整体架构设计](docs/architecture.md) · [交接协议与 YAML 角色编写指南](docs/protocol-and-roles.md) · [`algo` 实验目录与报告门禁规范](docs/algo-workflow-and-report.md)
-
----
-
-## 核心特性
-
-1. **双范式同构（日常 `N = 1` 与协同 `N > 1` 统一）**
-   - **内规范 (`RoleSpec`)**：采用纯 YAML 定义**认知立场 (`stance`)、工作方法步骤 (`method`)、工具与读写边界 (`permissions`)、准出判据 (`exit`)**，使用 Bun 1.4 原生 `Bun.YAML.parse` 零外部依赖解析。默认激活全能力通用基态 `general`，并内置 `algo`（引导型有监督算法优化专家）、`vision`（默认绑定 `@vision` 的只读视觉与图表诊断专员）、`dev`、`qa`、`reviewer`、`ml-engineer`、`supervisor` 共八个标准角色。
-   - **外规范 (`HandoffEnvelope`)**：无论日常向用户收尾，还是跨角色转手（如 `dev → qa`），统一传递**原始需求 (`Mandate`) + 自动计算的增删改产物 `sha256` 快照 + 本轮已核验事实 (`verifiedFacts`) 与真实工具证据 + 未决风险**，自动截断上游冗长的试错对话历史，杜绝上下文锚定污染。
-2. **100% 原生继承 OMP 生态，零重复配置与零命令劫持**
-   - 仅使用 OMP 公开 `ExtensionAPI` 与官方根 SDK `pi.pi.createAgentSession`（子会话强制使用 `SessionManager.inMemory` 内存会话，绝不污染主会话 `.jsonl` 历史或劫持 `omp --continue`），自动复用已登录的 `/login` OAuth 订阅账号、API Key、当前选中模型、Thinking 档位及内置 Rust 工具链。
-   - 完整保留 OMP 原生内置 `/handoff`（`/compact handoff`）行为不作覆盖，插件独立阶段转手统一使用 `/enhance-handoff`。
-3. **个人主权优先：无预扣预算、无源头硬超时**
-   - 实测 Token 与费用被动汇总记录至 `HandoffEnvelope.observedUsage`，不设预扣额度锁或固定时长强杀；多角色返修回路内置连续同错无进展熔断（Stagnation Guard）防止无人看管死循环。
-4. **原生融入系统 `/settings` 与内聚 `Role Studio`（受信任工作区门禁）**
-   - 自动发现优先级：受信任项目级 `.omp/roles/*.yaml`（需通过 `ctx.isProjectTrusted()` 校验） > 个人全局库 `~/.omp/enhance/roles/*.yaml` > 插件内置 `roles/*.yaml`。
-   - 插件全局参数直接集成在 OMP 系统默认 **`/settings → Plugins → omp-enhance`**（支持 `--profile` 配置隔离），交互式 TUI 下执行 `/role`、`/role studio` 或 `/role edit <id>` 即可打开可视化 **Role Studio**（新建角色向导、绑定角色专属模型、勾选工具复选框、Copy-on-Write 覆盖与一键恢复默认）。
-5. **全链路状态持久化、崩溃断点续跑与 `--continue` / `F5` 无损恢复**
-   - **长作业与进程身份防误杀对账**：后台长作业、会话/流程级 `Mandate`、`HandoffEnvelope`、认知黑板与 Flow 检查点全程持久化至 `.omp-enhance/state.sqlite`（6 张表，WAL + `busy_timeout` 并发事务模式，按需惰性创建）；通过进程启动时间指纹（`processStartToken`）防止跨重启 PID 复用误判或误杀无关进程。
-   - **Flow 断点续跑（`/flow continue` / `Ctrl+R`）**：多角色 Flow 每步与阶段切换自动写入带属主进程指纹的检查点；若进程中断后通过 `omp --continue` 重开，已完成阶段绝不重跑，群聊气泡、用户中途插话与工具轨迹完整恢复，输入 `/flow continue`（或在 `/flow` 面板按 `Ctrl+R`）即可从中断阶段继续执行（安全越界 `violation` 状态禁止带脏续跑）。
-   - **会话角色记忆与 `F5` 重试保护**：当前会话切换的 `/role <id>` 自动随 OMP `.jsonl` 会话分支持久化（切换回 `inherit` 或 `/role off` 时自动还原会话初始模型与推理档位）；当单轮请求因网络波动报错或中断后按 **`F5` 重试**时，自动保留报错前的文件基线快照与已执行工具证据。
-6. **运行期自适应巡检与止损（Supervisor 默认继承 `@advisor` 模型与推理档位）**
-   - 内置 `supervisor` 默认自动继承你在 OMP 中配置的 **`@advisor`（Advisor 模型角色及其 `:thinking` 推理档位，`supervisorThinking: "inherit"`）**，完整支持 OMP `19.x` 全部推理档位（含 `max` 与 `auto`），也可在 `/settings → Plugins → omp-enhance`（`supervisorModel` / `supervisorThinking`）或 `/role edit supervisor` 中自由改绑任意模型或推理档位。
-   - 为隔离阶段子会话（`/flow`、`/enhance-handoff`、`delegateNow`）及 `enhance_job(action="watch")` 后台作业提供周期性增量脉搏巡检（携带阶段 `roleId` / `readOnly` / `allowedTools` 权限元数据、正在运行的长耗时工具 `activeTool`、OMP 原生后台异步任务数 `activeAsyncJobs` 与最近巡检历史 `priorDecisions`）：对只读或无 `bash` 阶段严禁误导执行 Shell 命令，原生 `bg_*` 后台任务运行期自动计为活跃进展；子会话支持 `continue`、`steer`、`abort` 三种裁决（阶段中止时自动清理该阶段启动的残留 `enhance_job` 进程组），无标准输入的后台作业仅约束为 `continue` 或 `abort`。
-   - 快速任务在初始延迟（默认 30 秒）内结束时不产生任何监督模型调用；关闭 `supervisorEnabled` 时 `watch` 仅静默轮询完成状态而不触发 `@advisor` 调用；监督模型自身报错时 **fail-open** 并按指数退避（`30s → 60s → 120s...`）重试，绝不误杀健康任务或刷爆配额。
-7. **双流协同架构 + 左右对称群聊卡片与 `/flow` 动作检查器（B + C 形态）**
-   - **前台沟通流 + 后台执行流非阻塞并发**：多角色 Flow 在后台异步推进，主对话框始终解锁可随时追问或插话；支持在 `/settings → Plugins → omp-enhance` 切换 `flowRoutingMode`（默认 `ask` 询问确认、`auto` 自动派发、`manual` 仅手动 `/flow` 触发）。
-   - **左右对称群聊视觉语言**：各角色与 `supervisor` 发言居左（`▶ [dev → @qa]`），你的发言与中途插话居右（`... ◀ 你`）。
-   - **形态 B（主窗口实时悬停条 + 永久纪要卡片）**：后台执行期间在输入框上方显示紧凑实时群聊条；结束后自动折叠归档为群聊纪要卡片，按 `Ctrl+O` 一键展开每个 Agent 具体执行的工具时间线与产物快照。
-   - **形态 C（`/flow` 双栏群聊与 Agent 动作检查器）**：不带参数输入 `/flow`（或 `/flow hub`）打开全屏左右分栏面板——左栏 `↑/↓` 浏览左右群聊气泡，右栏实时检视当前选中 Agent 的模型、耗时、有序工具轨迹、产物 `sha256` 与插话记录；底部输入框直接打字回车即可向正在运行的 Agent 实时 `steer` 插话（或指定 `@role` 留言给下游角色），`Ctrl+X` 一键中止。
-   - **`@<roleId> <任务>` 直呼特定角色**：在主对话框直接输入 `@qa 跑一下鉴权边界测试` 即可免命令拉起单角色隔离执行并汇报。
+深入文档：[整体架构设计](docs/architecture.md) · [交接协议与 YAML 角色编写指南](docs/protocol-and-roles.md) · [`algo` 实验目录与报告门禁规范](docs/algo-workflow-and-report.md)
 
 ---
 
-## 快速开始
+## 三句话看懂工作方式
 
-### 安装 / 软链挂载为原生 OMP 插件（推荐）
+1. **默认 100% 标准 OMP（零侵入）**
+   装好插件直接打开 `omp`，界面、状态栏、工具与原版完全一致——默认不挂任何角色、不往上下文乱塞提示词、不改动原生命令，也不干扰 `@file` 文件补全。
+2. **敲 `/coord` 唤起总秘书（SuperAgent 单窗口统筹）**
+   全程你只跟**总秘书**一个人用自然语言对话。总秘书绝不亲自下场改代码、跑命令把聊天上下文弄乱，而是先用两三句大白话跟你确认**【去哪个项目目录 + 派哪几个专员 + 怎么算改好】**；你点头说“好 / 开干”后立刻往后台派单（支持在同一个窗口跨多个项目目录并行派发！）。
+3. **双向自动闭环（零空转干等、完事主动叫你）**
+   后台专员执行期间主对话框始终空闲可聊；专员遇到拿不准的业务取舍会自动挂起（挂起期间 **0 Token 消耗**）并让总秘书在聊天框问你，你随口答一句就能接着跑；专员干完活自动唤醒总秘书，把硬核验证报告消化成干净利落的人话结论交给你。
+
+---
+
+## 30 秒真实对话示例
+
+```text
+你：/coord
+系统：已开启总秘书模式（输入 /coord off 可随时退回标准 OMP）。
+
+你：帮我把 ../billing-api 里退款金额没拦负数的问题修掉，顺便去 ../admin-web 盘点一下对账页还差哪些接口没接。
+
+总秘书：收到！我准备分两路在后台同时推进：
+1. ../billing-api：派 dev → qa → reviewer 修复负数退款拦截，补齐独立边界测试并做盲审；
+2. ../admin-web：派只读 planner 扫描对账页源码与接口定义，梳理未接入清单（零文件修改）。
+这样安排可以开干吗？
+
+你：开干！
+
+（两路后台专员并行启动，主窗口随时可以继续聊别的事……片刻后总秘书自动主动找你）
+
+总秘书：../billing-api 那边的专员核对逻辑时有个业务细节想请你拍板：
+退款金额正好等于 0 时，应该直接报错拦截，还是按幂等空操作放行？
+
+你：等于 0 也直接报错拦截。
+
+总秘书：明白，已转达 ../billing-api 继续修改并补上 0 值断言。
+
+（两路后台流水线先后收工，自动唤醒总秘书向你汇报）
+
+总秘书：两边都顺利办妥了：
+- ../billing-api（已通过独立测试与盲审）：入口与服务层均已拦截 amount <= 0，qa 新增负数、零值与精度边界共 6 组实测全绿，reviewer 核验无越界改动。
+- ../admin-web（盘点完成）：账单列表与导出 CSV 已接通，还剩“异常账单人工冲正”和“月度汇总重算” 2 个接口未对接（具体文件行号已备好），需要现在派人去接上吗？
+```
+
+---
+
+## 6 类专员分工 × 项目规范自动加载（`Role × Project Context/Skills`）
+
+`omp-enhance` 把**“专员分工与权限护栏（`Role`）”**和**“项目规范与领域技能（`AGENTS.md` + `Skills`）”**分离开，只用 **1 个总秘书入口 + 6 类专员分工**就能覆盖研发、架构、测试、盲审、看图与算法调优全场景：
+
+| 角色 ID | 定位 | 权限护栏与工作方式 | 常见派单流向示例 |
+| --- | --- | --- | --- |
+| `coordinator` | **总协调官 / 总秘书**（唯一对话入口） | 只读探路 + 跨项目派单权；**严禁亲自改文件或跑命令** | 敲 `/coord` 进入 |
+| `planner` | **探查与规划专员** | 纯只读（`read`/`grep`/`glob`/`find`/`ls`/`lsp`）+ 强制附真实文件行号依据 | 单派 `planner`、`planner → reviewer` |
+| `dev` | **工程开发专员** | 可读写源码与执行验证命令，专注最小可验证改动 | 小改单派 `dev`、常规开发 `dev → qa` |
+| `algo` | **引导型算法优化专家** | 不碰原始数据，在独立实验目录（`algo_work/`）中一轮一存档做可复现对比调优；遇到业务容错偏好或性能瓶颈时自动暂停问你拍板，实时维护带图表证据的实验报告 | 带真值数据/ML 调优单派 `algo` |
+| `qa` | **独立测试与证伪专员** | **只许改测试目录、物理锁死保护 `src/**`**；发现缺陷自动打回上游返修 | 高保障交付 `dev → qa → reviewer` |
+| `reviewer` | **独立代码与方案盲审员** | 纯只读视角独立盲审代码、架构蓝图与接口契约，揪出未证实前提与边界漏洞 | 独立审计单派 `reviewer` |
+| `vision` | **视觉与图表诊断专员** | 默认绑定 `@vision` 多模态模型直读样本图、残差曲线与界面截图，输出客观像素证据 | 看图取证单派 `vision`（或由专员中途委托） |
+
+> 后台另内置隐藏运行期巡检员 `supervisor`（默认继承你在 OMP 配置的 `@advisor` 模型与推理档位），在任务长耗时运行期间静默防卡死、防死循环与纠偏止损，不出现在日常角色列表中干扰选择。
+
+### 黄金法则：什么时候写 `AGENTS.md` / `Skills`，什么时候新增 `Role YAML`？
+
+- **95% 场景请写进项目的 `AGENTS.md` 或 `Skills`**：技术栈约定（React / Go / Rust / PyTorch）、目录结构、接口规范、测试命令与业务术语。后台专员进入任意目标项目目录时，会**自动加载该项目下的 `AGENTS.md`、领域 `Skills` 与 `LSP`**——同一个 `dev` 进前端仓库就是资深前端，进后端仓库就是后端，无需维护一堆重复的“前端 dev / 后端 dev”角色。
+- **仅在需要新的“工作立场或硬权限锁”时用 `/role` 新建 `Role YAML`**：例如你想为某类专员固定绑定特定模型与推理档位，或者加一把硬权限锁（如“只允许写入 `docs/**`、严禁修改源码或运行命令的文档专员”）。
+
+---
+
+## 极简三命令速查
+
+日常使用只需记住 **3 个斜杠命令**：
+
+| 命令 | 用途 |
+| --- | --- |
+| `/coord` | **开启或关闭总秘书**：`/coord` 开启总秘书模式；`/coord off` 一键退回 100% 原版标准 OMP；`/coord status` 查看当前跨项目后台任务概览 |
+| `/role` | **专员编制与模型绑定工作台**：敲 `/role` 打开可视化面板为各专员绑定专属模型与推理档位，或新建、拷贝、编辑、删除自定义专员；也可执行 `/role list` 查看所有专员列表、`/role show <id>` 查看指定专员详细配置 |
+| `/flow` | **跨项目只读后台监控窗**：`Tab` / `←` `→` 在不同项目的后台流水线间切换，`↑` `↓` 翻看每个专员的工具执行轨迹与产物快照；`/flow status` 查看文本进度，`/flow cancel` 紧急叫停 |
+
+---
+
+## 安装与配置
+
+### 挂载为原生 OMP 插件
 
 ```sh
 omp plugin link .
 ```
 
-挂载后启动 `omp`，输入系统内置 `/settings` 并切换到 **`Plugins → omp-enhance`** 标签页，即可直接在系统设置面板中调整默认激活角色、`supervisorModel`（默认 `@advisor`）、巡检初始延迟、返修轮次上限与底部状态栏徽标开关。
+100% 自动继承你在 OMP 中已登录的 `/login` OAuth 订阅账号、API Key 与模型设置，无需重复配置任何密钥。
 
-也可单次临时加载：
+如需调整全局偏好（例如将开机默认模式由标准 `"off"` 改为自动进入 `"coordinator"`，或调整 `@advisor` 巡检开关与返修轮次上限），随时在 `omp` 中打开 **`/settings → Plugins → omp-enhance`** 即可。
 
-```sh
-omp --extension .
-```
-
-### 交互命令速查
-
-| 命令 | 说明 |
-| --- | --- |
-| `/settings` → `Plugins` → `omp-enhance` | 在 OMP 系统默认设置面板中配置插件参数（`defaultRole`、`flowRoutingMode`、`supervisorModel`、`supervisorEnabled`、`flowMaxRepairRounds` 等） |
-| `/role` 或 `/role studio` | 打开**单屏左右分栏 Role 面板**（`Enter` 切换会话角色，`e/→` 修改配置，`c` 基于当前角色拷贝新角色，`d` 删除自定义角色（8 个内置默认角色受保护不可删），`h` 独立阶段交接，`n` 新建，`Esc` 退出） |
-| `/role copy <src> <newId> [--project]` | 以现有内置或自定义角色为模板一键拷贝生成新角色 YAML |
-| `/role delete <customId>` | 删除自定义角色（内置默认角色受保护不可删除；若删除当前激活角色会自动回退至默认角色配置） |
-| `/role edit <id>` | 在交互式 TUI 中直接打开指定角色的配置页（内置角色修改时自动 Copy-on-Write 保存至覆盖目录，支持一键恢复默认） |
-| `/role list` | 文本列出当前激活角色及所有可用角色（显示来源与绑定模型） |
-| `/role <id>` / `/role off` | 切换主会话当前激活角色（若角色绑定了专属模型/推理档位会同步切换，切回时自动还原基线），或暂时关闭角色条件化注入 |
-| `/role show <id>` | 查看指定角色的完整 YAML 规范、专属模型、读写保护边界与文件路径 |
-| `/role create <id> [--project] [--readonly] <描述>` | CLI 快速生成规范 YAML 角色文件（默认存入 `~/.omp/enhance/roles/`） |
-| `/enhance-handoff [role]` | 将当前成果转手给独立隔离的阶段角色（如 `/enhance-handoff qa`；不带参数敲 `/enhance-handoff` 会弹出目标角色选择器，支持 `Tab` 补全，且不占用 OMP 原生内置 `/handoff` 压缩交接命令） |
-| `/flow` 或 `/flow hub` | 打开**双栏群聊与 Agent 动作检查器面板**（左栏左右对称群聊流，右栏检视每个 Agent 的工具动作轨迹与产物，底部输入框回车实时 `steer` 插话，`Ctrl+R` 断点续跑中断流程，`Ctrl+X` 中止，`Esc` 关闭） |
-| `/flow <r1,r2,...> [任务说明]` | 后台非阻塞启动马尔可夫隔离角色链与自动打回返修（如 `/flow dev,qa,reviewer`），主窗口显示实时悬停条并在完成后归档为可 `Ctrl+O` 展开的群聊卡片 |
-| `/flow continue` / `/flow steer <内容>` / `/flow cancel` / `/flow status` | 从上次中断/失败阶段断点续跑、向运行中的后台 Flow 实时插话纠偏、中止执行或查看快照 |
-| `@<roleId> <任务>` | 在主输入框直接点名某个角色（如 `@qa 验证并发边界`）执行独立隔离阶段并汇报 |
-| `/enhance-status` | 本地只读查看当前角色、当前生效插件设置、Flow 房间状态、有效 `Mandate`、认知黑板计数、最近交接链与后台作业 |
-
-### 模型可调用工具
-
-- `enhance_mandate`：建立/更新原始需求契约（目标、硬约束、验收条件）及读写认知黑板（`fact` 强制绑定真实证据引用、`hypothesis`、`inquiry`、`decision`）。
-- `enhance_handoff`：收束本轮工作生成标准 `HandoffEnvelope`（自动计算增删改文件 `sha256`、密封校验读写边界并核验真实工具调用证据），可选委托受权限允许的下一角色。
-- `enhance_flow`：双流协同控制工具，支持 `action: "start" | "resume" | "status" | "steer" | "cancel"`（受 `flowRoutingMode` 与角色写权限边界保护）。
-- `enhance_job`：启动、`watch`（支持工具 `AbortSignal` 取消与自适应巡检）、读取日志尾部、跨重启对账（`reconcile`）或安全取消后台无时限长作业（启动/取消操作要求当前角色具备非只读 `bash` 权限，在前台与阶段子会话中同构可用）。
-
----
-
-## 开发与验证
+### 开发与真机验证
 
 ```sh
-bun run probe:phase0 # 真机验证本机 OMP 公开 SDK、账号继承与隔离会话生命周期
+bun run probe:phase0 # 验证本机 OMP 公开 SDK、账号继承与隔离会话生命周期
 bun run check        # 类型检查 + 分层架构依赖/单文件行数/零私有导入门禁 + 单元测试
 bun run verify:omp   # 调用本机真实 omp 执行端到端集成验收
 ```

@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type {
   ArtifactRecord, BackgroundJob, EpistemicItem, EpistemicKind, EpistemicStatus,
@@ -20,10 +20,7 @@ function safeParseArray<T>(raw: string | null | undefined): T[] {
 
 function safeParseObject<T>(raw: string | null | undefined): T | null {
   if (!raw) return null;
-  try {
-    const p: unknown = JSON.parse(raw);
-    return p && typeof p === "object" && !Array.isArray(p) ? (p as T) : null;
-  } catch { return null; }
+  try { const p: unknown = JSON.parse(raw); return p && typeof p === "object" && !Array.isArray(p) ? (p as T) : null; } catch { return null; }
 }
 
 /** Capture OS process start-time token (`starttime` on Linux `/proc`, `ps lstart=` on macOS/BSD). */
@@ -33,10 +30,8 @@ export function captureProcessStartToken(pid: number): string | null {
   if (existsSync(procStatPath)) {
     try {
       const stat = readFileSync(procStatPath, "utf8"), closeParen = stat.lastIndexOf(")");
-      if (closeParen > 0) {
-        const f = stat.slice(closeParen + 2).trim().split(/\s+/);
-        if (f[19]) return `proc:${f[19]}`;
-      }
+      const f = closeParen > 0 ? stat.slice(closeParen + 2).trim().split(/\s+/) : [];
+      if (f[19]) return `proc:${f[19]}`;
     } catch { return null; }
   }
   try {
@@ -49,13 +44,8 @@ export function captureProcessStartToken(pid: number): string | null {
 /** Verify both PID existence and start-time identity to prevent PID-reuse false positives. */
 export function isProcessAliveWithToken(pid: number, expectedToken?: string | null): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EPERM" && expectedToken) {
-      return captureProcessStartToken(pid) === expectedToken;
-    }
-    return false;
+  try { process.kill(pid, 0); } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM" && Boolean(expectedToken) && captureProcessStartToken(pid) === expectedToken;
   }
   return !expectedToken || captureProcessStartToken(pid) === expectedToken;
 }
@@ -64,9 +54,9 @@ const SCHEMA_TABLES = [
   "CREATE TABLE IF NOT EXISTS mandates (id TEXT PRIMARY KEY, rev INTEGER NOT NULL, goal TEXT NOT NULL, constraints TEXT NOT NULL, acceptance TEXT NOT NULL, status TEXT NOT NULL, session_id TEXT, flow_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
   "CREATE TABLE IF NOT EXISTS epistemic_items (id TEXT PRIMARY KEY, mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE, kind TEXT NOT NULL CHECK (kind IN ('fact', 'hypothesis', 'inquiry', 'decision')), statement TEXT NOT NULL, evidence_ref TEXT, verification_plan TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, CHECK (kind != 'fact' OR (evidence_ref IS NOT NULL AND length(trim(evidence_ref)) > 0)));",
   "CREATE TABLE IF NOT EXISTS artifacts (artifact_id INTEGER PRIMARY KEY AUTOINCREMENT, mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE, path TEXT NOT NULL, sha256 TEXT NOT NULL, byte_size INTEGER NOT NULL, role TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE (mandate_id, path, sha256));",
-  "CREATE TABLE IF NOT EXISTS handoffs (id TEXT PRIMARY KEY, mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE, mandate_rev INTEGER NOT NULL, parent_handoff_id TEXT, from_role TEXT NOT NULL, to_target TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL, artifacts TEXT NOT NULL, deleted_files TEXT, verified_facts TEXT NOT NULL, open_risks TEXT NOT NULL, feedback_for_upstream TEXT, observed_usage TEXT, created_at TEXT NOT NULL);",
+  "CREATE TABLE IF NOT EXISTS handoffs (id TEXT PRIMARY KEY, mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE, mandate_rev INTEGER NOT NULL, parent_handoff_id TEXT, from_role TEXT NOT NULL, to_target TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL, artifacts TEXT NOT NULL, deleted_files TEXT, verified_facts TEXT NOT NULL, open_risks TEXT NOT NULL, questions_for_user TEXT, feedback_for_upstream TEXT, observed_usage TEXT, created_at TEXT NOT NULL);",
   "CREATE TABLE IF NOT EXISTS jobs (job_id TEXT PRIMARY KEY, mandate_id TEXT REFERENCES mandates(id) ON DELETE SET NULL, hypothesis_id TEXT, command TEXT NOT NULL, cwd TEXT NOT NULL, pid INTEGER NOT NULL, pgid INTEGER NOT NULL, owner_pid INTEGER, process_start_token TEXT, log_path TEXT NOT NULL, exit_file_path TEXT NOT NULL, status TEXT NOT NULL, exit_code INTEGER, started_at TEXT NOT NULL, ended_at TEXT);",
-  "CREATE TABLE IF NOT EXISTS flow_runs (flow_id TEXT PRIMARY KEY, mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE, goal TEXT NOT NULL, role_chain TEXT NOT NULL, status TEXT NOT NULL, current_index INTEGER NOT NULL, repair_round INTEGER NOT NULL, last_handoff_id TEXT, max_repair_rounds INTEGER NOT NULL, snapshot_json TEXT NOT NULL, owner_pid INTEGER, owner_start_token TEXT, next_stage_seq INTEGER, last_rejection_sig TEXT, user_steers TEXT, updated_at TEXT NOT NULL);",
+  "CREATE TABLE IF NOT EXISTS flow_runs (flow_id TEXT PRIMARY KEY, mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE, goal TEXT NOT NULL, cwd TEXT, role_chain TEXT NOT NULL, status TEXT NOT NULL, current_index INTEGER NOT NULL, repair_round INTEGER NOT NULL, last_handoff_id TEXT, max_repair_rounds INTEGER NOT NULL, snapshot_json TEXT NOT NULL, owner_pid INTEGER, owner_start_token TEXT, next_stage_seq INTEGER, last_rejection_sig TEXT, user_steers TEXT, updated_at TEXT NOT NULL);",
 ].join("\n");
 
 const SCHEMA_INDEXES = [
@@ -81,9 +71,10 @@ const SCHEMA_INDEXES = [
 ].join("\n");
 
 const MIGRATIONS: ReadonlyArray<[table: string, column: string, ddl: string]> = [
-  ["mandates", "session_id", "TEXT"], ["mandates", "flow_id", "TEXT"], ["handoffs", "deleted_files", "TEXT"],
+  ["mandates", "session_id", "TEXT"], ["mandates", "flow_id", "TEXT"],
+  ["handoffs", "deleted_files", "TEXT"], ["handoffs", "questions_for_user", "TEXT"],
   ["jobs", "owner_pid", "INTEGER"], ["jobs", "process_start_token", "TEXT"],
-  ["flow_runs", "owner_pid", "INTEGER"], ["flow_runs", "owner_start_token", "TEXT"],
+  ["flow_runs", "cwd", "TEXT"], ["flow_runs", "owner_pid", "INTEGER"], ["flow_runs", "owner_start_token", "TEXT"],
   ["flow_runs", "next_stage_seq", "INTEGER"], ["flow_runs", "last_rejection_sig", "TEXT"],
   ["flow_runs", "user_steers", "TEXT"],
 ];
@@ -103,7 +94,7 @@ interface HandoffRow {
   id: string; mandate_id: string; mandate_rev: number; parent_handoff_id: string | null;
   from_role: string; to_target: string; verdict: HandoffEnvelope["verdict"]; summary: string;
   artifacts: string; deleted_files: string | null; verified_facts: string; open_risks: string;
-  feedback_for_upstream: string | null; observed_usage: string | null; created_at: string;
+  questions_for_user: string | null; feedback_for_upstream: string | null; observed_usage: string | null; created_at: string;
 }
 interface JobRow {
   job_id: string; mandate_id: string | null; hypothesis_id: string | null; command: string; cwd: string;
@@ -127,11 +118,13 @@ const toArtifact = (r: ArtifactRow): ArtifactRecord => ({
 });
 const toHandoff = (r: HandoffRow): HandoffEnvelope => {
   const deletedFiles = r.deleted_files != null ? safeParseArray<string>(r.deleted_files) : undefined;
+  const questionsForUser = r.questions_for_user != null ? safeParseArray<string>(r.questions_for_user) : undefined;
   return {
     id: r.id, mandateId: r.mandate_id, mandateRev: r.mandate_rev, parentHandoffId: r.parent_handoff_id,
     fromRole: r.from_role, toTarget: r.to_target, verdict: r.verdict, summary: r.summary,
     artifacts: safeParseArray(r.artifacts), ...(deletedFiles !== undefined ? { deletedFiles } : {}),
     verifiedFacts: safeParseArray(r.verified_facts), openRisks: safeParseArray(r.open_risks),
+    ...(questionsForUser !== undefined ? { questionsForUser } : {}),
     feedbackForUpstream: r.feedback_for_upstream,
     observedUsage: safeParseObject<NonNullable<HandoffEnvelope["observedUsage"]>>(r.observed_usage),
     createdAt: r.created_at,
@@ -147,6 +140,7 @@ const toJob = (r: JobRow): BackgroundJob => ({
 });
 const toFlowCheckpoint = (row: Record<string, unknown>): PersistedFlowCheckpoint => ({
   flowId: String(row.flow_id), mandateId: String(row.mandate_id), goal: String(row.goal),
+  ...(row.cwd != null ? { cwd: String(row.cwd) } : {}),
   roleChain: safeParseArray<string>(String(row.role_chain ?? "[]")), status: String(row.status),
   currentIndex: Number(row.current_index), repairRound: Number(row.repair_round),
   lastHandoffId: row.last_handoff_id ? String(row.last_handoff_id) : null,
@@ -198,7 +192,11 @@ export class EnhanceStore {
     if (!create && !existsSync(this.dbPath)) return null;
     try { this.roDb?.close(); } catch {}
     this.roDb = null;
-    mkdirSync(path.dirname(this.dbPath), { recursive: true });
+    const dir = path.dirname(this.dbPath);
+    mkdirSync(dir, { recursive: true });
+    if (path.basename(dir) === ".omp-enhance") {
+      try { const gi = path.join(dir, ".gitignore"); if (!existsSync(gi)) writeFileSync(gi, "*\n", "utf8"); } catch {}
+    }
     this.db = new Database(this.dbPath);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
     this.db.exec(SCHEMA_TABLES); this.migrateSchema(this.db); this.db.exec(SCHEMA_INDEXES);
@@ -348,13 +346,14 @@ export class EnhanceStore {
 
   saveHandoff(envelope: HandoffEnvelope): void {
     this.writeConn(true)!.query(
-      "INSERT OR REPLACE INTO handoffs (id, mandate_id, mandate_rev, parent_handoff_id, from_role, to_target, verdict, summary, artifacts, deleted_files, verified_facts, open_risks, feedback_for_upstream, observed_usage, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO handoffs (id, mandate_id, mandate_rev, parent_handoff_id, from_role, to_target, verdict, summary, artifacts, deleted_files, verified_facts, open_risks, questions_for_user, feedback_for_upstream, observed_usage, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     ).run(
       envelope.id, envelope.mandateId, envelope.mandateRev, envelope.parentHandoffId, envelope.fromRole,
       envelope.toTarget, envelope.verdict, envelope.summary, JSON.stringify(envelope.artifacts),
       envelope.deletedFiles !== undefined ? JSON.stringify(envelope.deletedFiles) : null,
-      JSON.stringify(envelope.verifiedFacts), JSON.stringify(envelope.openRisks), envelope.feedbackForUpstream,
-      envelope.observedUsage ? JSON.stringify(envelope.observedUsage) : null, envelope.createdAt,
+      JSON.stringify(envelope.verifiedFacts), JSON.stringify(envelope.openRisks),
+      envelope.questionsForUser !== undefined ? JSON.stringify(envelope.questionsForUser) : null,
+      envelope.feedbackForUpstream, envelope.observedUsage ? JSON.stringify(envelope.observedUsage) : null, envelope.createdAt,
     );
   }
 
@@ -419,8 +418,8 @@ export class EnhanceStore {
     if (this.closed) return;
     const db = this.writeConn(true)!;
     db.transaction(() => {
-      db.query("INSERT OR REPLACE INTO flow_runs (flow_id, mandate_id, goal, role_chain, status, current_index, repair_round, last_handoff_id, max_repair_rounds, snapshot_json, owner_pid, owner_start_token, next_stage_seq, last_rejection_sig, user_steers, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-        .run(cp.flowId, cp.mandateId, cp.goal, JSON.stringify(cp.roleChain), cp.status, cp.currentIndex, cp.repairRound, cp.lastHandoffId, cp.maxRepairRounds, cp.snapshotJson, cp.ownerPid ?? null, cp.ownerStartToken ?? null, cp.nextStageSeq ?? null, cp.lastRejectionSig ?? null, cp.userSteers !== undefined ? JSON.stringify(cp.userSteers) : null, cp.updatedAt);
+      db.query("INSERT OR REPLACE INTO flow_runs (flow_id, mandate_id, goal, cwd, role_chain, status, current_index, repair_round, last_handoff_id, max_repair_rounds, snapshot_json, owner_pid, owner_start_token, next_stage_seq, last_rejection_sig, user_steers, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(cp.flowId, cp.mandateId, cp.goal, cp.cwd ?? null, JSON.stringify(cp.roleChain), cp.status, cp.currentIndex, cp.repairRound, cp.lastHandoffId, cp.maxRepairRounds, cp.snapshotJson, cp.ownerPid ?? null, cp.ownerStartToken ?? null, cp.nextStageSeq ?? null, cp.lastRejectionSig ?? null, cp.userSteers !== undefined ? JSON.stringify(cp.userSteers) : null, cp.updatedAt);
       db.query("DELETE FROM flow_runs WHERE status != 'running' AND flow_id NOT IN (SELECT flow_id FROM flow_runs ORDER BY updated_at DESC, rowid DESC LIMIT ?)").run(MAX_ARCHIVED_FLOW_RUNS);
     }).immediate();
   }

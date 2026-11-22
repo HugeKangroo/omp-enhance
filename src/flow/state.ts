@@ -35,14 +35,14 @@ export interface FlowObserver {
   onToolEnd?: (stageId: string, call: ObservedToolCall) => void;
   onSupervisorNote?: (stageId: string, note: string) => void;
   onStageEnd?: (stageId: string, info: {
-    status: "ready" | "rejected" | "blocked" | "violation" | "aborted";
+    status: "ready" | "needs_input" | "rejected" | "blocked" | "violation" | "aborted";
     outcome: StageTurnSummaryLike | null;
     reason?: string;
   }) => void;
 }
 
 export interface FlowRoomSnapshot {
-  flowId: string | null; mandateId?: string; goal: string; roleChain: string[];
+  flowId: string | null; mandateId?: string; goal: string; cwd?: string; roleChain: string[];
   status: FlowRoomStatus; reason?: string; currentIndex?: number; repairRound?: number;
   startedAt: string | null; endedAt: string | null; activeStageId: string | null;
   entries: RoomEntry[]; stages: FlowStageTrace[]; userSteers?: FlowUserSteer[];
@@ -88,10 +88,12 @@ export class FlowRoomManager {
   private cancelled = false;
   private disposed = false;
   private seq = 0;
+  private cwd: string | undefined;
   private readonly selfStartToken = captureProcessStartToken(process.pid);
   private readonly listeners = new Set<() => void>();
 
-  constructor(private readonly ui?: FlowRoomUiAdapter, private readonly store?: EnhanceStore) {
+  constructor(private readonly ui?: FlowRoomUiAdapter, private readonly store?: EnhanceStore, cwd?: string) {
+    this.cwd = cwd;
     this.hydrateFromStore();
   }
 
@@ -103,7 +105,7 @@ export class FlowRoomManager {
   isResumable(): boolean {
     return Boolean(
       this.flowId && this.mandateId && this.roleChain.length > 0 && this.currentIndex < this.roleChain.length &&
-      (this.status === "interrupted" || this.status === "failed" || this.status === "cancelled"),
+      (this.status === "waiting_input" || this.status === "interrupted" || this.status === "failed" || this.status === "cancelled"),
     );
   }
 
@@ -122,14 +124,14 @@ export class FlowRoomManager {
     try {
       const owned = this.status === "running";
       const snapJson = JSON.stringify({
-        flowId: this.flowId, mandateId: this.mandateId, goal: this.goal, roleChain: this.roleChain,
-        status: this.status, currentIndex: this.currentIndex, repairRound: this.repairRound,
+        flowId: this.flowId, mandateId: this.mandateId, goal: this.goal, ...(this.cwd ? { cwd: this.cwd } : {}),
+        roleChain: this.roleChain, status: this.status, currentIndex: this.currentIndex, repairRound: this.repairRound,
         ...(this.reason ? { reason: this.reason } : {}), startedAt: this.startedAt, endedAt: this.endedAt,
         activeStageId: this.activeStageId, entries: this.entries, stages: this.stages, userSteers: this.userSteers,
       });
       this.store.saveFlowCheckpoint({
-        flowId: this.flowId, mandateId: this.mandateId, goal: this.goal, roleChain: this.roleChain,
-        status: this.status, currentIndex: this.currentIndex, repairRound: this.repairRound,
+        flowId: this.flowId, mandateId: this.mandateId, goal: this.goal, ...(this.cwd ? { cwd: this.cwd } : {}),
+        roleChain: this.roleChain, status: this.status, currentIndex: this.currentIndex, repairRound: this.repairRound,
         lastHandoffId: this.lastHandoffId, maxRepairRounds: this.maxRepairRounds, snapshotJson: snapJson,
         ownerPid: owned ? process.pid : null, ownerStartToken: owned ? this.selfStartToken : null,
         nextStageSeq: this.nextStageSeq, lastRejectionSig: this.lastRejectionSig,
@@ -152,6 +154,7 @@ export class FlowRoomManager {
     } catch {}
 
     this.flowId = cp.flowId; this.mandateId = cp.mandateId; this.goal = cp.goal;
+    this.cwd = cp.cwd ?? snap.cwd ?? this.cwd;
     this.roleChain = [...cp.roleChain]; this.currentIndex = cp.currentIndex; this.repairRound = cp.repairRound;
     this.lastHandoffId = cp.lastHandoffId; this.maxRepairRounds = cp.maxRepairRounds;
     this.startedAt = typeof snap.startedAt === "string" ? snap.startedAt : null;
@@ -166,14 +169,14 @@ export class FlowRoomManager {
 
     if (cp.status === "running") {
       this.status = "interrupted"; this.activeStageId = null; this.endedAt = new Date().toISOString();
-      this.reason = "上次进程中断，输入 /flow continue 断点续跑";
+      this.reason = "上次进程中断，可在总秘书 (/coord) 中断点续跑";
       for (const st of this.stages) {
         if (st.status === "running") { st.status = "aborted"; st.endedAt = this.endedAt; st.activeTool = null; }
       }
       for (const en of this.entries) {
         if (en.badge?.startsWith("●")) {
           en.badge = "⏸ 中断"; en.tone = "warning";
-          en.text = "进程中断，输入 /flow continue (或 Ctrl+R) 从本阶段续跑";
+          en.text = "进程中断，可在总秘书 (/coord) 中从本阶段断点续跑";
         }
       }
       this.persist();
@@ -184,8 +187,8 @@ export class FlowRoomManager {
 
   getSnapshot(): FlowRoomSnapshot {
     return {
-      flowId: this.flowId, mandateId: this.mandateId, goal: this.goal, roleChain: [...this.roleChain],
-      status: this.status, currentIndex: this.currentIndex, repairRound: this.repairRound,
+      flowId: this.flowId, mandateId: this.mandateId, goal: this.goal, ...(this.cwd ? { cwd: this.cwd } : {}),
+      roleChain: [...this.roleChain], status: this.status, currentIndex: this.currentIndex, repairRound: this.repairRound,
       ...(this.reason ? { reason: this.reason } : {}), startedAt: this.startedAt, endedAt: this.endedAt,
       activeStageId: this.activeStageId, entries: this.entries.map((e) => ({ ...e })),
       stages: this.stages.map((s) => ({
@@ -368,6 +371,10 @@ export class FlowRoomManager {
         if (en) {
           if (status === "ready") {
             en.badge = "✓ ready"; en.tone = "success"; en.text = outcome?.envelope?.summary ?? (outcome?.assistantText || "阶段完成");
+          } else if (status === "needs_input") {
+            en.badge = "? 待确认"; en.tone = "warning"; en.target = "user";
+            const qs = outcome?.envelope?.questionsForUser;
+            en.text = qs?.length ? `${outcome?.envelope?.summary ?? ""}\n• ${qs.join("\n• ")}`.trim() : (outcome?.envelope?.summary ?? reason ?? "需补充信息后继续");
           } else if (status === "rejected") {
             en.badge = "✕ rejected"; en.tone = "warning";
             en.target = outcome?.envelope?.toTarget && outcome.envelope.toTarget !== en.speaker
@@ -391,9 +398,10 @@ export class FlowRoomManager {
     if (this.disposed) return this.getSnapshot();
     this.endedAt = new Date().toISOString(); this.activeStageId = null; this.controlStack = []; this.reason = result.reason;
     this.status = result.status === "completed" ? "completed"
-      : result.status === "cancelled" ? "cancelled"
-        : result.status === "violation" ? "violation"
-          : (result.status === "blocked" || result.status === "rejected_max_rounds" || result.status === "stagnated") ? "blocked" : "failed";
+      : result.status === "waiting_input" ? "waiting_input"
+        : result.status === "cancelled" ? "cancelled"
+          : result.status === "violation" ? "violation"
+            : (result.status === "blocked" || result.status === "rejected_max_rounds" || result.status === "stagnated") ? "blocked" : "failed";
     if (result.status === "rejected_max_rounds" || result.status === "stagnated") {
       this.seq += 1;
       this.entries.push({

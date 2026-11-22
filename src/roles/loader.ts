@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
-import { DEFAULT_READONLY_TOOLS } from "../core/policy.ts";
+import { canRoleDispatch, DEFAULT_READONLY_TOOLS, isInternalRole } from "../core/policy.ts";
 import { resolveDefaultGlobalRolesDir } from "../core/settings.ts";
 import type { RoleLoadDiagnostic, RoleSource, RoleSpec } from "../core/types.ts";
 import {
@@ -20,7 +20,15 @@ import {
   serializeRoleYaml,
 } from "./serializer.ts";
 
-export { formatYamlScalar, parseRoleYaml, ROLE_ID_PATTERN, ROLE_THINKING_LEVELS, serializeRoleYaml };
+export {
+  canRoleDispatch,
+  formatYamlScalar,
+  isInternalRole,
+  parseRoleYaml,
+  ROLE_ID_PATTERN,
+  ROLE_THINKING_LEVELS,
+  serializeRoleYaml,
+};
 
 const DEFAULT_BUILTIN_ROLES_DIR = path.resolve(import.meta.dir, "..", "..", "roles");
 
@@ -159,6 +167,16 @@ export function discoverRoles(options: DiscoverRolesOptions): Map<string, RoleSp
   return discoverRolesWithDiagnostics(options).roles;
 }
 
+export function listUserVisibleRoles(roles: ReadonlyMap<string, RoleSpec>): RoleSpec[] {
+  return [...roles.values()]
+    .filter((role) => !isInternalRole(role))
+    .sort((left, right) => {
+      const leftCoord = canRoleDispatch(left) ? 0 : 1;
+      const rightCoord = canRoleDispatch(right) ? 0 : 1;
+      return leftCoord !== rightCoord ? leftCoord - rightCoord : left.id.localeCompare(right.id);
+    });
+}
+
 export function saveRoleSpec(
   role: Omit<RoleSpec, "source" | "filePath" | "contentSha256">,
   targetDir: string,
@@ -233,6 +251,9 @@ export function cloneRoleSpec(input: {
           : {}),
         ...(input.sourceRole.permissions.protected
           ? { protected: [...input.sourceRole.permissions.protected] }
+          : {}),
+        ...(input.sourceRole.permissions.dispatch !== undefined
+          ? { dispatch: input.sourceRole.permissions.dispatch }
           : {}),
       },
       exit: {
