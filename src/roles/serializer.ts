@@ -35,6 +35,8 @@ const PERMISSION_KEYS: Record<string, true> = {
 
 const EXIT_KEYS: Record<string, true> = {
   require_tool_evidence: true,
+  required_tools: true,
+  required_artifacts: true,
   criteria: true,
 };
 
@@ -114,7 +116,12 @@ export function computeRoleContentSha256(
       protected: role.permissions.protected,
       dispatch: role.permissions.dispatch ?? false,
     },
-    exit: role.exit,
+    exit: {
+      requireToolEvidence: role.exit.requireToolEvidence,
+      requiredTools: role.exit.requiredTools ?? null,
+      requiredArtifacts: role.exit.requiredArtifacts ?? null,
+      criteria: role.exit.criteria,
+    },
   };
   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
@@ -222,11 +229,24 @@ export function parseRoleYaml(
     if (typeof requireToolEvidence !== "boolean") {
       throw new Error(`exit.require_tool_evidence must be a boolean in ${filePath}`);
     }
+    const requiredTools =
+      exitYaml.required_tools === undefined
+        ? undefined
+        : stringList(exitYaml.required_tools, "exit.required_tools", filePath);
+    const requiredArtifacts =
+      exitYaml.required_artifacts === undefined
+        ? undefined
+        : stringList(exitYaml.required_artifacts, "exit.required_artifacts", filePath);
     const criteria =
       exitYaml.criteria === undefined
         ? []
         : stringList(exitYaml.criteria, "exit.criteria", filePath);
-    exitSpec = { requireToolEvidence, criteria };
+    exitSpec = {
+      requireToolEvidence,
+      ...(requiredTools !== undefined ? { requiredTools } : {}),
+      ...(requiredArtifacts !== undefined ? { requiredArtifacts } : {}),
+      criteria,
+    };
   }
 
   const draft = {
@@ -293,10 +313,22 @@ export function serializeRoleYaml(
     }
   }
 
-  if (role.exit.requireToolEvidence || role.exit.criteria.length > 0) {
-    lines.push("exit:", `  require_tool_evidence: ${role.exit.requireToolEvidence}`);
-    if (role.exit.criteria.length > 0) {
-      lines.push("  criteria:", ...role.exit.criteria.map((item) => `    - ${JSON.stringify(item)}`));
+  const { requireToolEvidence, requiredTools, requiredArtifacts, criteria } = role.exit;
+  if (
+    requireToolEvidence ||
+    requiredTools !== undefined ||
+    requiredArtifacts !== undefined ||
+    criteria.length > 0
+  ) {
+    lines.push("exit:", `  require_tool_evidence: ${requireToolEvidence}`);
+    if (requiredTools !== undefined) {
+      lines.push(`  required_tools: [${requiredTools.map((item) => JSON.stringify(item)).join(", ")}]`);
+    }
+    if (requiredArtifacts !== undefined) {
+      lines.push(`  required_artifacts: [${requiredArtifacts.map((item) => JSON.stringify(item)).join(", ")}]`);
+    }
+    if (criteria.length > 0) {
+      lines.push("  criteria:", ...criteria.map((item) => `    - ${JSON.stringify(item)}`));
     }
   }
   return `${lines.join("\n")}\n`;

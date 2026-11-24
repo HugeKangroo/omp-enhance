@@ -279,6 +279,7 @@ function buildInspectorLines(snap: FlowRoomSnapshot, selected: RoomEntry | undef
     `专员: ${stage.roleId} (${stage.roleName}) · R${stage.round}`,
     `模型: ${stage.modelLabel}  状态: ${stage.status}  耗时: ${elapsedSec}s`,
     ...(stage.activeTool ? [`当前动作: ⚙ ${stage.activeTool}`] : []),
+    ...(stage.hostError ? wrapPlainText(`异常原因: ${stage.hostError}`, rightW - 2, 3) : []),
     "─".repeat(Math.min(28, rightW)), `动作时间线 (${stage.calls.length}):`,
   ];
   if (stage.calls.length === 0) out.push("  (尚无工具调用)");

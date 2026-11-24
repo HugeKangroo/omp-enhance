@@ -10,6 +10,44 @@ import { buildStageCompanionTools, schemaKit } from "./tools.ts";
 
 const MAX_CONSULTATION_DEPTH = 3;
 
+export function sanitizeHostError(raw: string): string {
+  const redacted = raw
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "sk-[REDACTED]")
+    .replace(/\b(api[_-]?key|token|secret|password|authorization)\s*([=:])\s*([^\s"',;}\]]+)/gi, "$1$2[REDACTED]")
+    .replace(/(https?:\/\/)([^/@\s:]+):([^/@\s]+)@/gi, "$1[REDACTED]:[REDACTED]@")
+    .replace(/\s+/g, " ")
+    .trim();
+  return redacted.length > 600 ? `${redacted.slice(0, 599)}…` : redacted;
+}
+
+export function extractSessionHostError(session: any): string | null {
+  const inspectMsg = (m: any): string | null => {
+    if (!m || m.stopReason === "aborted") return null;
+    const rawErr = typeof m.errorMessage === "string" && m.errorMessage.trim()
+      ? m.errorMessage
+      : typeof m.error === "string" && m.error.trim()
+        ? m.error
+        : typeof m.error?.message === "string" && m.error.message.trim()
+          ? m.error.message
+          : m.stopReason === "error"
+            ? "Model turn terminated with stopReason=error"
+            : null;
+    return rawErr ? sanitizeHostError(rawErr) : null;
+  };
+  const fromLast = inspectMsg(session?.getLastAssistantMessage?.());
+  if (fromLast) return fromLast;
+  const msgs: any[] = Array.isArray(session?.messages) ? session.messages : [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m?.role === "assistant" || m?.stopReason || m?.errorMessage || m?.error) {
+      const hit = inspectMsg(m);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
 export function turnFailedOrAborted(event: any): boolean {
   if (event?.stopReason === "error" || event?.stopReason === "aborted" || Boolean(event?.error)) return true;
   const msgs = Array.isArray(event?.messages) ? event.messages : [];
@@ -130,6 +168,13 @@ export function createOmpRoleSessionRunner(
 
   return {
     async runRoleTurn(stepCtx: RoleStepContext): Promise<RoleTurnOutcome> {
+      let cancelledByUser = false, supervisorAborted = false, abortSent = false, thrownHostError: string | null = null;
+      const isCancelledNow = (): boolean =>
+        cancelledByUser || Boolean(stepCtx.signal?.aborted) || Boolean(stepCtx.observer?.isCancelled?.());
+      if (isCancelledNow()) {
+        return { envelope: null, observedCalls: [], assistantText: "", usage: null, cancelledByUser: true };
+      }
+
       const childTracker = new TurnTracker();
       childTracker.beginTurn(stepCtx.cwd, false);
       const baselineSnap = stepCtx.beforeSnapshot ?? childTracker.getBaselineSnapshot(stepCtx.cwd);
@@ -137,7 +182,6 @@ export function createOmpRoleSessionRunner(
       const stageId = stepCtx.stageId ?? `${stepCtx.role.id}-${Date.now()}`;
       const stageStartedJobIds = new Set<string>();
       let submittedEnvelope: HandoffEnvelope | null = null, childSession: any = null;
-      let cancelledByUser = false, supervisorAborted = false;
       const boundaryViolations: string[] = [];
 
       const collectObservedCalls = (): ObservedToolCall[] => {
@@ -182,7 +226,7 @@ export function createOmpRoleSessionRunner(
               baselineConfigSnapshot: baselineConfigSnap, enforceConfigIntegrity: true,
               observedCalls: collectObservedCalls(), verifiedFacts: params.verifiedFacts,
               openRisks: params.openRisks, questionsForUser, feedbackForUpstream: params.feedbackForUpstream,
-              observedUsage: extractSessionUsage(childSession),
+              observedUsage: extractSessionUsage(childSession), isConsultation: Boolean(consultRole),
             });
             if (consultRole) {
               const delegated = await executeRoleStep({
@@ -253,40 +297,62 @@ export function createOmpRoleSessionRunner(
       });
 
       childSession = created.session;
-      const onExternalAbort = () => { cancelledByUser = true; void created.session.abort?.(); };
-      stepCtx.signal?.addEventListener("abort", onExternalAbort, { once: true });
-      stepCtx.observer?.bindControls?.({
-        steer: async (msg: string) => { await created.session.steer?.(`[User interjection in Flow room]: ${msg}`); },
-        abort: async () => { cancelledByUser = true; await created.session.abort?.(); },
-      }, stageId);
-
-      const finish = (abortedBySupervisor: SupervisorDecision | null = null): RoleTurnOutcome => {
-        const usage = extractSessionUsage(created.session);
-        if (submittedEnvelope && usage && !submittedEnvelope.observedUsage) {
-          submittedEnvelope = { ...submittedEnvelope, observedUsage: usage };
-          if (stepCtx.store.getHandoff(submittedEnvelope.id)) stepCtx.store.saveHandoff(submittedEnvelope);
-        }
-        return {
-          envelope: submittedEnvelope, observedCalls: collectObservedCalls(),
-          assistantText: created.session.getLastAssistantText?.() ?? "", usage,
-          ...(abortedBySupervisor && !submittedEnvelope ? { abortedBySupervisor } : {}),
-          ...(cancelledByUser || stepCtx.signal?.aborted || stepCtx.observer?.isCancelled?.() ? { cancelledByUser: true } : {}),
-          ...(boundaryViolations.length > 0 ? { boundaryViolations } : {}),
-        };
+      const triggerSessionAbort = async (): Promise<void> => {
+        cancelledByUser = true;
+        if (abortSent) return;
+        abortSent = true;
+        await created.session.abort?.();
       };
-
-      const runTurn = async (control: SessionSupervisorControl): Promise<RoleTurnOutcome> => {
-        await created.session.prompt(stepCtx.taskPrompt);
-        if (
-          !control.aborted && !cancelledByUser && !stepCtx.signal?.aborted &&
-          !stepCtx.observer?.isCancelled?.() && !submittedEnvelope && !lastAssistantErroredOrAborted(created.session)
-        ) {
-          await created.session.prompt("Submit your final role conclusion now using the enhance_handoff tool.");
-        }
-        return finish();
-      };
+      const onExternalAbort = () => { void triggerSessionAbort(); };
 
       try {
+        if (isCancelledNow()) {
+          cancelledByUser = true;
+          return { envelope: null, observedCalls: [], assistantText: "", usage: null, cancelledByUser: true };
+        }
+        stepCtx.signal?.addEventListener("abort", onExternalAbort, { once: true });
+        stepCtx.observer?.bindControls?.({
+          steer: async (msg: string) => { await created.session.steer?.(`[User interjection in Flow room]: ${msg}`); },
+          abort: async () => { await triggerSessionAbort(); },
+        }, stageId);
+
+        const finish = (abortedBySupervisor: SupervisorDecision | null = null): RoleTurnOutcome => {
+          const usage = extractSessionUsage(created.session);
+          if (submittedEnvelope && usage && !submittedEnvelope.observedUsage) {
+            submittedEnvelope = { ...submittedEnvelope, observedUsage: usage };
+            if (stepCtx.store.getHandoff(submittedEnvelope.id)) stepCtx.store.saveHandoff(submittedEnvelope);
+          }
+          const cancelled = isCancelledNow();
+          const hostError = !submittedEnvelope && !cancelled && !abortedBySupervisor
+            ? (thrownHostError ?? extractSessionHostError(created.session))
+            : null;
+          return {
+            envelope: submittedEnvelope, observedCalls: collectObservedCalls(),
+            assistantText: created.session.getLastAssistantText?.() ?? "", usage,
+            ...(abortedBySupervisor && !submittedEnvelope ? { abortedBySupervisor } : {}),
+            ...(cancelled ? { cancelledByUser: true } : {}),
+            ...(boundaryViolations.length > 0 ? { boundaryViolations } : {}),
+            ...(hostError ? { hostError } : {}),
+          };
+        };
+
+        const runTurn = async (control: SessionSupervisorControl): Promise<RoleTurnOutcome> => {
+          try {
+            await created.session.prompt(stepCtx.taskPrompt);
+            if (
+              !control.aborted && !isCancelledNow() &&
+              !submittedEnvelope && !lastAssistantErroredOrAborted(created.session)
+            ) {
+              await created.session.prompt("Submit your final role conclusion now using the enhance_handoff tool.");
+            }
+          } catch (err) {
+            if (!isCancelledNow() && !supervisorAborted && !control.aborted) {
+              thrownHostError = sanitizeHostError(err instanceof Error ? err.message : String(err));
+            }
+          }
+          return finish();
+        };
+
         const supervisor = stepCtx.supervisor;
         if (!supervisor) return await runTurn({ aborted: false, decisions: [] });
         const supervised = await runWithSessionSupervisor({
@@ -308,7 +374,7 @@ export function createOmpRoleSessionRunner(
             await created.session.steer?.(framed);
           },
           onAbort: async () => {
-            supervisorAborted = true;
+            supervisorAborted = true; abortSent = true;
             stepCtx.observer?.onSupervisorNote?.(stageId, "✕ aborted by supervisor");
             await created.session.abort?.();
           },
@@ -319,8 +385,7 @@ export function createOmpRoleSessionRunner(
       } finally {
         stepCtx.signal?.removeEventListener("abort", onExternalAbort);
         stepCtx.observer?.bindControls?.(null, stageId);
-        const stageAborted = (supervisorAborted && !submittedEnvelope) || cancelledByUser ||
-          Boolean(stepCtx.signal?.aborted) || Boolean(stepCtx.observer?.isCancelled?.());
+        const stageAborted = (supervisorAborted && !submittedEnvelope) || isCancelledNow();
         if (stageAborted && stageStartedJobIds.size > 0) cancelJobsByIds(stepCtx.store, stageStartedJobIds);
         await created.session.dispose();
       }

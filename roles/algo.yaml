@@ -16,6 +16,7 @@ method:
 
 exit:
   require_tool_evidence: true
+  required_artifacts: ["algo_work/REPORT.md", "algo_work/runs/**/metrics.json"]
   criteria:
     - 已完成真实数据质量/防同源泄漏审计，algo_work/ 三区完整且 benchmark/splits.json 与 benchmark/eval.py 在各实验件间保持一致未被篡改
     - 每个实验件 runs/exp_NNN_<slug>/ 均独立具备可复现 spec.yaml、metrics.json、vis/ 诊断图与 summary.md，REPORT.md 数值与 metrics.json 完全一致

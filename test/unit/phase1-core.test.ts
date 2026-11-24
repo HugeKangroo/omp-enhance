@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
@@ -15,7 +16,9 @@ import {
   extractWriteTargetPaths, isInternalRole, isValidExecutionEvidence,
   resolveEffectiveActiveTools, resolveRoleActiveTools, TurnTracker,
 } from "../../src/core/policy.ts";
-import { EnhanceStore, captureProcessStartToken, isProcessAliveWithToken } from "../../src/core/store.ts";
+import {
+  EnhanceStore, ProjectBusyError, captureProcessStartToken, isProcessAliveWithToken,
+} from "../../src/core/store.ts";
 import type {
   BackgroundJob, EpistemicItem, HandoffEnvelope, Mandate, ObservedToolCall,
 } from "../../src/core/types.ts";
@@ -84,11 +87,14 @@ describe("workspace snapshots, gitignore, symlinks, and boundary violations", ()
     expect([...before.keys()].sort()).toEqual([".gitignore", "README.md", "link-a.ts", "src/a.ts", "src/b.ts"]);
     expect(before.get("src/a.ts")?.sha256).toBe(createHash("sha256").update("export const a = 1;\n").digest("hex"));
     expect(before.get("src/a.ts")?.byteSize).toBe(20);
+    expect(before.get("src/a.ts")?.digestKind).toBe("sha256");
     expect(before.get("link-a.ts")?.sha256).toBe("symlink:src/a.ts");
+    expect(before.get("link-a.ts")?.digestKind).toBe("symlink");
 
-    // Oversize file (> maxFullHashBytes) avoids full Buffer allocation cleanly
-    const oversizeSnap = snapshotWorkspace(cwd, { maxFullHashBytes: 5 });
-    expect(oversizeSnap.get("src/a.ts")?.sha256.startsWith("oversize:20:")).toBe(true);
+    // Files exceeding maxStreamHashBytes are labeled digestKind="stat_fingerprint" with stat:<size>:<mtime>
+    const oversizeSnap = snapshotWorkspace(cwd, { maxStreamHashBytes: 5 });
+    expect(oversizeSnap.get("src/a.ts")?.digestKind).toBe("stat_fingerprint");
+    expect(oversizeSnap.get("src/a.ts")?.sha256.startsWith("stat:20:")).toBe(true);
 
     writeFile(cwd, "src/a.ts", "export const a = 10;\n");
     writeFile(cwd, "src/c.ts", "export const c = 3;\n");
@@ -120,6 +126,25 @@ describe("workspace snapshots, gitignore, symlinks, and boundary violations", ()
 
     const onlySource = snapshotWorkspace(cwd, ["src/**"]);
     expect([...onlySource.keys()].sort()).toEqual(["src/a.ts", "src/c.ts"]);
+  });
+
+  test("streams > 32 MiB files into true 64-hex SHA-256 (digestKind='sha256') without oversize shortcut (P2-2)", () => {
+    const cwd = tempDir();
+    const bigBytes = 33 * 1024 * 1024 + 137;
+    const buf = Buffer.alloc(bigBytes, 0x5a);
+    buf.write("OMP-STREAM-HEAD", 0, "utf8");
+    buf.write("OMP-STREAM-TAIL", bigBytes - 15, "utf8");
+    const expectedHex = createHash("sha256").update(buf).digest("hex");
+    mkdirSync(path.join(cwd, "artifacts"), { recursive: true });
+    writeFileSync(path.join(cwd, "artifacts", "model-33mb.bin"), buf);
+
+    const snap = snapshotWorkspace(cwd);
+    const entry = snap.get("artifacts/model-33mb.bin");
+    expect(entry).toBeDefined();
+    expect(entry?.byteSize).toBe(bigBytes);
+    expect(entry?.digestKind).toBe("sha256");
+    expect(entry?.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(entry?.sha256).toBe(expectedHex);
   });
 });
 
@@ -357,6 +382,109 @@ describe("EnhanceStore", () => {
       store.close();
     }
   });
+
+  test("enforces cross-instance & cross-process acquireProjectFlowLease, recovers dead owners, and isolates Flow A steer/cancel from running Flow B (P1-1 & P1-2)", async () => {
+    const workspaceDir = tempDir();
+    const dbPath = path.join(workspaceDir, ".omp-enhance", "state.sqlite");
+    const store1 = new EnhanceStore(dbPath);
+    const store2 = new EnhanceStore(dbPath);
+    const sleeper = spawn("sh", ["-c", "sleep 30"], { stdio: "ignore", detached: true });
+    sleeper.unref();
+    const otherPid = sleeper.pid!;
+
+    try {
+      expect(store1.getProjectFlowLease()).toBeNull();
+      const mA = store1.upsertMandate({ goal: "Flow A waiting", flowId: "flow-A" });
+      const mB = store1.upsertMandate({ goal: "Flow B running", flowId: "flow-B" });
+      const mDead = store1.upsertMandate({ goal: "Dead owner flow", flowId: "flow-dead" });
+
+      // 1) Same-PID contention across two EnhanceStore instances
+      store1.acquireProjectFlowLease("flow-A");
+      store1.acquireProjectFlowLease("flow-A"); // idempotent for same flowId
+      expect(store2.getProjectFlowLease()?.flowId).toBe("flow-A");
+      expect(() => store2.acquireProjectFlowLease("flow-B")).toThrow(ProjectBusyError);
+      try {
+        store2.acquireProjectFlowLease("flow-B");
+      } catch (err) {
+        expect(err).toBeInstanceOf(ProjectBusyError);
+        expect((err as ProjectBusyError).activeFlowId).toBe("flow-A");
+        expect((err as ProjectBusyError).ownerPid).toBe(process.pid);
+        expect((err as ProjectBusyError).cwd).toBe(workspaceDir);
+      }
+
+      // Flow A suspends to waiting_input -> saveFlowCheckpoint automatically releases Flow A's active lease!
+      store1.saveFlowCheckpoint({
+        flowId: "flow-A", mandateId: mA.id, goal: mA.goal, cwd: workspaceDir, roleChain: ["algo"],
+        status: "waiting_input", currentIndex: 0, repairRound: 0, lastHandoffId: null, maxRepairRounds: 2,
+        snapshotJson: JSON.stringify({ flowId: "flow-A", status: "waiting_input", entries: [], stages: [], userSteers: [] }),
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+      expect(store2.getProjectFlowLease()).toBeNull();
+
+      // 2) Live other-PID contention + automatic dead-PID recovery -> marks stale running row 'interrupted'
+      const otherToken = captureProcessStartToken(otherPid);
+      store1.acquireProjectFlowLease("flow-dead", otherPid, otherToken);
+      store1.saveFlowCheckpoint({
+        flowId: "flow-dead", mandateId: mDead.id, goal: mDead.goal, cwd: workspaceDir, roleChain: ["dev"],
+        status: "running", currentIndex: 0, repairRound: 0, lastHandoffId: null, maxRepairRounds: 2,
+        ownerPid: otherPid, ownerStartToken: otherToken,
+        snapshotJson: JSON.stringify({
+          flowId: "flow-dead", status: "running", activeStageId: "s1",
+          entries: [{ id: "stage-s1", side: "left", speaker: "dev", badge: "● 执行中", text: "running", timestamp: "now" }],
+          stages: [{ stageId: "s1", roleId: "dev", roleName: "dev", round: 0, status: "running", modelLabel: "m", startedAt: "now", endedAt: null, activeTool: "bash", calls: [], assistantText: "", envelope: null, notes: [] }],
+        }),
+        updatedAt: "2026-01-01T00:01:00.000Z",
+      });
+      expect(() => store2.acquireProjectFlowLease("flow-B")).toThrow(ProjectBusyError);
+
+      try { process.kill(-otherPid, "SIGKILL"); } catch { try { process.kill(otherPid, "SIGKILL"); } catch {} }
+      const deadline = Date.now() + 3000;
+      while (isProcessAliveWithToken(otherPid, otherToken) && Date.now() < deadline) await Bun.sleep(20);
+
+      // Dead owner is automatically recovered: flow-dead becomes 'interrupted' and flow-B gets the lease!
+      store2.acquireProjectFlowLease("flow-B");
+      expect(store2.getProjectFlowLease()?.flowId).toBe("flow-B");
+      const interruptedDead = store1.getFlowCheckpoint("flow-dead")!;
+      expect(interruptedDead.status).toBe("interrupted");
+      expect(JSON.parse(interruptedDead.snapshotJson).status).toBe("interrupted");
+
+      // 3) P1-1: While Flow B is actively running, steering & cancelling Flow A mutates ONLY Flow A and leaves Flow B untouched!
+      store2.saveFlowCheckpoint({
+        flowId: "flow-B", mandateId: mB.id, goal: mB.goal, cwd: workspaceDir, roleChain: ["dev", "qa"],
+        status: "running", currentIndex: 0, repairRound: 0, lastHandoffId: null, maxRepairRounds: 2,
+        ownerPid: process.pid, ownerStartToken: captureProcessStartToken(process.pid),
+        snapshotJson: JSON.stringify({ flowId: "flow-B", status: "running", entries: [{ id: "init-b", side: "right", speaker: "你", text: "B", timestamp: "now" }], stages: [], userSteers: [] }),
+        userSteers: [], updatedAt: "2026-01-01T00:02:00.000Z",
+      });
+
+      const steeredA = store1.appendFlowCheckpointSteer("flow-A", {
+        text: "@algo Prioritize low false negatives", createdAt: "2026-01-01T00:03:00.000Z",
+      });
+      expect(steeredA.userSteers).toEqual([
+        { text: "Prioritize low false negatives", targetRole: "algo", createdAt: "2026-01-01T00:03:00.000Z" },
+      ]);
+      expect(JSON.parse(steeredA.snapshotJson).entries).toHaveLength(1);
+      expect(store2.getFlowCheckpoint("flow-B")?.userSteers).toEqual([]);
+      expect(store2.getFlowCheckpoint("flow-B")?.status).toBe("running");
+
+      const cancelLiveB = store1.cancelFlowCheckpoint("flow-B");
+      expect(cancelLiveB.cancelled).toBe(false);
+
+      const cancelledA = store1.cancelFlowCheckpoint("flow-A");
+      expect(cancelledA.cancelled).toBe(true);
+      expect(cancelledA.checkpoint?.status).toBe("cancelled");
+      expect(JSON.parse(cancelledA.checkpoint!.snapshotJson).status).toBe("cancelled");
+      // Flow B's status, steers, and lease remain 100% intact!
+      expect(store2.getFlowCheckpoint("flow-B")?.status).toBe("running");
+      expect(store2.getProjectFlowLease()?.flowId).toBe("flow-B");
+      expect(() => store1.appendFlowCheckpointSteer("flow-A", { text: "late steer", createdAt: "now" }))
+        .toThrow(/terminal status "cancelled"/);
+    } finally {
+      try { process.kill(-otherPid, "SIGKILL"); } catch { try { process.kill(otherPid, "SIGKILL"); } catch {} }
+      store1.close();
+      store2.close();
+    }
+  });
 });
 
 describe("roles loader, serializer, and conditioning", () => {
@@ -398,6 +526,7 @@ describe("roles loader, serializer, and conditioning", () => {
     expect(isInternalRole(supervisor)).toBe(true);
 
     expect(roles.get("algo")?.exit.requireToolEvidence).toBe(true);
+    expect(roles.get("algo")?.exit.requiredArtifacts).toEqual(["algo_work/REPORT.md", "algo_work/runs/**/metrics.json"]);
     expect(roles.get("algo")?.stance).toContain("needs_input");
     expect(roles.get("algo")?.stance).toContain("questionsForUser");
     expect(roles.get("vision")?.model).toBe("@vision");
@@ -408,6 +537,7 @@ describe("roles loader, serializer, and conditioning", () => {
     expect(roles.get("qa")?.permissions.tools).toContain("apply_patch");
     expect(roles.get("qa")?.permissions.writable).toEqual(["test/**", "tests/**", "**/*.test.*", "**/*.spec.*"]);
     expect(roles.get("qa")?.exit.requireToolEvidence).toBe(true);
+    expect(roles.get("qa")?.exit.requiredTools).toEqual(["bash"]);
     expect(roles.get("reviewer")?.permissions.writable).toEqual([]);
     expect(roles.get("reviewer")?.permissions.protected).toEqual(["**"]);
   });
@@ -501,12 +631,21 @@ describe("roles loader, serializer, and conditioning", () => {
       serializeRoleYaml({
         id: "lead", name: "Lead", description: "Coord", internal: false, stance: "s", method: ["m"],
         permissions: { tools: ["read"], writable: [], protected: ["**"], dispatch: true },
-        exit: { requireToolEvidence: false, criteria: [] },
+        exit: {
+          requireToolEvidence: true,
+          requiredTools: ["bash", "read"],
+          requiredArtifacts: ["algo_work/REPORT.md", "algo_work/runs/**/metrics.json"],
+          criteria: ["verified"],
+        },
       }),
       "global", path.join(root, "lead.yaml"),
     );
     expect(roundTripDispatch.permissions.dispatch).toBe(true);
     expect(roundTripDispatch.internal).toBe(false);
+    expect(roundTripDispatch.exit.requiredTools).toEqual(["bash", "read"]);
+    expect(roundTripDispatch.exit.requiredArtifacts).toEqual(["algo_work/REPORT.md", "algo_work/runs/**/metrics.json"]);
+    expect(() => parseRoleYaml(`${base}exit:\n  required_tools: [123]\n`, "project", filePath))
+      .toThrow(/exit\.required_tools must be an array of non-empty strings/);
     expect(() => parseRoleYaml(base, "project", path.join(root, "other.yaml")))
       .toThrow(/does not match filename/);
     expect(() => parseRoleYaml("id: bad id\nstance: x\nmethod:\n  - y\n", "project", filePath))

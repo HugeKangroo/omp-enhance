@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { captureProcessStartToken, isProcessAliveWithToken, type EnhanceStore } from "../core/store.ts";
 import type { BackgroundJob } from "../core/types.ts";
@@ -8,6 +8,7 @@ import type { BackgroundJob } from "../core/types.ts";
 export interface StartBackgroundJobInput {
   store: EnhanceStore; cwd: string; command: string;
   mandateId?: string | null; hypothesisId?: string | null;
+  shellBin?: string; spawnImpl?: typeof spawn;
 }
 
 export interface CancelJobOptions { graceMs?: number }
@@ -44,35 +45,60 @@ function isProcessGroupAlive(pgid: number): boolean {
 
 export function startBackgroundJob(input: StartBackgroundJobInput): BackgroundJob {
   const jobsDir = path.join(input.cwd, ".omp-enhance", "jobs");
-  mkdirSync(jobsDir, { recursive: true, mode: 0o700 });
   const jobId = randomUUID();
   const logPath = path.join(jobsDir, `${jobId}.log`), exitFilePath = path.join(jobsDir, `${jobId}.exit`);
-  const logFd = openSync(logPath, "a");
-  const childEnv: NodeJS.ProcessEnv = {
-    ...process.env, OMP_ENHANCE_SUBPROCESS: "1", OMP_ENHANCE_JOB_CMD: input.command, OMP_ENHANCE_JOB_EXIT: exitFilePath,
-  };
-  delete childEnv.OMP_ENHANCE_CMD_OUT;
+  const startedAt = new Date().toISOString();
+  const mandateId = input.mandateId?.trim() || null;
+  const hypothesisId = input.hypothesisId?.trim() || null;
 
-  let child;
+  // Register intent in SQLite BEFORE writing files or spawning any OS process (enforces FK & store health upfront).
+  const initialJob: BackgroundJob = {
+    jobId, mandateId, hypothesisId, command: input.command, cwd: input.cwd,
+    pid: 0, pgid: 0, ownerPid: process.pid, processStartToken: null,
+    logPath, exitFilePath, status: "running", exitCode: null, startedAt, endedAt: null,
+  };
+  input.store.saveJob(initialJob);
+
+  let logFd: number | null = null;
   try {
-    child = spawn("sh", ["-c", WRAPPER_SCRIPT], { cwd: input.cwd, env: childEnv, detached: true, stdio: ["ignore", logFd, logFd] });
+    mkdirSync(jobsDir, { recursive: true, mode: 0o700 });
+    logFd = openSync(logPath, "a");
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env, OMP_ENHANCE_SUBPROCESS: "1", OMP_ENHANCE_JOB_CMD: input.command, OMP_ENHANCE_JOB_EXIT: exitFilePath,
+    };
+    delete childEnv.OMP_ENHANCE_CMD_OUT;
+
+    const spawnFn = input.spawnImpl ?? spawn;
+    const child = spawnFn(input.shellBin ?? "sh", ["-c", WRAPPER_SCRIPT], {
+      cwd: input.cwd, env: childEnv, detached: true, stdio: ["ignore", logFd, logFd],
+    });
+    child.on("error", () => {});
+    if (typeof child.pid !== "number" || child.pid <= 0) {
+      throw new Error("Failed to spawn background job process.");
+    }
+    const processStartToken = captureProcessStartToken(child.pid);
+    child.unref();
+
+    const runningJob: BackgroundJob = {
+      ...initialJob, pid: child.pid, pgid: child.pid, processStartToken,
+    };
+    input.store.saveJob(runningJob);
+    return runningJob;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    try {
+      mkdirSync(jobsDir, { recursive: true, mode: 0o700 });
+      writeFileSync(logPath, `[spawn_error] ${detail}\n`, { flag: "a" });
+    } catch {}
+    try {
+      input.store.saveJob({ ...initialJob, status: "failed", exitCode: -1, endedAt: new Date().toISOString() });
+    } catch {}
+    throw error;
   } finally {
-    closeSync(logFd);
+    if (logFd !== null) {
+      try { closeSync(logFd); } catch {}
+    }
   }
-  child.on("error", () => {});
-  if (typeof child.pid !== "number" || child.pid <= 0) throw new Error("Failed to spawn background job process.");
-
-  const processStartToken = captureProcessStartToken(child.pid);
-  child.unref();
-
-  const job: BackgroundJob = {
-    jobId, mandateId: input.mandateId ?? null, hypothesisId: input.hypothesisId ?? null,
-    command: input.command, cwd: input.cwd, pid: child.pid, pgid: child.pid,
-    ownerPid: process.pid, processStartToken, logPath, exitFilePath,
-    status: "running", exitCode: null, startedAt: new Date().toISOString(), endedAt: null,
-  };
-  input.store.saveJob(job);
-  return job;
 }
 
 function reconcileRunningJobRecord(store: EnhanceStore, job: BackgroundJob): BackgroundJob {

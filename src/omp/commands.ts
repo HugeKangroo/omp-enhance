@@ -7,6 +7,7 @@ import {
 } from "../roles/loader.ts";
 import { openFlowRoomOverlay } from "../ui/flow-room.ts";
 import { openRoleEditor, openRoleStudioHome, type RoleStudioDeps } from "../ui/role-studio.ts";
+import { executeCancelFlow } from "./flow-tool.ts";
 import type { WorkspaceHub } from "./hub.ts";
 import { defaultRoleId, type ManagedWorkspace } from "./workspace.ts";
 
@@ -20,16 +21,16 @@ function splitHeadAndRest(raw: string): { head: string; rest: string } {
 }
 
 function renderMultiProjectFlowStatus(hub: WorkspaceHub, primaryWs: ManagedWorkspace): string {
-  const targets = hub.getMonitorTargets(primaryWs);
+  hub.getMonitorTargets(primaryWs);
+  const summaries = hub.getAllFlowSummaries();
   const lines = ["跨项目后台专员监控 (/flow status)"];
-  for (const t of targets) {
-    const snap = t.room.getSnapshot();
-    const chain = snap.roleChain.length > 0 ? snap.roleChain.join(" → ") : "待命";
-    const stageInfo = snap.roleChain.length > 0 ? ` · 阶段 ${(snap.currentIndex ?? 0) + 1}/${snap.roleChain.length}` : "";
-    lines.push(`• ${t.cwd}`);
-    lines.push(`  状态: ${snap.status}${t.room.isResumable() ? " (可续跑)" : ""} · Flow: ${snap.flowId ?? "无"} · 专员链: ${chain}${stageInfo}`);
-    if (snap.goal) lines.push(`  目标: ${snap.goal}`);
-    if (snap.reason) lines.push(`  说明: ${snap.reason}`);
+  for (const s of summaries) {
+    const chain = s.roleChain.length > 0 ? s.roleChain.join(" → ") : "待命";
+    const stageInfo = s.roleChain.length > 0 ? ` · 阶段 ${s.currentIndex + 1}/${s.roleChain.length}` : "";
+    lines.push(`• ${s.cwd}`);
+    lines.push(`  状态: ${s.status}${s.resumable ? " (可续跑)" : ""} · Flow: ${s.flowId ?? "无"} · 专员链: ${chain}${stageInfo}`);
+    if (s.goal) lines.push(`  目标: ${s.goal}`);
+    if (s.reason) lines.push(`  说明: ${s.reason}`);
   }
   lines.push("提示: 派发或续跑任务请敲 /coord 用自然语言吩咐总秘书 · 紧急停止敲 /flow cancel [flowId]");
   return lines.join("\n");
@@ -54,8 +55,9 @@ function renderCoordStatusCard(
     const jobs = !w.store.isClosed() ? w.store.listJobs() : [];
     const runningJobs = jobs.filter((j) => j.status === "running").length;
     const flowDetail = snap.flowId ? `${snap.status} (${snap.roleChain.join(" → ")})` : snap.status;
-    uiProjects.push(`  - ${w.cwd} · 协作流=${flowDetail} · 后台任务=${runningJobs}/${jobs.length}`);
-    metaProjects.push(`- ${w.cwd} · flow=${snap.flowId ? `${snap.status} (${snap.flowId}: ${snap.roleChain.join("→")})` : snap.status} · jobs=${runningJobs}/${jobs.length}`);
+    const trustTag = w.isTrusted ? "trusted" : "untrusted";
+    uiProjects.push(`  - ${w.cwd} [${w.isTrusted ? "已信任" : "待信任"}] · 协作流=${flowDetail} · 后台任务=${runningJobs}/${jobs.length}`);
+    metaProjects.push(`- ${w.cwd} [${trustTag}] · flow=${snap.flowId ? `${snap.status} (${snap.flowId}: ${snap.roleChain.join("→")})` : snap.status} · jobs=${runningJobs}/${jobs.length}`);
   }
 
   const modeDesc = activeId === "coordinator"
@@ -71,7 +73,7 @@ function renderCoordStatusCard(
     `• 运行设置: 默认模式=${s.defaultRole ?? "off"} · 督导模型=${s.supervisorModel} (${s.supervisorThinking}) · 最大返修=${s.flowMaxRepairRounds}轮 · 派单确认=${s.flowRoutingMode}`,
     "• 受管项目:",
     ...uiProjects,
-    "提示: /coord 开启总秘书 · /coord off 退回标准 OMP · /role 配置专员模型 · /flow 打开只读监控窗",
+    "提示: /coord 开启总秘书 · /coord off 退回标准 OMP · /coord trust <dir> 授权子项目配置 · /role 配置专员模型 · /flow 打开只读监控窗",
   ].join("\n");
 
   const cmdOutText = [
@@ -111,22 +113,42 @@ export function registerEnhanceCommands(
   };
 
   pi.registerCommand("coord", {
-    description: "开启或退出 SuperAgent 总秘书模式 (/coord, /coord off, /coord status).",
+    description: "开启或退出 SuperAgent 总秘书模式 (/coord, /coord off, /coord status, /coord trust <dir>).",
     getArgumentCompletions: (prefix: string) => {
+      if (/^(?:trust|untrust)\s+/i.test(prefix)) {
+        const head = prefix.match(/^(?:trust|untrust)\s+/i)![0];
+        const q = prefix.slice(head.length).trim().toLowerCase();
+        return hub.listWorkspaces()
+          .filter((w) => !q || w.cwd.toLowerCase().includes(q))
+          .map((w) => ({ value: `${head}${w.cwd}`, label: w.cwd, description: w.isTrusted ? "trusted" : "untrusted" }));
+      }
       const q = prefix.trim().toLowerCase();
-      return ["on", "off", "status", "toggle"]
+      const base = q ? ["on", "off", "status", "toggle", "trust ", "untrust "] : ["on", "off", "status", "toggle"];
+      return base
         .filter((v) => !q || v.startsWith(q))
-        .map((v) => ({ value: v, label: v }));
+        .map((v) => ({ value: v, label: v.trim() }));
     },
     handler: async (args: string, ctx: any) => {
       try {
         const ws = hub.getWorkspace(ctx);
         ws.refresh(ctx);
-        const { head } = splitHeadAndRest(args);
+        const { head, rest } = splitHeadAndRest(args);
         const sub = head.toLowerCase();
         if (sub === "status") {
           const { uiText, cmdOutText } = renderCoordStatusCard(hub, ws, ctx);
           return ws.emitMessage(ctx, uiText, { cmdOutText });
+        }
+        if (sub === "trust") {
+          const targetWs = hub.grantProjectTrust(rest || undefined, ws, ctx);
+          hub.syncGlobalUi(ctx, ws);
+          const uiText = `✓ 已信任项目目录: ${targetWs.cwd}（已启用项目级 .omp/* 角色与设置覆盖）`;
+          return ws.emitMessage(ctx, uiText, { cmdOutText: `${uiText}\nTrusted project: ${targetWs.cwd}` });
+        }
+        if (sub === "untrust") {
+          const targetWs = hub.revokeProjectTrust(rest || undefined, ws, ctx);
+          hub.syncGlobalUi(ctx, ws);
+          const uiText = `○ 已撤销项目目录信任: ${targetWs.cwd}（仅使用内置与全局角色及设置）`;
+          return ws.emitMessage(ctx, uiText, { cmdOutText: `${uiText}\nUntrusted project: ${targetWs.cwd}` });
         }
         const curRoleId = ws.getSessionRoleId(ctx);
         if (sub === "off" || (sub === "toggle" && curRoleId === "coordinator")) {
@@ -146,7 +168,7 @@ export function registerEnhanceCommands(
           const uiText = "✓ 总秘书模式已开启 — 直接用自然语言描述需求，方案确认后自动派发后台专员（输入 /coord off 退回标准 OMP）。";
           return ws.emitMessage(ctx, uiText, { cmdOutText: `${uiText}\nActive role: ${coord.id} [${coord.source}]` });
         }
-        return ws.emitMessage(ctx, "用法: /coord (开启总秘书) | /coord off (退回标准 OMP) | /coord status (跨项目状态概览)");
+        return ws.emitMessage(ctx, "用法: /coord | /coord off | /coord status | /coord trust <dir> | /coord untrust <dir>");
       } catch (err) {
         hub.getWorkspace(ctx).emitMessage(ctx, err instanceof Error ? err.message : String(err));
       }
@@ -323,8 +345,8 @@ export function registerEnhanceCommands(
         const head = prefix.match(/^cancel\s+/i)![0];
         const q = prefix.slice(head.length).trim().toLowerCase();
         return hub.getAllFlowSummaries()
-          .filter((s) => s.status === "running" && s.flowId && (!q || s.flowId.toLowerCase().startsWith(q)))
-          .map((s) => ({ value: `${head}${s.flowId}`, label: s.flowId!, description: s.cwd }));
+          .filter((s) => (s.status === "running" || s.resumable) && s.flowId && (!q || s.flowId.toLowerCase().startsWith(q)))
+          .map((s) => ({ value: `${head}${s.flowId}`, label: s.flowId!, description: `${s.cwd} [${s.status}]` }));
       }
       const q = prefix.trim().toLowerCase();
       return ["status", "cancel"]
@@ -345,17 +367,12 @@ export function registerEnhanceCommands(
           return ws.emitMessage(ctx, renderMultiProjectFlowStatus(hub, ws));
         }
         if (first === "cancel" || first === "stop") {
-          const targetWs = hub.resolveFlowWorkspace(
-            ws,
-            { flowId: restRaw || undefined },
-            ctx,
-            (w) => w.room.isRunning(),
-          );
-          const ok = await targetWs.room.cancelActiveFlow(ctx);
-          hub.syncGlobalUi(ctx, ws);
+          const res = await executeCancelFlow(hub, ws, { flowId: restRaw || undefined }, ctx);
           return ws.emitMessage(
             ctx,
-            ok ? `已中止项目 ${targetWs.cwd} 的协作 Flow。` : "当前没有正在运行的协作 Flow。",
+            res.cancelled
+              ? `已中止项目 ${res.cwd} 的协作 Flow (${res.flowId ?? "flow"})。`
+              : (res.reason ?? "当前没有正在运行的协作 Flow。"),
           );
         }
         return ws.emitMessage(

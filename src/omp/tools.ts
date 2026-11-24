@@ -1,13 +1,14 @@
-import { canRoleDelegateTo, canRoleUseCompanionTool, isInternalRole } from "../core/policy.ts";
+import { canRoleDelegateTo, canRoleUseCompanionTool } from "../core/policy.ts";
 import { normalizeUsageSummary } from "../core/settings.ts";
 import type { EnhanceStore } from "../core/store.ts";
 import type {
-  EnhanceSettings, EpistemicKind, EpistemicStatus, HandoffEnvelope, HandoffVerdict, Mandate, MandateStatus, RoleSpec, UsageSummary, VerifiedFact,
+  EnhanceSettings, EpistemicKind, EpistemicStatus, HandoffVerdict, Mandate, MandateStatus, RoleSpec, UsageSummary, VerifiedFact,
 } from "../core/types.ts";
 import { BoundaryViolationError, createAndVerifyHandoff } from "../flow/handoff.ts";
 import { executeRoleStep, type RoleStepContext, type RoleSupervisorConfig } from "../flow/orchestrator.ts";
 import { cancelJob, readJobLogTail, reconcileJobs, startBackgroundJob } from "../jobs/runner.ts";
 import { watchBackgroundJob, type SupervisorInspector } from "../jobs/supervisor.ts";
+import { registerFlowTool } from "./flow-tool.ts";
 import type { WorkspaceHub } from "./hub.ts";
 import type { WorkspaceRuntime } from "./workspace.ts";
 export type { WorkspaceRuntime };
@@ -282,6 +283,7 @@ export function registerEnhanceTools(pi: any, hub: WorkspaceHub): void {
           observedCalls: tracker.getObservedCalls(), verifiedFacts: asVerifiedFacts(params.verifiedFacts),
           openRisks: asStringArray(params.openRisks), questionsForUser: asStringArray(params.questionsForUser),
           feedbackForUpstream: asString(params.feedbackForUpstream), observedUsage: extractForegroundUsage(ctx),
+          isConsultation: Boolean(targetRole),
         });
 
         if (wantDelegate && targetRole) {
@@ -300,120 +302,7 @@ export function registerEnhanceTools(pi: any, hub: WorkspaceHub): void {
     },
   });
 
-  registerTool({
-    name: "enhance_flow", label: "Enhance Flow", approval: "exec",
-    description: "Start, resume, list/inspect status, steer, or cancel Markov-isolated specialist Flows across one or multiple project directories (cwd).",
-    parameters: kit.obj({
-      action: kit.en(["start", "status", "list", "steer", "cancel", "resume"]),
-      cwd: kit.str(), flowId: kit.str(), roles: kit.arr(kit.str()), goal: kit.str(),
-      message: kit.str(), maxRepairRounds: kit.num(), initialHandoffId: kit.str(), wait: kit.bool(),
-    }, []),
-    async execute(params, ctx, signal) {
-      try {
-        const originWs = hub.getWorkspace(ctx); originWs.refresh(ctx);
-        const action = asString(params.action) ?? "start", activeRole = originWs.getActiveRole(ctx);
-        const reqFlowId = asString(params.flowId), reqCwd = asString(params.cwd);
-
-        if (action === "list") {
-          hub.markAllSettledFlowsObserved();
-          return toolResult({ cwd: originWs.cwd, flows: hub.getAllFlowSummaries(), runningJobs: hub.getAllRunningJobs() });
-        }
-        if (action === "status") {
-          if (reqFlowId || reqCwd) {
-            const targetWs = hub.resolveFlowWorkspace(originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx);
-            hub.markFlowSnapshotObserved(targetWs);
-            return toolResult({ cwd: targetWs.cwd, ...targetWs.room.getSnapshot(), resumable: targetWs.room.isResumable() });
-          }
-          hub.markAllSettledFlowsObserved();
-          return toolResult({
-            cwd: originWs.cwd, ...originWs.room.getSnapshot(), resumable: originWs.room.isResumable(),
-            flows: hub.getAllFlowSummaries(), runningJobs: hub.getAllRunningJobs(),
-          });
-        }
-        if (action === "cancel") {
-          const targetWs = hub.resolveFlowWorkspace(originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx, (w) => w.room.isRunning());
-          const cancelled = await targetWs.room.cancelActiveFlow(ctx);
-          hub.syncGlobalUi(ctx, originWs);
-          const snap = targetWs.room.getSnapshot();
-          return toolResult({ cancelled, cwd: targetWs.cwd, flowId: snap.flowId, status: snap.status });
-        }
-        if (action === "resume") {
-          const perm = canRoleUseCompanionTool(activeRole, "enhance_flow", "resume");
-          if (!perm.allowed) throw new Error(perm.reason);
-          const targetWs = hub.resolveFlowWorkspace(originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx, (w) => w.room.isResumable());
-          targetWs.refresh(ctx);
-          const msg = asString(params.message);
-          if (msg) await targetWs.room.postUserSteer(msg, ctx);
-          const background = params.wait === true ? false : Boolean(ctx?.hasUI);
-          const res = await targetWs.resumeManagedFlow(ctx, background, background ? undefined : signal, originWs);
-          hub.syncGlobalUi(ctx, originWs);
-          return toolResult(res);
-        }
-        if (action === "steer") {
-          const perm = canRoleUseCompanionTool(activeRole, "enhance_flow", "steer");
-          if (!perm.allowed) throw new Error(perm.reason);
-          const msg = asString(params.message) ?? asString(params.goal);
-          if (!msg) throw new Error("enhance_flow steer requires a message.");
-          const targetWs = hub.resolveFlowWorkspace(originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx, (w) => w.room.isRunning() || w.room.isResumable());
-          const res = await targetWs.room.postUserSteer(msg, ctx);
-          const snap = targetWs.room.getSnapshot();
-          return toolResult({ ok: true, cwd: targetWs.cwd, flowId: snap.flowId, ...res, status: snap.status });
-        }
-        if (action !== "start") throw new Error(`Unknown enhance_flow action "${action}".`);
-
-        const targetWs = hub.resolveTargetWorkspace(originWs, reqCwd, ctx);
-        targetWs.refresh(ctx);
-        const roleIds = asStringArray(params.roles);
-        if (!roleIds) throw new Error("enhance_flow start requires a non-empty roles array.");
-        const roles = roleIds.map((id) => {
-          const r = targetWs.roles.get(id);
-          if (id === "supervisor" || (r && isInternalRole(r))) throw new Error(`Role "${id}" is an internal monitor and cannot run as a Flow stage.`);
-          if (!r) throw new Error(`Unknown role "${id}".`);
-          return r;
-        });
-        const perm = canRoleUseCompanionTool(activeRole, "enhance_flow", "start", roles);
-        if (!perm.allowed) throw new Error(perm.reason);
-        if (targetWs.room.isRunning()) throw new Error(`项目 ${targetWs.cwd} 已有正在运行的协作 Flow；可通过 steer 留言、/flow 查看或 cancel 取消。`);
-
-        const sid = originWs.getSessionId(ctx), goal = asString(params.goal);
-        const priorSessionMandate = targetWs.store.getActiveMandate({ sessionId: sid });
-        const existingMandate = goal ? null : priorSessionMandate;
-        const previewGoal = goal ?? existingMandate?.goal;
-        if (!previewGoal) throw new Error("enhance_flow requires a goal or an active mandate.");
-
-        if (originWs.settings.flowRoutingMode === "manual") {
-          return toolResult({
-            started: false, blockedByRoutingMode: "manual",
-            suggestion: "Automatic Flow dispatch is disabled (flowRoutingMode=manual). Enable auto or ask in /settings → Plugins → omp-enhance.",
-          });
-        }
-        if (originWs.settings.flowRoutingMode === "ask" && ctx?.hasUI) {
-          if (typeof ctx?.ui?.confirm !== "function") return toolResult({ started: false, declined: true, reason: "Interactive confirmation unavailable under flowRoutingMode=ask." });
-          const ok = (await ctx.ui.confirm("启动后台专员协作 Flow？", `目录: ${targetWs.cwd}\n专员链: ${roleIds.join(" → ")}\n目标: ${previewGoal}`)) === true;
-          if (!ok) return toolResult({ started: false, declined: true, reason: "User declined multi-role Flow dispatch." });
-        }
-        if (targetWs.room.isRunning()) throw new Error(`项目 ${targetWs.cwd} 已有正在运行的协作 Flow；可通过 steer 留言、/flow 查看或 cancel 取消。`);
-
-        const flowId = `flow-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-        const mandate = goal ? targetWs.store.upsertMandate({ goal, flowId }) : existingMandate!;
-        const initialHandoffId = asString(params.initialHandoffId);
-        let initialHandoff: HandoffEnvelope | null = initialHandoffId
-          ? (targetWs.store.getHandoff(initialHandoffId) ?? (originWs !== targetWs ? originWs.store.getHandoff(initialHandoffId) : null))
-          : (!goal ? targetWs.store.getLatestHandoff(mandate.id) : (priorSessionMandate ? targetWs.store.getLatestHandoff(priorSessionMandate.id) : null));
-        if (!initialHandoff && targetWs.cwd === originWs.cwd) {
-          initialHandoff = hub.seedLocalChangesHandoff(originWs, sid, mandate, roles[0]!.id);
-        }
-
-        const maxRepairRounds = typeof params.maxRepairRounds === "number" ? params.maxRepairRounds : targetWs.settings.flowMaxRepairRounds;
-        const background = params.wait === true ? false : Boolean(ctx?.hasUI);
-        const started = await targetWs.startManagedFlow({
-          ctx, originWs, flowId, roles, mandate, initialHandoff, maxRepairRounds, background, ...(background ? {} : { signal }),
-        });
-        hub.syncGlobalUi(ctx, originWs);
-        return toolResult(started);
-      } catch (error) { return toolError(error); }
-    },
-  });
+  registerFlowTool(registerTool, kit, hub);
 
   registerTool({
     name: "enhance_job", label: "Enhance Job", approval: "exec",

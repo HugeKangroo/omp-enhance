@@ -42,6 +42,8 @@ export interface RolePermissions {
 
 export interface RoleExitSpec {
   requireToolEvidence: boolean;
+  requiredTools?: string[];
+  requiredArtifacts?: string[];
   criteria: string[];
 }
 
@@ -98,12 +100,14 @@ export interface EpistemicItem {
 }
 
 export type ArtifactRole = "input" | "inspected" | "changed" | "test" | "report" | "metrics";
+export type ArtifactDigestKind = "sha256" | "stat_fingerprint";
 
 export interface ArtifactRecord {
   path: string;
   sha256: string;
   byteSize: number;
   role: ArtifactRole;
+  digestKind?: ArtifactDigestKind;
 }
 
 export interface VerifiedFact {
@@ -159,12 +163,25 @@ export interface RoomEntry {
   stageId?: string;
 }
 
+export type FlowStageStatus =
+  | "running"
+  | "ready"
+  | "needs_input"
+  | "rejected"
+  | "blocked"
+  | "host_error"
+  | "missing_handoff"
+  | "failed"
+  | "violation"
+  | "aborted";
+
 export interface FlowStageTrace {
   stageId: string;
   roleId: string;
   roleName: string;
   round: number;
-  status: "running" | "ready" | "needs_input" | "rejected" | "blocked" | "violation" | "aborted";
+  status: FlowStageStatus;
+  hostError?: string | null;
   modelLabel: string;
   startedAt: string;
   endedAt: string | null;
@@ -283,6 +300,7 @@ export interface FlowRunResult {
     | "rejected_max_rounds"
     | "stagnated"
     | "blocked"
+    | "failed"
     | "violation"
     | "aborted_by_supervisor"
     | "cancelled";

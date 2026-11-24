@@ -15,7 +15,9 @@ import {
   createChildSettingsProxy,
   createOmpRoleSessionRunner,
   createOmpSupervisorInspector,
+  sanitizeHostError,
 } from "../../src/omp/session.ts";
+import { FlowRoomManager } from "../../src/flow/state.ts";
 import { schemaKit } from "../../src/omp/tools.ts";
 import { discoverRoles } from "../../src/roles/loader.ts";
 
@@ -704,6 +706,279 @@ describe("role flow repair loop & mandate completion", () => {
       expect(twoStageAudit.finalEnvelope?.verdict).toBe("rejected");
       expect(twoStageAudit.finalEnvelope?.toTarget).toBe("user");
       expect(store.getMandate(m2.id)?.status).toBe("completed");
+
+      // P1-4: Mixed delivery chain (planner -> dev -> qa) where planner rejects MUST NOT complete dev/qa or Mandate!
+      const m3 = store.upsertMandate({ goal: "Deliver feature after planning" });
+      const executedMixed: string[] = [];
+      const mixedRejectRunner: RoleSessionRunner = {
+        async runRoleTurn(ctx) {
+          executedMixed.push(ctx.role.id);
+          const call: ObservedToolCall = { toolCallId: `mx-${ctx.role.id}`, toolName: "read", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+          const env = createAndVerifyHandoff({
+            store, role: ctx.role, cwd, mandate: m3, baselineSnapshot: ctx.beforeSnapshot,
+            toTarget: ctx.toTarget, verdict: "rejected", summary: "Goal contradicts existing schema",
+            feedbackForUpstream: "src/auth.ts requires migration decision first", observedCalls: [call],
+          });
+          return { envelope: env, observedCalls: [call], assistantText: "rejected", usage: null };
+        },
+      };
+      const mixedRes = await executeRoleFlow({
+        cwd, store, mandate: m3, runner: mixedRejectRunner,
+        roles: [roles.get("planner")!, roles.get("dev")!, roles.get("qa")!],
+      });
+      expect(executedMixed).toEqual(["planner"]);
+      expect(mixedRes.status).toBe("blocked");
+      expect(mixedRes.reason).toContain("migration decision");
+      expect(store.getMandate(m3.id)?.status).toBe("active");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("enforces 3-stage cancellation barrier (before create, during delayed createAgentSession, and during Turn 1) with zero post-cancel prompt (P1-3)", async () => {
+    const { cwd, roles, store, mandate } = setup();
+    try {
+      // (a) Cancelled BEFORE createAgentSession -> 0 sessions created, 0 prompts
+      let createCallsA = 0, promptCallsA = 0;
+      const preAborted = new AbortController();
+      preAborted.abort();
+      const piA = {
+        getAllTools: () => [{ name: "read" }],
+        getThinkingLevel: () => "off",
+        pi: {
+          settings: {},
+          async createAgentSession() {
+            createCallsA += 1;
+            return { session: { messages: [], async prompt() { promptCallsA += 1; }, async dispose() {} } };
+          },
+        },
+      };
+      const resA = await executeRoleFlow({
+        cwd, store, mandate, roles: [roles.get("reviewer")!],
+        runner: createOmpRoleSessionRunner(piA, { cwd, modelRegistry: {} }, undefined, roles),
+        signal: preAborted.signal,
+      });
+      expect(resA.status).toBe("cancelled");
+      expect(createCallsA).toBe(0);
+      expect(promptCallsA).toBe(0);
+
+      // (b) Cancelled DURING delayed createAgentSession -> 1 session disposed, 0 prompt() calls!
+      let createCallsB = 0, promptCallsB = 0, disposeCallsB = 0, abortCallsB = 0;
+      let notifyCreateStarted: (() => void) | null = null;
+      let finishCreateSession: (() => void) | null = null;
+      const roomB = new FlowRoomManager(undefined, store, cwd);
+      const piB = {
+        getAllTools: () => [{ name: "read" }],
+        getThinkingLevel: () => "off",
+        pi: {
+          settings: {},
+          async createAgentSession() {
+            createCallsB += 1;
+            notifyCreateStarted?.();
+            await new Promise<void>((r) => { finishCreateSession = r; });
+            return {
+              session: {
+                messages: [],
+                async prompt() { promptCallsB += 1; },
+                async abort() { abortCallsB += 1; },
+                getLastAssistantText: () => "",
+                getLastAssistantMessage: () => null,
+                async dispose() { disposeCallsB += 1; },
+              },
+            };
+          },
+        },
+      };
+      const flowIdB = roomB.beginFlow({ mandateId: mandate.id, goal: mandate.goal, roleChain: ["reviewer"] });
+      const runPromiseB = executeRoleFlow({
+        cwd, store, flowId: flowIdB, mandate, roles: [roles.get("reviewer")!],
+        runner: createOmpRoleSessionRunner(piB, { cwd, modelRegistry: {} }, undefined, roles),
+        observer: roomB.createObserver(), signal: roomB.getAbortSignal(),
+      });
+      await new Promise<void>((r) => { if (createCallsB > 0) r(); else notifyCreateStarted = r; });
+      const cancelAcceptedB = await roomB.cancelActiveFlow();
+      expect(cancelAcceptedB).toBe(true);
+      finishCreateSession!();
+      const resB = await runPromiseB;
+      roomB.finishFlow(resB);
+      expect(resB.status).toBe("cancelled");
+      expect(createCallsB).toBe(1);
+      expect(promptCallsB).toBe(0);
+      expect(abortCallsB).toBe(0);
+      expect(disposeCallsB).toBe(1);
+
+      // (c) Cancelled DURING Turn 1 prompt() -> session.abort() invoked once, disposed, status=cancelled
+      let promptCallsC = 0, abortCallsC = 0, disposeCallsC = 0;
+      let notifyPromptStarted: (() => void) | null = null;
+      let releasePrompt: (() => void) | null = null;
+      const roomC = new FlowRoomManager(undefined, store, cwd);
+      const piC = {
+        getAllTools: () => [{ name: "read" }],
+        getThinkingLevel: () => "off",
+        pi: {
+          settings: {},
+          async createAgentSession() {
+            return {
+              session: {
+                messages: [],
+                async prompt() {
+                  promptCallsC += 1;
+                  notifyPromptStarted?.();
+                  await new Promise<void>((r) => { releasePrompt = r; });
+                },
+                async abort() { abortCallsC += 1; releasePrompt?.(); },
+                getLastAssistantText: () => "",
+                getLastAssistantMessage: () => ({ role: "assistant", stopReason: "aborted" }),
+                async dispose() { disposeCallsC += 1; },
+              },
+            };
+          },
+        },
+      };
+      const flowIdC = roomC.beginFlow({ mandateId: mandate.id, goal: mandate.goal, roleChain: ["reviewer"] });
+      const runPromiseC = executeRoleFlow({
+        cwd, store, flowId: flowIdC, mandate, roles: [roles.get("reviewer")!],
+        runner: createOmpRoleSessionRunner(piC, { cwd, modelRegistry: {} }, undefined, roles),
+        observer: roomC.createObserver(), signal: roomC.getAbortSignal(),
+      });
+      await new Promise<void>((r) => { if (promptCallsC > 0) r(); else notifyPromptStarted = r; });
+      expect(await roomC.cancelActiveFlow()).toBe(true);
+      const resC = await runPromiseC;
+      roomC.finishFlow(resC);
+      expect(resC.status).toBe("cancelled");
+      expect(promptCallsC).toBe(1);
+      expect(abortCallsC).toBe(1);
+      expect(disposeCallsC).toBe(1);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("verifies line-number bounds, qa required_tools, algo required_artifacts vs needs_input (P2-1), and distinguishes host_error, missing_handoff, and violation (P2-4)", async () => {
+    const { cwd, roles, store, mandate } = setup();
+    writeFile(cwd, "src/math.ts", "export const add = (a: number, b: number) => a + b;\n");
+    try {
+      const readCall: ObservedToolCall = { toolCallId: "rd-1", toolName: "read", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+      const bashCall: ObservedToolCall = { toolCallId: "bs-1", toolName: "bash", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+      const jobCall: ObservedToolCall = { toolCallId: "jb-1", toolName: "enhance_job", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+
+      // 1) P2-1: Out-of-bounds line citations on 1-line src/math.ts are rejected with actual line count
+      expect(() =>
+        createAndVerifyHandoff({
+          store, role: roles.get("reviewer")!, cwd, mandate, verdict: "ready", summary: "Fabricated line 900",
+          observedCalls: [readCall], verifiedFacts: [{ claim: "phantom line", evidenceRef: "src/math.ts:900" }],
+        }),
+      ).toThrow(/Out-of-bounds verifiedFacts line citation[\s\S]*1 line/);
+      expect(() =>
+        createAndVerifyHandoff({
+          store, role: roles.get("reviewer")!, cwd, mandate, verdict: "ready", summary: "Fabricated #L2",
+          observedCalls: [readCall], verifiedFacts: [{ claim: "phantom hash", evidenceRef: "src/math.ts#L1-L2" }],
+        }),
+      ).toThrow(/Out-of-bounds verifiedFacts line citation/);
+
+      // 2) P2-1: qa ready requires bash or enhance_job, while needs_input succeeds without bash
+      expect(() =>
+        createAndVerifyHandoff({
+          store, role: roles.get("qa")!, cwd, mandate, verdict: "ready", summary: "Read only QA", observedCalls: [readCall],
+        }),
+      ).toThrow(/required verification tool\(s\): bash/);
+      expect(
+        createAndVerifyHandoff({
+          store, role: roles.get("qa")!, cwd, mandate, verdict: "needs_input", summary: "Need test fixture credentials",
+          questionsForUser: ["Which test DB port?"], observedCalls: [readCall],
+        }).verdict,
+      ).toBe("needs_input");
+      expect(
+        createAndVerifyHandoff({
+          store, role: roles.get("qa")!, cwd, mandate, verdict: "ready", summary: "Verified via enhance_job", observedCalls: [jobCall],
+        }).verdict,
+      ).toBe("ready");
+
+      // 3) P2-1: algo ready requires REPORT.md + runs/**/metrics.json, while needs_input suspends cleanly without them!
+      expect(() =>
+        createAndVerifyHandoff({
+          store, role: roles.get("algo")!, cwd, mandate, verdict: "ready", summary: "No report yet", observedCalls: [bashCall],
+        }),
+      ).toThrow(/algo_work\/REPORT\.md[\s\S]*algo_work\/runs\/\*\*\/metrics\.json/);
+      const algoPaused = createAndVerifyHandoff({
+        store, role: roles.get("algo")!, cwd, mandate, verdict: "needs_input",
+        summary: "Dataset missing ground-truth labels", questionsForUser: ["Where is labels.parquet?"], observedCalls: [readCall],
+      });
+      expect(algoPaused.verdict).toBe("needs_input");
+
+      writeFile(cwd, "algo_work/REPORT.md", "# Experiment Report\nBaseline vs Candidate\n");
+      writeFile(cwd, "algo_work/runs/r1/metrics.json", '{"mae":0.12}\n');
+      const algoReady = createAndVerifyHandoff({
+        store, role: roles.get("algo")!, cwd, mandate, verdict: "ready", summary: "MAE improved to 0.12", observedCalls: [bashCall],
+      });
+      expect(algoReady.artifacts.map((a) => a.path)).toEqual(["algo_work/REPORT.md", "algo_work/runs/r1/metrics.json"]);
+      expect(algoReady.artifacts[0]?.digestKind).toBe("sha256");
+
+      // 4) P2-4: Distinguish 502 host_error (sanitized, resumable failed), missing_handoff (resumable failed), and violation (non-resumable)
+      expect(sanitizeHostError("502 Bad Gateway Authorization: Bearer sk-secret-abcdef123456 api_key=my_key_99")).not.toContain("sk-secret");
+      expect(sanitizeHostError("502 Bad Gateway Authorization: Bearer sk-secret-abcdef123456 api_key=my_key_99")).not.toContain("my_key_99");
+
+      const hostErrPi = {
+        getAllTools: () => [{ name: "read" }],
+        getThinkingLevel: () => "off",
+        pi: {
+          settings: {},
+          async createAgentSession() {
+            return {
+              session: {
+                messages: [{ role: "assistant", stopReason: "error", errorMessage: "502 Bad Gateway (Bearer sk-live-9876543210secret)" }],
+                async prompt() {},
+                getLastAssistantText: () => "",
+                getLastAssistantMessage: () => ({ role: "assistant", stopReason: "error", errorMessage: "502 Bad Gateway (Bearer sk-live-9876543210secret)" }),
+                async dispose() {},
+              },
+            };
+          },
+        },
+      };
+      const roomHostErr = new FlowRoomManager(undefined, store, cwd);
+      const fidHost = roomHostErr.beginFlow({ mandateId: mandate.id, goal: mandate.goal, roleChain: ["reviewer"] });
+      const hostFlowRes = await executeRoleFlow({
+        cwd, store, flowId: fidHost, mandate, roles: [roles.get("reviewer")!],
+        runner: createOmpRoleSessionRunner(hostErrPi, { cwd, modelRegistry: {} }, undefined, roles),
+        observer: roomHostErr.createObserver(),
+      });
+      const hostSnap = roomHostErr.finishFlow(hostFlowRes);
+      expect(hostFlowRes.status).toBe("failed");
+      expect(hostSnap.status).toBe("failed");
+      expect(roomHostErr.isResumable()).toBe(true);
+      expect(hostSnap.stages[0]?.status).toBe("host_error");
+      expect(hostSnap.stages[0]?.hostError).toContain("502 Bad Gateway");
+      expect(hostSnap.stages[0]?.hostError).not.toContain("sk-live-9876543210secret");
+
+      const roomMissing = new FlowRoomManager(undefined, store, cwd);
+      const fidMissing = roomMissing.beginFlow({ mandateId: mandate.id, goal: mandate.goal, roleChain: ["reviewer"] });
+      const missingFlowRes = await executeRoleFlow({
+        cwd, store, flowId: fidMissing, mandate, roles: [roles.get("reviewer")!],
+        runner: { async runRoleTurn() { return { envelope: null, observedCalls: [], assistantText: "forgot tool", usage: null }; } },
+        observer: roomMissing.createObserver(),
+      });
+      const missingSnap = roomMissing.finishFlow(missingFlowRes);
+      expect(missingFlowRes.status).toBe("failed");
+      expect(missingSnap.stages[0]?.status).toBe("missing_handoff");
+      expect(roomMissing.isResumable()).toBe(true);
+
+      const roomViol = new FlowRoomManager(undefined, store, cwd);
+      const fidViol = roomViol.beginFlow({ mandateId: mandate.id, goal: mandate.goal, roleChain: ["reviewer"] });
+      const violFlowRes = await executeRoleFlow({
+        cwd, store, flowId: fidViol, mandate, roles: [roles.get("reviewer")!],
+        runner: {
+          async runRoleTurn() {
+            writeFile(cwd, "src/math.ts", "export const tampered = 0;\n");
+            return { envelope: null, observedCalls: [], assistantText: "", usage: null };
+          },
+        },
+        observer: roomViol.createObserver(),
+      });
+      const violSnap = roomViol.finishFlow(violFlowRes);
+      expect(violFlowRes.status).toBe("violation");
+      expect(violSnap.stages[0]?.status).toBe("violation");
+      expect(roomViol.isResumable()).toBe(false);
     } finally {
       store.close();
     }

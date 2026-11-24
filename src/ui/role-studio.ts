@@ -41,7 +41,12 @@ function stripRoleDraft(role: RoleSpec): Omit<RoleSpec, "source" | "filePath" | 
       ...(role.permissions.protected ? { protected: [...role.permissions.protected] } : {}),
       ...(role.permissions.dispatch !== undefined ? { dispatch: role.permissions.dispatch } : {}),
     },
-    exit: { requireToolEvidence: role.exit.requireToolEvidence, criteria: [...role.exit.criteria] },
+    exit: {
+      requireToolEvidence: role.exit.requireToolEvidence,
+      ...(role.exit.requiredTools ? { requiredTools: [...role.exit.requiredTools] } : {}),
+      ...(role.exit.requiredArtifacts ? { requiredArtifacts: [...role.exit.requiredArtifacts] } : {}),
+      criteria: [...role.exit.criteria],
+    },
   };
 }
 

@@ -36,6 +36,7 @@ export interface RoleTurnOutcome {
   abortedBySupervisor?: SupervisorDecision | null;
   cancelledByUser?: boolean;
   boundaryViolations?: string[];
+  hostError?: string | null;
 }
 export interface RoleSessionRunner {
   runRoleTurn(ctx: RoleStepContext): Promise<RoleTurnOutcome>;
@@ -50,6 +51,7 @@ export interface ExecuteRoleStepInput {
 export type ExecuteRoleStepResult =
   | { ok: true; envelope: HandoffEnvelope }
   | { ok: false; status: "violation"; violations: string[]; reason: string }
+  | { ok: false; status: "host_error"; reason: string; hostError: string }
   | { ok: false; status: "missing_handoff"; reason: string }
   | { ok: false; status: "aborted_by_supervisor"; reason: string; decision: SupervisorDecision }
   | { ok: false; status: "cancelled"; reason: string };
@@ -136,8 +138,13 @@ export async function executeRoleStep(input: ExecuteRoleStepInput): Promise<Exec
     return { ok: false, status: "violation", violations: allViolations, reason };
   }
   if (!outcome.envelope) {
-    const reason = `Role "${input.role.id}" finished without submitting enhance_handoff.`;
-    input.observer?.onStageEnd?.(stageId, { status: "violation", outcome, reason });
+    if (outcome.hostError) {
+      const reason = `[stage:${input.role.id}] Host/model error: ${outcome.hostError}`;
+      input.observer?.onStageEnd?.(stageId, { status: "host_error", outcome, reason, hostError: outcome.hostError });
+      return { ok: false, status: "host_error", reason, hostError: outcome.hostError };
+    }
+    const reason = `[stage:${input.role.id}] Role ended without calling enhance_handoff.`;
+    input.observer?.onStageEnd?.(stageId, { status: "missing_handoff", outcome, reason });
     return { ok: false, status: "missing_handoff", reason };
   }
   if (outcome.usage && !outcome.envelope.observedUsage) {
@@ -159,6 +166,7 @@ export interface ExecuteRoleFlowInput {
 export async function executeRoleFlow(input: ExecuteRoleFlowInput): Promise<FlowRunResult> {
   if (input.roles.length < 1) throw new Error("executeRoleFlow requires at least one role.");
   const maxRepairRounds = input.maxRepairRounds ?? 2, steps: FlowStepResult[] = [];
+  const isPureReadOnlyAuditFlow = input.roles.every((r) => isRoleReadOnly(r));
   const repairTargetIdx = resolveRepairTargetIndex(input.roles), repairTargetRoleId = input.roles[repairTargetIdx]!.id;
   let repairRound = input.initialRepairRound ?? 0, lastRejectionSig: string | null = input.initialLastRejectionSig ?? null;
   let upstream = input.initialHandoff ?? null;
@@ -184,7 +192,13 @@ export async function executeRoleFlow(input: ExecuteRoleFlowInput): Promise<Flow
       ...(input.supervisor ? { supervisor: input.supervisor } : {}), ...(input.signal ? { signal: input.signal } : {}),
     });
     if (!res.ok) {
-      const status = res.status === "cancelled" ? "cancelled" : (res.status === "aborted_by_supervisor" ? "aborted_by_supervisor" : "violation");
+      const status = res.status === "cancelled"
+        ? "cancelled"
+        : res.status === "aborted_by_supervisor"
+          ? "aborted_by_supervisor"
+          : res.status === "violation"
+            ? "violation"
+            : "failed";
       return { status, cwd: input.cwd, steps, finalEnvelope: upstream, reason: res.reason };
     }
     let env = res.envelope;
@@ -200,12 +214,12 @@ export async function executeRoleFlow(input: ExecuteRoleFlowInput): Promise<Flow
     }
     if (env.verdict === "blocked") return { status: "blocked", cwd: input.cwd, steps, finalEnvelope: env, reason: env.summary };
     if (env.verdict === "rejected") {
-      if (!hasWritableSoFar) {
+      if (isPureReadOnlyAuditFlow && idx === input.roles.length - 1) {
         input.observer?.onProgress?.({ currentIndex: idx + 1, repairRound, lastHandoffId: env.id, lastRejectionSig, nextStageSeq: seq });
         input.store.completeMandate(input.mandate.id);
         return { status: "completed", cwd: input.cwd, steps, finalEnvelope: env, reason: env.feedbackForUpstream ?? env.summary };
       }
-      if (idx <= repairTargetIdx) {
+      if (!hasWritableSoFar || idx <= repairTargetIdx) {
         return { status: "blocked", cwd: input.cwd, steps, finalEnvelope: env, reason: env.feedbackForUpstream ?? env.summary };
       }
       const signature = (env.feedbackForUpstream ?? env.summary).trim().toLowerCase().replace(/\s+/g, " ");

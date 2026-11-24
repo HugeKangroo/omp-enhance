@@ -258,6 +258,12 @@ export function cloneRoleSpec(input: {
       },
       exit: {
         requireToolEvidence: input.sourceRole.exit.requireToolEvidence,
+        ...(input.sourceRole.exit.requiredTools
+          ? { requiredTools: [...input.sourceRole.exit.requiredTools] }
+          : {}),
+        ...(input.sourceRole.exit.requiredArtifacts
+          ? { requiredArtifacts: [...input.sourceRole.exit.requiredArtifacts] }
+          : {}),
         criteria: [...input.sourceRole.exit.criteria],
       },
     },

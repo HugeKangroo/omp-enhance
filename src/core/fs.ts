@@ -1,16 +1,17 @@
-import { createHash } from "node:crypto";
 import {
-  existsSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync,
+  closeSync, existsSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync,
 } from "node:fs";
 import path from "node:path";
 import type { RolePermissions } from "./types.ts";
 
-export interface SnapshotEntry { sha256: string; byteSize: number }
+export type SnapshotDigestKind = "sha256" | "stat_fingerprint" | "symlink";
+export interface SnapshotEntry { sha256: string; byteSize: number; digestKind?: SnapshotDigestKind }
 
 export interface SnapshotWorkspaceOptions {
   includeGlobs?: readonly string[];
   respectGitignore?: boolean;
   extraSkipDirs?: readonly string[];
+  maxStreamHashBytes?: number;
   maxFullHashBytes?: number;
 }
 
@@ -20,7 +21,9 @@ export const DEFAULT_SKIP_DIRS: ReadonlySet<string> = new Set([
   "target", "dist", "build", ".next", ".turbo",
 ]);
 
-const DEFAULT_MAX_FULL_HASH_BYTES = 32 * 1024 * 1024;
+export const MAX_STREAM_HASH_BYTES = 512 * 1024 * 1024;
+const STREAM_CHUNK_BYTES = 64 * 1024;
+const sharedChunkBuf = Buffer.allocUnsafe(STREAM_CHUNK_BYTES);
 const RACILY_CLEAN_WINDOW_MS = 2_000;
 const MAX_HASH_CACHE_SIZE = 50_000;
 const MAX_GLOB_CACHE_SIZE = 2_048;
@@ -142,34 +145,61 @@ function isIgnoredByGitignore(relPath: string, isDir: boolean, gi: ParsedGitigno
   return !(gi.negateGlobs.length > 0 && matchesGlobList(relPath, gi.negateGlobs));
 }
 
-function hashRegularFile(fullPath: string, nowMs: number, maxFullHashBytes: number): SnapshotEntry | null {
+export function hashFileSync(
+  fullPath: string,
+  maxStreamHashBytes = MAX_STREAM_HASH_BYTES,
+  nowMs = Date.now(),
+): SnapshotEntry | null {
+  let st;
   try {
-    const st = statSync(fullPath);
-    if (st.size > maxFullHashBytes) {
-      return { sha256: `oversize:${st.size}:${Math.trunc(st.mtimeMs)}`, byteSize: st.size };
-    }
-    const cached = fileHashCache.get(fullPath);
-    const racilyCleanSafe =
-      nowMs - st.mtimeMs >= RACILY_CLEAN_WINDOW_MS && nowMs - st.ctimeMs >= RACILY_CLEAN_WINDOW_MS;
-    if (
-      racilyCleanSafe && cached && cached.dev === st.dev && cached.ino === st.ino &&
-      cached.mtimeMs === st.mtimeMs && cached.ctimeMs === st.ctimeMs && cached.size === st.size
-    ) {
-      return { sha256: cached.sha256, byteSize: st.size };
-    }
+    st = statSync(fullPath);
+  } catch {
+    return null;
+  }
+  if (!st.isFile()) return null;
+  if (st.size > maxStreamHashBytes) {
+    return { sha256: `stat:${st.size}:${Math.trunc(st.mtimeMs)}`, byteSize: st.size, digestKind: "stat_fingerprint" };
+  }
+  const cached = fileHashCache.get(fullPath);
+  const racilyCleanSafe =
+    nowMs - st.mtimeMs >= RACILY_CLEAN_WINDOW_MS && nowMs - st.ctimeMs >= RACILY_CLEAN_WINDOW_MS;
+  if (
+    racilyCleanSafe && cached && cached.dev === st.dev && cached.ino === st.ino &&
+    cached.mtimeMs === st.mtimeMs && cached.ctimeMs === st.ctimeMs && cached.size === st.size
+  ) {
+    return { sha256: cached.sha256, byteSize: st.size, digestKind: "sha256" };
+  }
 
-    const content = readFileSync(fullPath);
-    const sha256 = createHash("sha256").update(content).digest("hex");
+  let fd: number | null = null;
+  try {
+    fd = openSync(fullPath, "r");
+    const hasher = new Bun.CryptoHasher("sha256");
+    let totalRead = 0;
+    while (true) {
+      const bytesRead = readSync(fd, sharedChunkBuf, 0, STREAM_CHUNK_BYTES, totalRead);
+      if (bytesRead <= 0) break;
+      hasher.update(sharedChunkBuf.subarray(0, bytesRead));
+      totalRead += bytesRead;
+      if (totalRead > maxStreamHashBytes) {
+        return { sha256: `stat:${totalRead}:${Math.trunc(st.mtimeMs)}`, byteSize: totalRead, digestKind: "stat_fingerprint" };
+      }
+    }
+    const sha256 = hasher.digest("hex");
     if (fileHashCache.size >= MAX_HASH_CACHE_SIZE) {
       const oldest = fileHashCache.keys().next().value;
       if (oldest !== undefined) fileHashCache.delete(oldest);
     }
     fileHashCache.set(fullPath, {
-      dev: st.dev, ino: st.ino, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, size: content.byteLength, sha256,
+      dev: st.dev, ino: st.ino, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, size: totalRead, sha256,
     });
-    return { sha256, byteSize: content.byteLength };
+    return { sha256, byteSize: totalRead, digestKind: "sha256" };
   } catch {
-    return null;
+    if (!existsSync(fullPath)) return null;
+    return { sha256: `stat:${st.size}:${Math.trunc(st.mtimeMs)}`, byteSize: st.size, digestKind: "stat_fingerprint" };
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch {}
+    }
   }
 }
 
@@ -181,7 +211,7 @@ export function snapshotWorkspace(
     ? { includeGlobs: includeOrOptions }
     : ((includeOrOptions as SnapshotWorkspaceOptions | undefined) ?? {});
   const includeGlobs = opts.includeGlobs;
-  const maxFullHashBytes = opts.maxFullHashBytes ?? DEFAULT_MAX_FULL_HASH_BYTES;
+  const maxStreamHashBytes = opts.maxStreamHashBytes ?? opts.maxFullHashBytes ?? MAX_STREAM_HASH_BYTES;
   const extraSkips = opts.extraSkipDirs?.length ? new Set(opts.extraSkipDirs) : null;
   const gitignore = opts.respectGitignore !== false ? loadRootGitignore(cwd) : null;
   const nowMs = Date.now();
@@ -198,7 +228,7 @@ export function snapshotWorkspace(
         if (includeGlobs && !matchesGlobList(relPath, includeGlobs)) continue;
         try {
           const target = readlinkSync(fullPath);
-          snapshot.set(relPath, { sha256: `symlink:${target}`, byteSize: Buffer.byteLength(target) });
+          snapshot.set(relPath, { sha256: `symlink:${target}`, byteSize: Buffer.byteLength(target), digestKind: "symlink" });
         } catch {}
       } else if (entry.isDirectory()) {
         if (DEFAULT_SKIP_DIRS.has(entry.name) || extraSkips?.has(entry.name)) continue;
@@ -209,7 +239,7 @@ export function snapshotWorkspace(
         const relPath = normalizeRelPath(path.relative(cwd, fullPath));
         if (isIgnoredByGitignore(relPath, false, gitignore)) continue;
         if (includeGlobs && !matchesGlobList(relPath, includeGlobs)) continue;
-        const hashed = hashRegularFile(fullPath, nowMs, maxFullHashBytes);
+        const hashed = hashFileSync(fullPath, maxStreamHashBytes, nowMs);
         if (hashed) snapshot.set(relPath, hashed);
       }
     }
@@ -228,10 +258,10 @@ export function snapshotConfigIntegrity(cwd: string): Map<string, SnapshotEntry>
     if (!existsSync(full)) continue;
     try {
       const target = readlinkSync(full);
-      integrity.set(relFile, { sha256: `symlink:${target}`, byteSize: Buffer.byteLength(target) });
+      integrity.set(relFile, { sha256: `symlink:${target}`, byteSize: Buffer.byteLength(target), digestKind: "symlink" });
       continue;
     } catch {}
-    const hashed = hashRegularFile(full, nowMs, DEFAULT_MAX_FULL_HASH_BYTES);
+    const hashed = hashFileSync(full, MAX_STREAM_HASH_BYTES, nowMs);
     if (hashed) integrity.set(relFile, hashed);
   }
 
@@ -245,11 +275,11 @@ export function snapshotConfigIntegrity(cwd: string): Map<string, SnapshotEntry>
       if (entry.isSymbolicLink()) {
         try {
           const target = readlinkSync(full);
-          integrity.set(rel, { sha256: `symlink:${target}`, byteSize: Buffer.byteLength(target) });
+          integrity.set(rel, { sha256: `symlink:${target}`, byteSize: Buffer.byteLength(target), digestKind: "symlink" });
         } catch {}
       } else if (entry.isDirectory()) walkRoles(full);
       else if (entry.isFile()) {
-        const hashed = hashRegularFile(full, nowMs, DEFAULT_MAX_FULL_HASH_BYTES);
+        const hashed = hashFileSync(full, MAX_STREAM_HASH_BYTES, nowMs);
         if (hashed) integrity.set(rel, hashed);
       }
     }

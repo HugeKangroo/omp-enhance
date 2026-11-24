@@ -2,7 +2,7 @@
 
 本文档定义内置专员 **[algo.yaml](../roles/algo.yaml)**（引导型有监督算法优化专家，融合防泄漏数据质量审计与科学实验调优）与 **[vision.yaml](../roles/vision.yaml)**（`@vision` 视觉诊断专员）的工程方法论契约。
 
-在 `/coord` 总秘书统筹下，`algo` 对内以**“防同源泄漏数据审计 + `algo_work/` 三区实验件隔离 + 四道渐进式报告门禁”**锁死可复现闭环；对外在关键业务分叉点通过 `enhance_handoff(verdict="needs_input", questionsForUser=[...])` 自动挂起为 `waiting_input`（挂起期间 **0 Token 消耗**），由总秘书用大白话向用户确认偏好后再通过 `enhance_flow(action="resume", message=...)` 续跑。（注：若需对原始数据目录或定稿后的基准目录施加硬物理写锁，可在项目覆盖角色 `.omp/roles/algo.yaml` 中配置 `permissions.protected` 与 `permissions.writable`。）
+在 `/coord` 总秘书统筹下，`algo` 对内以**“防同源泄漏数据审计 + `algo_work/` 三区实验件隔离 + 四道渐进式报告门禁”**锁死可复现闭环（声明 `verdict: "ready"` 结项时由交接核验器强制检查 `algo_work/REPORT.md` 与 `algo_work/runs/**/metrics.json` 齐全，并对 `<= 512 MiB` 的实验产物计算流式 `sha256` 内容摘要 `digestKind: "sha256"`，超大文件单独标记为 `digestKind: "stat_fingerprint"`）；对外在关键业务分叉点通过 `enhance_handoff(verdict="needs_input", questionsForUser=[...])` 自动挂起为 `waiting_input`（挂起期间 **0 Token 消耗**，允许在最终交付物未齐前合法暂停），由总秘书用大白话向用户确认偏好后再通过 `enhance_flow(action="resume", flowId, message=...)` 续跑。（注：项目覆盖角色 `.omp/roles/algo.yaml` 可配置 `permissions.protected` 与 `permissions.writable` 实现编辑工具事前路径拦截 + 阶段结束全目录哈希快照比对；若要求训练脚本执行期间原始数据目录在操作系统层全程严格只读，建议在隔离工作区或只读挂载目录下运行。）
 
 ---
 

@@ -317,4 +317,77 @@ describe("background jobs (src/jobs/runner.ts)", () => {
       store.close();
     }
   });
+
+  test("aborts before spawning on invalid mandateId FK with 0 side effects, and records queryable failed row on spawn failure (P1-5)", async () => {
+    const cwd = tempDir();
+    const store = new EnhanceStore(path.join(cwd, "state.sqlite"));
+    const sideEffectFile = path.join(cwd, "should-never-exist.marker");
+    const retryCounterFile = path.join(cwd, "retry-executions.log");
+
+    try {
+      // 1) Invalid mandateId FK fails BEFORE spawning process or writing job files -> 0 side effects, 0 rows!
+      expect(() =>
+        startBackgroundJob({
+          store,
+          cwd,
+          mandateId: "invalid-missing-mandate-id",
+          command: `printf "leaked\\n" > "${sideEffectFile}"`,
+        }),
+      ).toThrow();
+      await Bun.sleep(80);
+      expect(existsSync(sideEffectFile)).toBe(false);
+      expect(existsSync(path.join(cwd, ".omp-enhance", "jobs"))).toBe(false);
+      expect(store.listJobs()).toEqual([]);
+
+      // 2) Simulated spawn failure AFTER DB pre-registration leaves a queryable status="failed" row & log diagnostic!
+      const validMandate = store.upsertMandate({ goal: "Run supervised training" });
+      expect(() =>
+        startBackgroundJob({
+          store,
+          cwd,
+          mandateId: validMandate.id,
+          command: `printf "leaked\\n" > "${sideEffectFile}"`,
+          spawnImpl: (() => {
+            throw new Error("EAGAIN: simulated OS fork exhaustion");
+          }) as unknown as typeof spawn,
+        }),
+      ).toThrow(/EAGAIN: simulated OS fork exhaustion/);
+      expect(existsSync(sideEffectFile)).toBe(false);
+
+      const failedJobs = store.listJobs();
+      expect(failedJobs).toHaveLength(1);
+      expect(failedJobs[0]!.status).toBe("failed");
+      expect(failedJobs[0]!.exitCode).toBe(-1);
+      expect(failedJobs[0]!.endedAt).not.toBeNull();
+      expect(failedJobs[0]!.pid).toBe(0);
+      expect(readJobLogTail(failedJobs[0]!)).toContain("EAGAIN: simulated OS fork exhaustion");
+
+      // Also verify missing shell binary (child.pid undefined) transitions pre-registered row to status="failed"
+      expect(() =>
+        startBackgroundJob({
+          store,
+          cwd,
+          mandateId: validMandate.id,
+          command: `printf "leaked\\n" > "${sideEffectFile}"`,
+          shellBin: "/nonexistent/omp-missing-sh-binary",
+        }),
+      ).toThrow(/Failed to spawn background job process/);
+      expect(existsSync(sideEffectFile)).toBe(false);
+      expect(store.listJobs("failed")).toHaveLength(2);
+
+      // 3) Retry succeeds cleanly with exactly 1 real execution!
+      const okJob = startBackgroundJob({
+        store,
+        cwd,
+        mandateId: validMandate.id,
+        command: `printf "executed_once\\n" >> "${retryCounterFile}"`,
+      });
+      await waitUntil(() => existsSync(okJob.exitFilePath));
+      reconcileJobs(store);
+      expect(store.getJob(okJob.jobId)?.status).toBe("completed");
+      expect(await Bun.file(retryCounterFile).text()).toBe("executed_once\n");
+    } finally {
+      store.close();
+    }
+  });
 });

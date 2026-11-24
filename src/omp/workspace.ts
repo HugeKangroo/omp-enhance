@@ -7,11 +7,12 @@ import {
 import { EnhanceStore } from "../core/store.ts";
 import type { EnhanceSettings, FlowRunResult, HandoffEnvelope, Mandate, RoleSpec } from "../core/types.ts";
 import { executeRoleFlow, type RoleSessionRunner, type RoleSupervisorConfig } from "../flow/orchestrator.ts";
-import { FlowRoomManager } from "../flow/state.ts";
+import { FlowRoomManager, isCheckpointResumable } from "../flow/state.ts";
 import { SessionTrackerRegistry } from "../flow/tracker.ts";
 import { discoverRolesWithDiagnostics } from "../roles/loader.ts";
 import { createFlowRoomUiAdapter, type FlowMonitorTarget } from "../ui/flow-room.ts";
 import { createOmpRoleSessionRunner, createOmpSupervisorInspector } from "./session.ts";
+import type { TrustEvaluation } from "./trust.ts";
 
 export interface EmitMessageOptions {
   excludeFromContext?: boolean;
@@ -20,6 +21,7 @@ export interface EmitMessageOptions {
 
 export interface WorkspaceRuntime {
   cwd: string; globalRolesDir: string; builtinRolesDir?: string;
+  isTrusted: boolean; trustNotice?: string;
   store: EnhanceStore; trackers: SessionTrackerRegistry; room: FlowRoomManager;
   roles: Map<string, RoleSpec>; settings: EnhanceSettings;
   getSessionId(ctx: any): string;
@@ -37,7 +39,7 @@ export interface WorkspaceRuntime {
     background: boolean; initiatorText?: string; signal?: AbortSignal;
   }): Promise<{ started: true; flowId: string; cwd: string; background: true; status: "running"; roleChain: string[]; goal: string } | FlowRunResult>;
   resumeManagedFlow(
-    ctx: any, background: boolean, signal?: AbortSignal, originWs?: ManagedWorkspace,
+    ctx: any, background: boolean, signal?: AbortSignal, originWs?: ManagedWorkspace, targetFlowId?: string,
   ): Promise<{ resumed: true; flowId: string; cwd: string; startIndex: number; background: true; status: "running"; roleChain: string[] } | FlowRunResult>;
 }
 
@@ -56,13 +58,23 @@ export interface WorkspaceHubHooks {
   syncGlobalUi?: (ctx: any, ws: ManagedWorkspace) => void;
   getActiveTargets?: () => readonly FlowMonitorTarget[];
   onBackgroundFlowSettled?: (settlement: BackgroundFlowSettlement) => void;
+  evaluateTrust?: (targetCwd: string, ctx?: any) => TrustEvaluation;
 }
 
 export const sessionKey = (ctx: any): string =>
   ctx?.sessionManager?.getSessionId?.() ?? ctx?.sessionManager?.getSessionFile?.() ?? "__default__";
 
-export const isProjectTrusted = (ctx: any): boolean =>
-  typeof ctx?.isProjectTrusted === "function" ? Boolean(ctx.isProjectTrusted()) : true;
+export const isProjectTrusted = (ctx: any, targetCwd?: string): boolean => {
+  if (typeof ctx?.isProjectTrusted !== "function") return true;
+  return targetCwd && ctx.isProjectTrusted.length >= 1
+    ? Boolean(ctx.isProjectTrusted(path.resolve(targetCwd)))
+    : Boolean(ctx.isProjectTrusted());
+};
+
+function combineAbortSignals(a?: AbortSignal, b?: AbortSignal): AbortSignal | undefined {
+  if (a && b) return AbortSignal.any([a, b]);
+  return a ?? b;
+}
 
 export const defaultRoleId = (roles: Map<string, RoleSpec>, settings: EnhanceSettings): string | null => {
   if (settings.defaultRole === null) return null;
@@ -241,13 +253,15 @@ export interface ManagedWorkspace extends WorkspaceRuntime {
 export type WorkspaceState = ManagedWorkspace;
 
 export function createManagedWorkspace(
-  pi: any, cwd: string, trusted: boolean,
+  pi: any, cwd: string, initialTrust: boolean | TrustEvaluation,
   options: { globalRolesDir?: string; builtinRolesDir?: string; pluginLockPath?: string; runnerFactory?: (pi: any, ctx: any) => RoleSessionRunner },
   hooks?: WorkspaceHubHooks,
 ): ManagedWorkspace {
   const resolveGlobalDir = () => options.globalRolesDir ?? resolveDefaultGlobalRolesDir();
-  const { roles } = discoverRolesWithDiagnostics({ cwd, globalRolesDir: resolveGlobalDir(), builtinRolesDir: options.builtinRolesDir, isProjectTrusted: trusted });
-  const settings = loadEnhanceSettings({ cwd, pluginLockPath: options.pluginLockPath, isProjectTrusted: trusted });
+  const initTrusted = typeof initialTrust === "boolean" ? initialTrust : initialTrust.trusted;
+  const initNotice = typeof initialTrust === "boolean" ? undefined : initialTrust.trustNotice;
+  const { roles } = discoverRolesWithDiagnostics({ cwd, globalRolesDir: resolveGlobalDir(), builtinRolesDir: options.builtinRolesDir, isProjectTrusted: initTrusted });
+  const settings = loadEnhanceSettings({ cwd, pluginLockPath: options.pluginLockPath, isProjectTrusted: initTrusted });
   const store = new EnhanceStore(path.join(cwd, ".omp-enhance", "state.sqlite"));
   const trackers = new SessionTrackerRegistry(), baselines = new SessionBaselineManager();
   const room = new FlowRoomManager(createFlowRoomUiAdapter(pi, hooks?.getActiveTargets), store, cwd);
@@ -281,6 +295,7 @@ export function createManagedWorkspace(
 
   const ws: ManagedWorkspace = {
     cwd, globalRolesDir: resolveGlobalDir(), builtinRolesDir: options.builtinRolesDir,
+    isTrusted: initTrusted, ...(initNotice ? { trustNotice: initNotice } : {}),
     store, trackers, room, roles, settings, rolesBySession, baselines,
     getSessionId: (c) => sessionKey(c),
     getSessionRoleId: (c) => {
@@ -291,10 +306,15 @@ export function createManagedWorkspace(
     },
     getActiveRole: (c) => { const id = ws.getSessionRoleId(c); return id ? ws.roles.get(id) ?? null : null; },
     refresh: (c) => {
-      const isTrusted = c === undefined ? true : isProjectTrusted(c);
+      if (hooks?.evaluateTrust) {
+        const ev = hooks.evaluateTrust(cwd, c);
+        ws.isTrusted = ev.trusted; ws.trustNotice = ev.trustNotice;
+      } else if (c !== undefined) {
+        ws.isTrusted = isProjectTrusted(c, cwd); ws.trustNotice = undefined;
+      }
       ws.globalRolesDir = resolveGlobalDir();
-      ws.roles = discoverRolesWithDiagnostics({ cwd, globalRolesDir: ws.globalRolesDir, builtinRolesDir: options.builtinRolesDir, isProjectTrusted: isTrusted }).roles;
-      ws.settings = loadEnhanceSettings({ cwd, pluginLockPath: options.pluginLockPath, isProjectTrusted: isTrusted });
+      ws.roles = discoverRolesWithDiagnostics({ cwd, globalRolesDir: ws.globalRolesDir, builtinRolesDir: options.builtinRolesDir, isProjectTrusted: ws.isTrusted }).roles;
+      ws.settings = loadEnhanceSettings({ cwd, pluginLockPath: options.pluginLockPath, isProjectTrusted: ws.isTrusted });
       return ws.roles;
     },
     syncStatusBar: (c) => {
@@ -343,17 +363,46 @@ export function createManagedWorkspace(
     startManagedFlow: async ({ ctx: c, originWs, flowId: explicitId, roles: rList, mandate, initialHandoff, maxRepairRounds, background, initiatorText, signal }) => {
       const roleChain = rList.map((r) => r.id);
       const flowId = room.beginFlow({ flowId: explicitId, mandateId: mandate.id, goal: mandate.goal, roleChain, maxRepairRounds, lastHandoffId: initialHandoff?.id ?? null, initiatorText, ctx: c });
-      const p = runFlowTask(c, originWs ?? ws, background, flowId, { roles: rList, mandate, initialHandoff, maxRepairRounds, signal });
+      const effSignal = combineAbortSignals(signal, room.getAbortSignal());
+      const p = runFlowTask(c, originWs ?? ws, background, flowId, { roles: rList, mandate, initialHandoff, maxRepairRounds, signal: effSignal });
       if (!background) return await p;
       void p.catch(() => {});
       return { started: true, flowId, cwd, background: true, status: "running", roleChain, goal: mandate.goal };
     },
-    resumeManagedFlow: async (c, background, signal, originWs) => {
-      const plan = room.resumeFlow(c);
-      const rList = plan.roleChain.map((id) => { const r = ws.roles.get(id); if (!r) throw new Error(`Unknown role "${id}".`); return r; });
-      const mandate = store.getMandate(plan.mandateId) ?? store.upsertMandate({ goal: room.getSnapshot().goal || "Resumed Flow", flowId: plan.flowId });
-      const initialHandoff = plan.lastHandoffId ? store.getHandoff(plan.lastHandoffId) : null;
-      const p = runFlowTask(c, originWs ?? ws, background, plan.flowId, { roles: rList, mandate, initialHandoff, maxRepairRounds: plan.maxRepairRounds, startIndex: plan.startIndex, initialRepairRound: plan.repairRound, initialStageSeq: plan.initialStageSeq, initialLastRejectionSig: plan.lastRejectionSig, signal });
+    resumeManagedFlow: async (c, background, signal, originWs, targetFlowId) => {
+      const effectiveFlowId = targetFlowId ?? room.getSnapshot().flowId;
+      const cp = effectiveFlowId && !store.isClosed() ? store.getFlowCheckpoint(effectiveFlowId) : null;
+      if (targetFlowId && !cp && room.getSnapshot().flowId !== targetFlowId) {
+        throw new Error(`Unknown flowId "${targetFlowId}".`);
+      }
+      if (cp ? !isCheckpointResumable(cp) : !room.isResumable()) {
+        throw new Error(cp ? `Flow "${cp.flowId}" 当前状态为 ${cp.status}，无法断点续跑。` : "当前没有可断点续跑的中断/失败 Flow。");
+      }
+      const chainToValidate = cp ? cp.roleChain : room.getSnapshot().roleChain;
+      const rList = chainToValidate.map((id) => {
+        const r = ws.roles.get(id);
+        if (id === "supervisor" || (r && isInternalRole(r))) {
+          throw new Error(`Role "${id}" is an internal monitor and cannot run as a Flow stage.`);
+        }
+        if (!r) throw new Error(`Unknown role "${id}" in Flow "${effectiveFlowId ?? "flow"}". Restore the role before resuming.`);
+        return r;
+      });
+      const plan = room.resumeFlow(c, targetFlowId);
+      let mandate: Mandate;
+      let initialHandoff: HandoffEnvelope | null;
+      try {
+        mandate = store.getMandate(plan.mandateId) ?? store.upsertMandate({ goal: room.getSnapshot().goal || "Resumed Flow", flowId: plan.flowId });
+        initialHandoff = plan.lastHandoffId ? store.getHandoff(plan.lastHandoffId) : null;
+      } catch (setupErr) {
+        room.failFlow(setupErr, c);
+        throw setupErr;
+      }
+      const effSignal = combineAbortSignals(signal, room.getAbortSignal());
+      const p = runFlowTask(c, originWs ?? ws, background, plan.flowId, {
+        roles: rList, mandate, initialHandoff, maxRepairRounds: plan.maxRepairRounds,
+        startIndex: plan.startIndex, initialRepairRound: plan.repairRound, initialStageSeq: plan.initialStageSeq,
+        initialLastRejectionSig: plan.lastRejectionSig, signal: effSignal,
+      });
       if (!background) return await p;
       void p.catch(() => {});
       return { resumed: true, flowId: plan.flowId, cwd, startIndex: plan.startIndex, background: true, status: "running", roleChain: plan.roleChain };

@@ -12,7 +12,7 @@ import {
 } from "../../src/core/settings.ts";
 import { ROLE_THINKING_LEVELS, type RoleSpec } from "../../src/core/types.ts";
 import {
-  discoverRoles, listUserVisibleRoles, parseRoleYaml, resetRoleOverride, saveRoleSpec, serializeRoleYaml,
+  cloneRoleSpec, discoverRoles, listUserVisibleRoles, parseRoleYaml, resetRoleOverride, saveRoleSpec, serializeRoleYaml,
 } from "../../src/roles/loader.ts";
 import { parseOverlayKey } from "../../src/ui/kit.ts";
 import {
@@ -565,6 +565,20 @@ describe("Role Studio strict UI, glob parsing, coordinator/specialist grouping, 
     expect(savedQa.permissions.tools).toEqual([
       "bash", "edit", "find", "glob", "grep", "lsp", "read", "task", "wait", "write",
     ]);
+    // Wave 2S: Role Studio edit & clone preserve required_tools (qa) and required_artifacts (algo)
+    expect(savedQa.exit.requiredTools).toEqual(["bash"]);
+
+    selectScripts.push("推理档位: inherit", "high", "返回");
+    await openRoleEditor("algo", h.makeDeps(ctx));
+    const savedAlgoPath = path.join(globalDir, "algo.yaml");
+    const savedAlgo = parseRoleYaml(readFileSync(savedAlgoPath, "utf8"), "global", savedAlgoPath);
+    expect(savedAlgo.thinking).toBe("high");
+    expect(savedAlgo.exit.requiredArtifacts).toEqual(["algo_work/REPORT.md", "algo_work/runs/**/metrics.json"]);
+
+    const clonedAlgo = cloneRoleSpec({ sourceRole: savedAlgo, newId: "algo-ts", targetDir: globalDir });
+    expect(clonedAlgo.role.exit.requiredArtifacts).toEqual(["algo_work/REPORT.md", "algo_work/runs/**/metrics.json"]);
+    const clonedQa = cloneRoleSpec({ sourceRole: savedQa, newId: "qa-strict", targetDir: globalDir });
+    expect(clonedQa.role.exit.requiredTools).toEqual(["bash"]);
   });
 });
 

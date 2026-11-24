@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import {
   diffSnapshots, findBoundaryViolations, matchesGlobList, normalizeRelPath, snapshotWorkspace,
@@ -12,14 +13,34 @@ import type {
 } from "../core/types.ts";
 
 const TEST_GLOBS = ["test/**", "tests/**", "**/*.test.*", "**/*.spec.*"] as const;
+const MAX_LINE_CHECK_BYTES = 32 * 1024 * 1024;
 
-function stripEvidenceSelectorAndNotes(rawRef: string): string {
-  let s = rawRef
+function stripTrailingEvidenceNotes(rawRef: string): string {
+  return rawRef
     .trim()
     .replace(/\s+\([^)]*\)\s*$/, "")
     .replace(/\s+(?:—|--)\s+[\s\S]*$/, "")
     .replace(/\s*;\s+[\s\S]*$/, "")
     .trim();
+}
+
+function extractEvidenceLineRange(rawRef: string): { start: number; end: number; malformed?: boolean } | null {
+  const cleaned = stripTrailingEvidenceNotes(rawRef).replace(/:(?:raw|summary)$/i, "").trim();
+  const hashMatch = /#L(\d+)(?:-L?(\d+))?$/i.exec(cleaned);
+  if (hashMatch) {
+    const start = Number(hashMatch[1]), end = hashMatch[2] ? Number(hashMatch[2]) : start;
+    return { start, end, malformed: start < 1 || end < start };
+  }
+  const colonMatch = /:(\d+)(?:-(\d+))?(?::\d+)?$/.exec(cleaned);
+  if (colonMatch) {
+    const start = Number(colonMatch[1]), end = colonMatch[2] ? Number(colonMatch[2]) : start;
+    return { start, end, malformed: start < 1 || end < start };
+  }
+  return null;
+}
+
+function stripEvidenceSelectorAndNotes(rawRef: string): string {
+  let s = stripTrailingEvidenceNotes(rawRef);
   let prev = "";
   while (s && s !== prev) {
     prev = s;
@@ -30,6 +51,13 @@ function stripEvidenceSelectorAndNotes(rawRef: string): string {
       .trim();
   }
   return s;
+}
+
+function countFileLines(filePath: string): number {
+  const raw = readFileSync(filePath, "utf8");
+  if (raw.length === 0) return 0;
+  const trimmedNewline = raw.endsWith("\n") ? raw.slice(0, -1) : raw;
+  return trimmedNewline.replace(/\r/g, "").split("\n").length;
 }
 
 export class BoundaryViolationError extends Error {
@@ -67,6 +95,7 @@ export interface CreateHandoffInput {
   questionsForUser?: readonly string[];
   feedbackForUpstream?: string | null;
   observedUsage?: UsageSummary | null;
+  isConsultation?: boolean;
 }
 
 export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelope {
@@ -78,14 +107,27 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
   }
   const rawQuestions = (input.questionsForUser ?? []).map((q) => q.trim()).filter(Boolean);
   const questionsForUser = rawQuestions.length > 0 ? rawQuestions : (input.verdict === "needs_input" ? [summary] : []);
+
   const observedCalls = input.observedCalls ?? [];
-  if (
-    input.verdict === "ready" && input.role.exit.requireToolEvidence &&
-    !observedCalls.some((call) => isValidExecutionEvidence(call.toolName, call.isError))
-  ) {
-    throw new Error(
-      `Role "${input.role.id}" requires at least one successful non-companion tool execution before a ready handoff.`,
-    );
+  if (input.verdict === "ready") {
+    if (
+      input.role.exit.requireToolEvidence &&
+      !observedCalls.some((call) => isValidExecutionEvidence(call.toolName, call.isError))
+    ) {
+      throw new Error(
+        `Role "${input.role.id}" requires at least one successful non-companion tool execution before a ready handoff.`,
+      );
+    }
+    const reqTools = !input.isConsultation ? (input.role.exit.requiredTools ?? []) : [];
+    if (reqTools.length > 0) {
+      const okTools = new Set(observedCalls.filter((c) => !c.isError).map((c) => c.toolName));
+      const missingTools = reqTools.filter((req) => !okTools.has(req) && !(req === "bash" && okTools.has("enhance_job")));
+      if (missingTools.length > 0) {
+        throw new Error(
+          `Role "${input.role.id}" cannot submit verdict="ready" without executing required verification tool(s): ${missingTools.join(", ")}.`,
+        );
+      }
+    }
   }
 
   const after = input.afterSnapshot ?? snapshotWorkspace(input.cwd);
@@ -98,6 +140,7 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
     if (violations.length > 0) throw new BoundaryViolationError(input.role.id, violations);
   }
 
+  const afterPaths = [...after.keys()];
   const candidates = new Set<string>(), deletedSet = new Set<string>();
   if (input.baselineSnapshot) {
     const diff = diffSnapshots(input.baselineSnapshot, after);
@@ -111,15 +154,31 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
     else if (input.baselineSnapshot?.has(rel)) deletedSet.add(rel);
   }
 
+  if (input.verdict === "ready" && !input.isConsultation && (input.role.exit.requiredArtifacts?.length ?? 0) > 0) {
+    const missingPatterns: string[] = [];
+    for (const pattern of input.role.exit.requiredArtifacts!) {
+      const matched = afterPaths.filter((p) => matchesGlobList(p, [pattern]));
+      if (matched.length === 0) missingPatterns.push(pattern);
+      else for (const hit of matched) candidates.add(hit);
+    }
+    if (missingPatterns.length > 0) {
+      throw new Error(
+        `Role "${input.role.id}" cannot submit verdict="ready" without required deliverable artifact(s): ${missingPatterns.join(", ")}.`,
+      );
+    }
+  }
+
   const artifacts: ArtifactRecord[] = [...candidates]
     .filter((relPath) => after.has(relPath))
     .map((relPath): ArtifactRecord => {
       const entry = after.get(relPath)!;
       const beforeSha = input.baselineSnapshot?.get(relPath)?.sha256;
       const unchanged = beforeSha !== undefined ? beforeSha === entry.sha256 : isRoleReadOnly(input.role);
+      const digestKind = entry.digestKind === "sha256" || entry.digestKind === "stat_fingerprint" ? entry.digestKind : undefined;
       return {
         path: relPath, sha256: entry.sha256, byteSize: entry.byteSize,
         role: unchanged ? "inspected" : (matchesGlobList(relPath, TEST_GLOBS) ? "test" : "changed"),
+        ...(digestKind ? { digestKind } : {}),
       };
     })
     .sort((left, right) => left.path.localeCompare(right.path));
@@ -149,17 +208,21 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
   }
 
   const resolvedCwd = path.resolve(input.cwd);
-  const afterPaths = [...after.keys()];
   const verifiedFacts = [...(input.verifiedFacts ?? [])];
+  const lineCountCache = new Map<string, number>();
   for (const fact of verifiedFacts) {
     const evidenceRef = fact.evidenceRef?.trim();
     let verified = Boolean(evidenceRef && allowedEvidence.has(evidenceRef));
     if (!verified && evidenceRef) {
+      const lineRange = extractEvidenceLineRange(evidenceRef);
+      if (lineRange?.malformed) {
+        throw new Error(`Invalid verifiedFacts line range "${fact.evidenceRef}" for claim "${fact.claim}".`);
+      }
       const stripped = stripEvidenceSelectorAndNotes(evidenceRef);
       if (stripped) {
         const absTarget = path.resolve(resolvedCwd, stripped);
         if (absTarget === resolvedCwd) {
-          verified = hasValidTool && after.size > 0;
+          verified = !lineRange && hasValidTool && after.size > 0;
         } else {
           const normRel = normalizeRelPath(path.relative(resolvedCwd, absTarget));
           if (
@@ -169,10 +232,23 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
             normRel !== ".omp-enhance" &&
             !normRel.startsWith(".omp-enhance/")
           ) {
+            const fileEntry = after.get(normRel);
+            const fileAllowed = allowedEvidence.has(normRel) || (hasValidTool && fileEntry !== undefined);
+            if (fileAllowed && lineRange && fileEntry && fileEntry.byteSize <= MAX_LINE_CHECK_BYTES && existsSync(absTarget)) {
+              let totalLines = lineCountCache.get(absTarget);
+              if (totalLines === undefined) {
+                totalLines = countFileLines(absTarget);
+                lineCountCache.set(absTarget, totalLines);
+              }
+              if (lineRange.start < 1 || lineRange.end > totalLines) {
+                const span = lineRange.end !== lineRange.start ? `${lineRange.start}-${lineRange.end}` : `${lineRange.start}`;
+                throw new Error(
+                  `Out-of-bounds verifiedFacts line citation "${fact.evidenceRef}" for claim "${fact.claim}": line ${span} exceeds "${normRel}" (${totalLines} line${totalLines === 1 ? "" : "s"}).`,
+                );
+              }
+            }
             const dirPrefix = `${normRel}/`;
-            verified =
-              allowedEvidence.has(normRel) ||
-              (hasValidTool && (after.has(normRel) || afterPaths.some((p) => p.startsWith(dirPrefix))));
+            verified = fileAllowed || (!lineRange && hasValidTool && afterPaths.some((p) => p.startsWith(dirPrefix)));
           }
         }
       }

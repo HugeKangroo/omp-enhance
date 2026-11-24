@@ -157,9 +157,10 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
     const fastRunner: RoleSessionRunner = {
       async runRoleTurn(stepCtx) {
         runCount += 1;
+        const toolName = stepCtx.role.id === "qa" ? "bash" : "read";
         const call: ObservedToolCall = {
-          toolCallId: `c-${runCount}`, toolName: "read", isError: false,
-          touchedPaths: [], timestamp: new Date().toISOString(), summary: "read README.md",
+          toolCallId: `c-${runCount}`, toolName, isError: false,
+          touchedPaths: [], timestamp: new Date().toISOString(), summary: `${toolName} check`,
         };
         const envelope = createAndVerifyHandoff({
           store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
@@ -819,11 +820,13 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
                 expect(parsedConsult.delegated.ok).toBe(true);
                 expect(parsedConsult.delegated.envelope.summary).toContain("样本 #3/#7 真值框偏移");
 
+                writeText(path.join(cwd, "algo_work", "REPORT.md"), "# Algo Report\nMAE reduced by 32%\n");
+                writeText(path.join(cwd, "algo_work", "runs", "r1", "metrics.json"), '{"mae":0.068}\n');
                 emitEnd("algo-opt-2", "bash", { command: "python eval_v1.py" });
                 await handoffTool.execute("ah-final", {
                   verdict: "ready",
                   summary: "依据视觉诊断修正边缘滞后与剔除脏标后，MAE 较基线降低 32%",
-                  artifactPaths: ["artifacts/vis/badcases.png"],
+                  artifactPaths: ["artifacts/vis/badcases.png", "algo_work/REPORT.md", "algo_work/runs/r1/metrics.json"],
                 });
               },
               getLastAssistantText: () => "done",
@@ -935,5 +938,134 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
       cwd, hasUI: false, model: { provider: "deepseek", id: "deepseek-reasoner", input: ["text"] }, models: { resolve: () => undefined, list: () => [] },
     });
     expect(childSystemPrompts[0]).toContain("do NOT self-delegate");
+  });
+
+  test("isolates status/steer/resume/cancel by flowId when Flow A is waiting_input and Flow B is running in the same project (P1-1)", async () => {
+    let releaseB: (() => void) | null = null;
+    let bAborted = false;
+    const bLiveSteers: string[] = [];
+    let aResumedPrompts: string[] = [];
+    let aTurnCount = 0;
+
+    const p1Runner: RoleSessionRunner = {
+      async runRoleTurn(stepCtx) {
+        const stageId = stepCtx.stageId ?? stepCtx.role.id;
+        const call: ObservedToolCall = {
+          toolCallId: `tc-${stepCtx.flowId}-${stepCtx.role.id}-${aTurnCount}`,
+          toolName: "read", isError: false, touchedPaths: [], timestamp: new Date().toISOString(),
+        };
+        stepCtx.observer?.onToolEnd?.(stageId, call);
+
+        if (stepCtx.mandate.goal.startsWith("FLOW_B_ACTIVE")) {
+          stepCtx.observer?.bindControls?.({
+            steer: async (m) => { bLiveSteers.push(m); },
+            abort: async () => { bAborted = true; releaseB?.(); },
+          }, stageId);
+          writeText(path.join(stepCtx.cwd, "b-work.txt"), "B_CLEAN\n");
+          await new Promise<void>((r) => { releaseB = r; });
+          if (bAborted) return { envelope: null, observedCalls: [call], assistantText: "", usage: null, cancelledByUser: true };
+          const env = createAndVerifyHandoff({
+            store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
+            toTarget: stepCtx.toTarget, verdict: "ready", summary: "Flow B finished cleanly",
+            artifactPaths: ["b-work.txt"], observedCalls: [call],
+          });
+          return { envelope: env, observedCalls: [call], assistantText: "B done", usage: null };
+        }
+
+        aTurnCount += 1;
+        if (stepCtx.mandate.goal.startsWith("PAUSE_CANCEL") || aTurnCount === 1) {
+          const env = createAndVerifyHandoff({
+            store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
+            toTarget: stepCtx.toTarget, verdict: "needs_input", summary: `Waiting on ${stepCtx.mandate.goal}`,
+            questionsForUser: ["Confirm A strategy?"], observedCalls: [call],
+          });
+          return { envelope: env, observedCalls: [call], assistantText: "pause", usage: null };
+        }
+        aResumedPrompts.push(stepCtx.conditioningPrompt);
+        writeText(path.join(stepCtx.cwd, "a-work.txt"), "A_RESUMED\n");
+        const env = createAndVerifyHandoff({
+          store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
+          parentHandoffId: stepCtx.upstreamHandoff?.id ?? null, toTarget: stepCtx.toTarget,
+          verdict: "ready", summary: "Flow A completed after B", artifactPaths: ["a-work.txt"], observedCalls: [call],
+        });
+        return { envelope: env, observedCalls: [call], assistantText: "A done", usage: null };
+      },
+    };
+
+    const { cwd, tools, commands } = setupHarness({ flowRoutingMode: "auto" }, p1Runner);
+    const flowTool = tools.get("enhance_flow")!;
+    const ctx = { cwd, hasUI: true, ui: { setWidget() {}, setStatus() {}, notify() {} } };
+
+    // 1. Create paused Flow A (to be resumed later), paused A2 (to test /flow cancel), and paused A3 (to test enhance_flow cancel)
+    const startA = JSON.parse((await flowTool.execute("sa", { roles: ["dev"], goal: "FLOW_A_MAIN", wait: true }, null, null, ctx)).content[0].text);
+    expect(startA.status).toBe("waiting_input");
+    const flowAId = (JSON.parse((await flowTool.execute("sta0", { action: "status" }, null, null, ctx)).content[0].text)).flowId as string;
+
+    const a2Pause = JSON.parse((await flowTool.execute("sa2", { roles: ["planner"], goal: "PAUSE_CANCEL_CMD", wait: true }, null, null, ctx)).content[0].text);
+    expect(a2Pause.status).toBe("waiting_input");
+    const flowA2Id = (JSON.parse((await flowTool.execute("sta2", { action: "status" }, null, null, ctx)).content[0].text)).flowId as string;
+
+    const a3Pause = JSON.parse((await flowTool.execute("sa3", { roles: ["planner"], goal: "PAUSE_CANCEL_TOOL", wait: true }, null, null, ctx)).content[0].text);
+    expect(a3Pause.status).toBe("waiting_input");
+    const flowA3Id = (JSON.parse((await flowTool.execute("sta3", { action: "status" }, null, null, ctx)).content[0].text)).flowId as string;
+
+    // 2. Start Flow B in the SAME cwd -> B is now running in room!
+    const startB = JSON.parse((await flowTool.execute("sb", { roles: ["dev"], goal: "FLOW_B_ACTIVE" }, null, null, ctx)).content[0].text);
+    expect(startB).toMatchObject({ started: true, status: "running" });
+    const flowBId = startB.flowId as string;
+    for (let i = 0; i < 20 && !releaseB; i++) await Bun.sleep(5);
+
+    // 3. Query status(flowId=A) while B runs -> MUST return Flow A, NOT Flow B!
+    const statusA = JSON.parse((await flowTool.execute("q-a", { action: "status", flowId: flowAId }, null, null, ctx)).content[0].text);
+    expect(statusA.flowId).toBe(flowAId);
+    expect(statusA.goal).toBe("FLOW_A_MAIN");
+    expect(statusA.status).toBe("waiting_input");
+    expect(statusA.resumable).toBe(true);
+
+    // 4. Steer A and attempt resume(A, message) while B holds the project execution lease -> B is 100% untouched!
+    const steerA = JSON.parse((await flowTool.execute("st-a", {
+      action: "steer", flowId: flowAId, message: "A_STEER_ONE",
+    }, null, null, ctx)).content[0].text);
+    expect(steerA).toMatchObject({ ok: true, flowId: flowAId, delivered: false, savedToCheckpoint: true, status: "waiting_input" });
+
+    const busyResumeA = JSON.parse((await flowTool.execute("res-a-busy", {
+      action: "resume", flowId: flowAId, message: "A_STEER_TWO",
+    }, null, null, ctx)).content[0].text);
+    expect(busyResumeA).toMatchObject({
+      started: false, resumed: false, busy: true, flowId: flowAId, activeFlowId: flowBId, savedReply: true, status: "waiting_input",
+    });
+
+    // 5. Cancel A2 via `/flow cancel <flowA2Id>` AND cancel A3 via `enhance_flow(action="cancel", flowId=flowA3Id)` -> B stays running!
+    await commands.get("flow")!.handler(`cancel ${flowA2Id}`, ctx);
+    const cancelA3 = JSON.parse((await flowTool.execute("can-a3", { action: "cancel", flowId: flowA3Id }, null, null, ctx)).content[0].text);
+    expect(cancelA3).toMatchObject({ cancelled: true, flowId: flowA3Id, status: "cancelled" });
+
+    const statusA2After = JSON.parse((await flowTool.execute("q-a2", { action: "status", flowId: flowA2Id }, null, null, ctx)).content[0].text);
+    expect(statusA2After.status).toBe("cancelled");
+    expect(bAborted).toBe(false);
+    expect(bLiveSteers).toEqual([]);
+    const statusBMid = JSON.parse((await flowTool.execute("q-b", { action: "status", flowId: flowBId }, null, null, ctx)).content[0].text);
+    expect(statusBMid.status).toBe("running");
+    expect(statusBMid.userSteers).toEqual([]);
+
+    // 6. Finish Flow B -> then resume Flow A from its original waiting_input checkpoint with both saved replies!
+    releaseB!();
+    for (let i = 0; i < 30; i++) {
+      const sb = JSON.parse((await flowTool.execute("qb2", { action: "status", flowId: flowBId }, null, null, ctx)).content[0].text);
+      if (sb.status === "completed") break;
+      await Bun.sleep(10);
+    }
+    const finalB = JSON.parse((await flowTool.execute("qb3", { action: "status", flowId: flowBId }, null, null, ctx)).content[0].text);
+    expect(finalB.status).toBe("completed");
+    expect(finalB.userSteers).toEqual([]);
+
+    const resumedA = JSON.parse((await flowTool.execute("res-a-ok", {
+      action: "resume", flowId: flowAId, wait: true,
+    }, null, null, ctx)).content[0].text);
+    expect(resumedA.status).toBe("completed");
+    expect(aResumedPrompts[0]).toContain("A_STEER_ONE");
+    expect(aResumedPrompts[0]).toContain("A_STEER_TWO");
+    expect(existsSync(path.join(cwd, "a-work.txt"))).toBe(true);
+    expect(existsSync(path.join(cwd, "b-work.txt"))).toBe(true);
   });
 });

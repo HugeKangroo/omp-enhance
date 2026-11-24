@@ -19,6 +19,7 @@ permissions:
 
 exit:
   require_tool_evidence: true
+  required_tools: ["bash"]
   criteria:
     - 核心验收条件均有本轮真实测试运行记录支撑
     - 受保护目录 src/** 未发生任何字节变动
