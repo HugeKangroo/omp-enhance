@@ -174,8 +174,10 @@ export const PILOT_CASES: readonly CiPilotCaseSpec[] = [
       runGit(caseDir, ["add", "-A"]);
       runGit(caseDir, ["commit", "-q", "-m", "refactor(settlement): validate ISO date string in computeUtcDayWindow"], "2026-11-20T08:30:00Z");
       const headCommit = runGit(caseDir, ["rev-parse", "--short", "HEAD"]);
+      const recentPatch = runGit(caseDir, ["log", "-n", "2", "--stat", "-p"]);
 
       writeFiles(caseDir, {
+        "ci/recent-commits.patch": `${recentPatch}\n`,
         "ci/failing-build-418.log": [
           `[CI build #418] commit=${headCommit} prev_green=${baseCommit} runner=macos-14 CI_RUNNER_TZ=America/Los_Angeles`,
           "$ bun test test/settlement.test.ts",
@@ -190,7 +192,7 @@ export const PILOT_CASES: readonly CiPilotCaseSpec[] = [
           "",
         ].join("\n"),
       });
-      runGit(caseDir, ["add", "ci/failing-build-418.log"]);
+      runGit(caseDir, ["add", "ci/recent-commits.patch", "ci/failing-build-418.log"]);
       runGit(caseDir, ["commit", "-q", "-m", "ci: attach failing build #418 log"], "2026-11-20T08:35:00Z");
       return { baseCommit, headCommit };
     },
@@ -259,8 +261,10 @@ export const PILOT_CASES: readonly CiPilotCaseSpec[] = [
       runGit(caseDir, ["add", "-A"]);
       runGit(caseDir, ["commit", "-q", "-m", "feat(config): support WEBHOOK_BASE_BACKOFF_MS env override"], "2026-11-20T11:10:00Z");
       const headCommit = runGit(caseDir, ["rev-parse", "--short", "HEAD"]);
+      const recentPatch = runGit(caseDir, ["log", "-n", "2", "--stat", "-p"]);
 
       writeFiles(caseDir, {
+        "ci/recent-commits.patch": `${recentPatch}\n`,
         "ci/failing-build-502.log": [
           `[CI build #502] matrix_leg=retry-disabled WEBHOOK_MAX_RETRIES="0" commit=${headCommit} prev_green=${baseCommit}`,
           "$ bun run check:worker-smoke",
@@ -271,7 +275,7 @@ export const PILOT_CASES: readonly CiPilotCaseSpec[] = [
           "",
         ].join("\n"),
       });
-      runGit(caseDir, ["add", "ci/failing-build-502.log"]);
+      runGit(caseDir, ["add", "ci/recent-commits.patch", "ci/failing-build-502.log"]);
       runGit(caseDir, ["commit", "-q", "-m", "ci: attach failing build #502 log"], "2026-11-20T11:15:00Z");
       return { baseCommit, headCommit };
     },
@@ -307,6 +311,14 @@ export const PILOT_CASES: readonly CiPilotCaseSpec[] = [
           "}",
           "",
         ].join("\n"),
+      });
+      runGit(caseDir, ["add", "-A"]);
+      runGit(caseDir, ["commit", "-q", "-m", "chore: baseline exporter and db pool modules"], "2026-11-20T11:55:00Z");
+      const headCommit = runGit(caseDir, ["rev-parse", "--short", "HEAD"]);
+      const recentPatch = runGit(caseDir, ["log", "-n", "1", "--stat", "-p"]);
+
+      writeFiles(caseDir, {
+        "ci/recent-commits.patch": `${recentPatch}\n`,
         "ci/failing-build-619.log": [
           "[CI build #619] workflow=nightly-e2e shard_count=3 runner=ubuntu-latest",
           "[02:14:01] Launching docker compose integration shards (shard-1, shard-2, shard-3)...",
@@ -315,9 +327,8 @@ export const PILOT_CASES: readonly CiPilotCaseSpec[] = [
           "",
         ].join("\n"),
       });
-      runGit(caseDir, ["add", "-A"]);
-      runGit(caseDir, ["commit", "-q", "-m", "chore: baseline modules and truncated nightly build #619 log"], "2026-11-20T12:00:00Z");
-      const headCommit = runGit(caseDir, ["rev-parse", "--short", "HEAD"]);
+      runGit(caseDir, ["add", "ci/recent-commits.patch", "ci/failing-build-619.log"]);
+      runGit(caseDir, ["commit", "-q", "-m", "ci: attach truncated nightly build #619 log"], "2026-11-20T12:00:00Z");
       return { baseCommit: headCommit, headCommit };
     },
   },
@@ -537,10 +548,16 @@ async function runLiveArmTrial(options: {
   mkdirSync(ctrlDir, { recursive: true });
   const cfgPath = path.join(ctrlDir, "pilot-config.yml");
   writeFileSync(cfgPath, "advisor:\n  enabled: false\n", "utf8");
+  const lockPath = path.join(ctrlDir, "lock.json");
+  writeFileSync(
+    lockPath,
+    JSON.stringify({ settings: { "omp-enhance": { supervisorEnabled: false } } }),
+    "utf8",
+  );
 
   const diagnosisPrompt = [
-    `请只读诊断该仓库的 CI 失败日志 \`${options.spec.logRelPath}\`（严禁修改任何工作区文件）。`,
-    "请严格依据仓库真实代码、Git 提交历史与日志回答：",
+    `请只读诊断该仓库的 CI 失败日志 \`${options.spec.logRelPath}\`（严禁修改任何工作区文件，近期提交补丁已归档于 \`ci/recent-commits.patch\`）。`,
+    "请严格依据仓库真实代码、Git 提交补丁与日志回答：",
     "1. 根因结论（若现有日志不足以唯一确定根因，必须明确回答“证据不足/无法唯一定因”，绝不猜测编造）；",
     "2. 支持结论的精确文件路径与行号引用（如 `src/foo.ts:12`、`ci/failing-build-xxx.log:3`）；",
     "3. 一条可区分候选原因的最小复验命令，或（当证据不足时）下一步具体取证动作。",
@@ -555,7 +572,7 @@ async function runLiveArmTrial(options: {
     "--no-session", "--no-skills", "--no-rules", "--no-context-files",
     "--no-lsp", "--no-extensions", "--no-title", "--auto-approve",
     ...(options.arm === "vanilla-omp"
-      ? ["--tools", "read,grep,glob,find,ls"]
+      ? ["--tools", "read,grep,glob,find"]
       : ["--extension", repoRoot]),
   ];
 
@@ -566,13 +583,14 @@ async function runLiveArmTrial(options: {
       ...(process.env as Record<string, string>),
       OMP_ENHANCE_HOME: path.join(ctrlDir, "home"),
       OMP_ENHANCE_GLOBAL_ROLES_DIR: path.join(ctrlDir, "roles"),
-      OMP_ENHANCE_PLUGIN_LOCK_PATH: path.join(ctrlDir, "lock.json"),
+      OMP_ENHANCE_PLUGIN_LOCK_PATH: lockPath,
       OMP_ENHANCE_CMD_OUT: path.join(ctrlDir, "cmd.out"),
     },
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
   });
+  const stderrTask = new Response(proc.stderr).text().catch(() => "");
 
   let inputTokens = 0;
   let outputTokens = 0;
@@ -631,8 +649,22 @@ async function runLiveArmTrial(options: {
     return pred();
   };
 
+  const dbPath = path.join(caseDir, ".omp-enhance", "state.sqlite");
+  const countRecordedHandoffs = (): number => {
+    if (!existsSync(dbPath)) return 0;
+    const s = new EnhanceStore(dbPath);
+    try {
+      return s.listHandoffs().filter((h) => h.fromRole !== "user").length;
+    } catch {
+      return 0;
+    } finally {
+      s.close();
+    }
+  };
+
   let failed = false;
   let errorMsg: string | undefined;
+  let stderrText = "";
   try {
     if (options.arm !== "vanilla-omp") {
       proc.stdin.write(`${JSON.stringify({ id: "c1", type: "prompt", message: "/coord" })}\n`);
@@ -648,10 +680,21 @@ async function runLiveArmTrial(options: {
     const beforeEnds = agentEnds;
     proc.stdin.write(`${JSON.stringify({ id: "diag", type: "prompt", message: promptMsg })}\n`);
     await proc.stdin.flush();
-    const ok = await waitUntil(() => agentEnds > beforeEnds, 240_000);
+    let ok = await waitUntil(() => agentEnds > beforeEnds, 240_000);
+
+    if (ok && options.arm !== "vanilla-omp" && countRecordedHandoffs() === 0 && proc.exitCode === null) {
+      const retryEnds = agentEnds;
+      const confirmMsg = `好，确认立即执行！请现在直接调用 enhance_flow(action="start", roles=${rolesChain}, goal=${JSON.stringify(diagnosisPrompt)}, wait=true) 并将核实后的完整结论与精确行号汇报给我。`;
+      proc.stdin.write(`${JSON.stringify({ id: "diag2", type: "prompt", message: confirmMsg })}\n`);
+      await proc.stdin.flush();
+      ok = await waitUntil(() => agentEnds > retryEnds, 240_000);
+    }
+
     if (!ok) {
       failed = true;
-      errorMsg = "Timed out waiting for diagnosis turn.";
+      errorMsg = proc.exitCode !== null
+        ? `omp exited early (code=${proc.exitCode}) before diagnosis turn completed.`
+        : "Timed out waiting for diagnosis turn.";
     }
   } catch (err) {
     failed = true;
@@ -664,26 +707,44 @@ async function runLiveArmTrial(options: {
       try { proc.kill("SIGKILL"); } catch {}
     }
     await Promise.race([stdoutTask, Bun.sleep(1_000)]);
+    stderrText = (await Promise.race([stderrTask, Bun.sleep(1_000).then(() => "")])).trim();
+    if (failed && stderrText) {
+      errorMsg = `${errorMsg ?? "Trial failed"} | stderr: ${stderrText.slice(0, 300)}`;
+    }
   }
 
-  // Include specialist handoff usage + summaries from state.sqlite when enhance_flow ran.
+  // Include specialist handoff usage (all stages/rounds) + latest ready handoff per role from state.sqlite.
   let combinedText = assistantTexts.at(-1) ?? "";
-  const dbPath = path.join(caseDir, ".omp-enhance", "state.sqlite");
+  const executedRoles = new Set<string>();
   if (existsSync(dbPath)) {
     const store = new EnhanceStore(dbPath);
     try {
+      const seenReadyRole = new Set<string>();
       for (const h of store.listHandoffs()) {
+        if (h.fromRole !== "user") executedRoles.add(h.fromRole);
         if (h.observedUsage) {
           inputTokens += h.observedUsage.inputTokens;
           outputTokens += h.observedUsage.outputTokens;
           costUsd += h.observedUsage.costUsd;
         }
-        const factLines = h.verifiedFacts.map((f) => `- ${f.claim} (${f.evidenceRef})`).join("\n");
-        combinedText += `\n\n[${h.fromRole} handoff]: ${h.summary}\n${factLines}`;
+        if (h.fromRole !== "user" && h.verdict === "ready" && !seenReadyRole.has(h.fromRole)) {
+          seenReadyRole.add(h.fromRole);
+          const factLines = h.verifiedFacts.map((f) => `- ${f.claim} (${f.evidenceRef})`).join("\n");
+          combinedText += `\n\n[${h.fromRole} handoff]: ${h.summary}\n${factLines}`;
+        }
       }
     } finally {
       store.close();
     }
+  }
+
+  if (!failed && options.arm === "single-planner" && !executedRoles.has("planner")) {
+    failed = true;
+    errorMsg = "single-planner arm did not execute planner stage.";
+  }
+  if (!failed && options.arm === "coord-planner-reviewer" && (!executedRoles.has("planner") || !executedRoles.has("reviewer"))) {
+    failed = true;
+    errorMsg = `coord-planner-reviewer arm missing required specialist stage(s): executed=[${[...executedRoles].join(",")}].`;
   }
 
   // Verify read-only invariance across all arms.
@@ -736,7 +797,7 @@ async function main(): Promise<void> {
         const record = await runLiveArmTrial({ spec, arm, model, sandboxRoot });
         trials.push(record);
         console.log(
-          `  -> passed=${record.score.passed} duration=${record.durationMs}ms tokens=${record.inputTokens + record.outputTokens} cost=$${record.costUsd}`,
+          `  -> passed=${record.score.passed && !record.failed} failed=${record.failed} duration=${record.durationMs}ms tokens=${record.inputTokens + record.outputTokens} cost=$${record.costUsd}${record.error ? ` err=${record.error}` : ""}`,
         );
       }
     }
