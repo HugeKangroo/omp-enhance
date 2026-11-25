@@ -505,7 +505,10 @@ describe("role flow repair loop & mandate completion", () => {
           }
           if (ctx.role.id === "qa") {
             qaCalls += 1;
-            const call: ObservedToolCall = { toolCallId: `qa-${qaCalls}`, toolName: "bash", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+            const call: ObservedToolCall = {
+              toolCallId: `qa-${qaCalls}`, toolName: "bash", command: "bun test", exitCode: 0,
+              outputSnippet: "4 pass, 0 fail", isError: false, touchedPaths: [], timestamp: new Date().toISOString(),
+            };
             const env = qaCalls === 1
               ? createAndVerifyHandoff({
                   store, role: ctx.role, cwd, mandate, parentHandoffId: ctx.upstreamHandoff?.id ?? null,
@@ -639,7 +642,10 @@ describe("role flow repair loop & mandate completion", () => {
             });
             return { envelope: env, observedCalls: [call], assistantText: "done", usage: null };
           }
-          const qaCall: ObservedToolCall = { toolCallId: "q-1", toolName: "bash", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+          const qaCall: ObservedToolCall = {
+            toolCallId: "q-1", toolName: "bash", command: "bun test", exitCode: 0,
+            isError: false, touchedPaths: [], timestamp: new Date().toISOString(),
+          };
           const env = createAndVerifyHandoff({
             store, role: ctx.role, cwd, mandate, parentHandoffId: ctx.upstreamHandoff?.id ?? null,
             toTarget: ctx.toTarget, verdict: "ready", summary: "QA verified 7d TTL", observedCalls: [qaCall],
@@ -859,8 +865,8 @@ describe("role flow repair loop & mandate completion", () => {
     writeFile(cwd, "src/math.ts", "export const add = (a: number, b: number) => a + b;\n");
     try {
       const readCall: ObservedToolCall = { toolCallId: "rd-1", toolName: "read", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
-      const bashCall: ObservedToolCall = { toolCallId: "bs-1", toolName: "bash", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
-      const jobCall: ObservedToolCall = { toolCallId: "jb-1", toolName: "enhance_job", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+      const bashCall: ObservedToolCall = { toolCallId: "bs-1", toolName: "bash", command: "pytest -q", exitCode: 0, isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+      const jobCall: ObservedToolCall = { toolCallId: "jb-1", toolName: "enhance_job", command: "bun test", exitCode: 0, outputSnippet: '{"status":"completed","exitCode":0}', isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
 
       // 1) P2-1: Out-of-bounds line citations on 1-line src/math.ts are rejected with actual line count
       expect(() =>
@@ -906,13 +912,115 @@ describe("role flow repair loop & mandate completion", () => {
       });
       expect(algoPaused.verdict).toBe("needs_input");
 
-      writeFile(cwd, "algo_work/REPORT.md", "# Experiment Report\nBaseline vs Candidate\n");
-      writeFile(cwd, "algo_work/runs/r1/metrics.json", '{"mae":0.12}\n');
+      writeFile(
+        cwd,
+        "algo_work/REPORT.md",
+        "# Experiment Report\n## 1. Data Split & Baseline\nValidated holdout_v1 split; candidate r1 reduced MAE from 0.18 to 0.12.\n",
+      );
+      writeFile(
+        cwd,
+        "algo_work/runs/r1/metrics.json",
+        JSON.stringify({ experimentId: "r1", split: "holdout_v1", evaluatorVersion: "eval@1.0", baseline: "exp_000", mae: 0.12 }) + "\n",
+      );
       const algoReady = createAndVerifyHandoff({
         store, role: roles.get("algo")!, cwd, mandate, verdict: "ready", summary: "MAE improved to 0.12", observedCalls: [bashCall],
       });
       expect(algoReady.artifacts.map((a) => a.path)).toEqual(["algo_work/REPORT.md", "algo_work/runs/r1/metrics.json"]);
       expect(algoReady.artifacts[0]?.digestKind).toBe("sha256");
+
+      // 3b) GPT #3: QA rejects pwd/echo/bg-launch/stale-pre-edit test runs & records verificationEvidence; Algo rejects stub REPORT.md, invalid/stale metrics.json, and accepts valid reusedBaseline!
+      const pwdCall: ObservedToolCall = { toolCallId: "pw-1", toolName: "bash", command: "pwd && echo bun test", exitCode: 0, isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+      const bgStartCall: ObservedToolCall = { toolCallId: "bg-1", toolName: "enhance_job", command: "bun test", isBackgroundLaunch: true, exitCode: null, isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+      const editTestCall: ObservedToolCall = { toolCallId: "ed-1", toolName: "edit", isError: false, touchedPaths: ["test/math.test.ts"], timestamp: new Date().toISOString() };
+      const realTestCall: ObservedToolCall = { toolCallId: "bt-1", toolName: "bash", command: "CI=1 bun test test/unit", exitCode: 0, outputSnippet: "14 pass, 0 fail", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+
+      expect(() =>
+        createAndVerifyHandoff({ store, role: roles.get("qa")!, cwd, mandate, verdict: "ready", summary: "Ran pwd only", observedCalls: [pwdCall] }),
+      ).toThrow(/non-test shell commands like pwd\/ls do not qualify/);
+      expect(() =>
+        createAndVerifyHandoff({ store, role: roles.get("qa")!, cwd, mandate, verdict: "ready", summary: "Only started bg job", observedCalls: [bgStartCall] }),
+      ).toThrow(/requires at least one successful/);
+      expect(() =>
+        createAndVerifyHandoff({ store, role: roles.get("qa")!, cwd, mandate, verdict: "ready", summary: "Edited after test", observedCalls: [realTestCall, editTestCall] }),
+      ).toThrow(/modified files after the last test execution/);
+
+      const qaVerified = createAndVerifyHandoff({
+        store, role: roles.get("qa")!, cwd, mandate, verdict: "ready", summary: "All 14 unit tests pass", observedCalls: [editTestCall, realTestCall],
+      });
+      expect(qaVerified.verificationEvidence).toHaveLength(1);
+      expect(qaVerified.verificationEvidence![0]).toMatchObject({
+        command: "CI=1 bun test test/unit", exitCode: 0, outputSnippet: "14 pass, 0 fail", toolCallId: "bt-1",
+      });
+      expect(qaVerified.verificationEvidence![0]!.testedTreeFingerprint).toMatch(/^[0-9a-f]{64}$/);
+      expect(store.getHandoff(qaVerified.id)?.verificationEvidence).toEqual(qaVerified.verificationEvidence);
+
+      const cwdAlgo = path.join(tempDir(), "algo-gpt3");
+      mkdirSync(cwdAlgo, { recursive: true });
+      writeFile(cwdAlgo, "algo_work/REPORT.md", "# Stub\n");
+      writeFile(
+        cwdAlgo, "algo_work/runs/exp_000_baseline/metrics.json",
+        JSON.stringify({ experimentId: "exp_000", split: "val_v1", evaluatorVersion: "eval@1", isBaseline: true, mae: 0.25 }) + "\n",
+      );
+      const algoSnap0 = (await import("../../src/core/fs.ts")).snapshotWorkspace(cwdAlgo);
+      // Stub REPORT.md (< 40 non-ws chars) rejected
+      expect(() =>
+        createAndVerifyHandoff({
+          store, role: roles.get("algo")!, cwd: cwdAlgo, mandate, baselineSnapshot: algoSnap0,
+          verdict: "ready", summary: "Stub report", observedCalls: [readCall],
+        }),
+      ).toThrow(/empty or stub-only/);
+
+      writeFile(
+        cwdAlgo, "algo_work/REPORT.md",
+        "# Algo Benchmark Report\nLeakage-free group split verified; baseline MAE=0.250 across 500 holdout samples.\n",
+      );
+      // Pre-existing unchanged metrics.json with 0 current-turn runs rejected!
+      expect(() =>
+        createAndVerifyHandoff({
+          store, role: roles.get("algo")!, cwd: cwdAlgo, mandate, baselineSnapshot: algoSnap0,
+          verdict: "ready", summary: "Stale metrics only", observedCalls: [readCall],
+        }),
+      ).toThrow(/no current-turn experiment metrics/);
+
+      // Non-JSON metrics rejected
+      writeFile(cwdAlgo, "algo_work/runs/exp_001_cand/metrics.json", "NOT_VALID_JSON\n");
+      expect(() =>
+        createAndVerifyHandoff({
+          store, role: roles.get("algo")!, cwd: cwdAlgo, mandate, baselineSnapshot: algoSnap0,
+          verdict: "ready", summary: "Broken JSON", observedCalls: [bashCall],
+        }),
+      ).toThrow(/Invalid JSON/);
+
+      // Mismatched old experimentId inside exp_001_cand rejected
+      writeFile(
+        cwdAlgo, "algo_work/runs/exp_001_cand/metrics.json",
+        JSON.stringify({ experimentId: "exp_999_stale", split: "val_v1", evaluatorVersion: "eval@1", baseline: "exp_000", mae: 0.19 }) + "\n",
+      );
+      expect(() =>
+        createAndVerifyHandoff({
+          store, role: roles.get("algo")!, cwd: cwdAlgo, mandate, baselineSnapshot: algoSnap0,
+          verdict: "ready", summary: "Mismatched expId", observedCalls: [bashCall],
+        }),
+      ).toThrow(/mismatched experimentId/);
+
+      // Valid current-turn candidate reusing historical exp_000_baseline succeeds!
+      writeFile(
+        cwdAlgo, "algo_work/runs/exp_001_cand/metrics.json",
+        JSON.stringify({
+          experimentId: "exp_001", split: "val_v1", evaluatorVersion: "eval@1",
+          reusedBaseline: true, baselineSource: "algo_work/runs/exp_000_baseline/metrics.json", mae: 0.14,
+        }) + "\n",
+      );
+      const algoReusedOk = createAndVerifyHandoff({
+        store, role: roles.get("algo")!, cwd: cwdAlgo, mandate, baselineSnapshot: algoSnap0,
+        artifactPaths: ["algo_work/runs/exp_000_baseline/metrics.json"],
+        verdict: "ready", summary: "Candidate exp_001 beat reused baseline exp_000 (0.14 vs 0.25)", observedCalls: [bashCall],
+      });
+      expect(algoReusedOk.artifacts.map((a) => `${a.path}:${a.role}`)).toEqual([
+        "algo_work/REPORT.md:report",
+        "algo_work/runs/exp_000_baseline/metrics.json:inspected",
+        "algo_work/runs/exp_001_cand/metrics.json:metrics",
+      ]);
 
       // 4) P2-4: Distinguish 502 host_error (sanitized, resumable failed), missing_handoff (resumable failed), and violation (non-resumable)
       expect(sanitizeHostError("502 Bad Gateway Authorization: Bearer sk-secret-abcdef123456 api_key=my_key_99")).not.toContain("sk-secret");
@@ -1227,9 +1335,29 @@ describe("entry extension (SuperAgent /coord, zero-intrusion default off, and co
     expect(handoff.fromRole).toBe("dev");
     expect(handoff.observedUsage).toEqual({ inputTokens: 240, outputTokens: 80, costUsd: 0.004 });
 
+    // Verify enhance_job(action="start", idempotencyKey) deduplicates retries via tool layer
+    const jobFirst = await harness.execTool("enhance_job", { action: "start", command: "true", idempotencyKey: "exp-dedup-1" });
+    const jobRetry = await harness.execTool("enhance_job", { action: "start", command: "true", idempotencyKey: "exp-dedup-1" });
+    expect((jobRetry.job as { jobId: string }).jobId).toBe((jobFirst.job as { jobId: string }).jobId);
+    expect(jobRetry.reused).toBe(true);
+
+    // Verify entry.ts tool_execution_start + tool_execution_end forward command/exitCode/outputSnippet for foreground qa!
+    await harness.runCommand("role", "qa --foreground");
+    await harness.runHook("before_agent_start", { systemPrompt: ["BASE"], prompt: "test it" });
+    await harness.runHook("tool_execution_start", { toolCallId: "fg-qa-1", toolName: "bash", args: { command: "bun test" } });
+    await harness.runHook("tool_execution_end", {
+      toolCallId: "fg-qa-1", toolName: "bash", output: "8 pass, 0 fail", exitCode: 0, isError: false,
+    });
+    const qaFgPayload = await harness.execTool("enhance_handoff", { verdict: "ready", summary: "Foreground QA passed" });
+    const qaFgHandoff = qaFgPayload.handoff as HandoffEnvelope;
+    expect(qaFgHandoff.verificationEvidence?.[0]).toMatchObject({
+      command: "bun test", exitCode: 0, outputSnippet: "8 pass, 0 fail", toolCallId: "fg-qa-1",
+    });
+    await harness.runCommand("role", "dev --foreground");
+
     const inspect = new EnhanceStore(path.join(cwd, ".omp-enhance", "state.sqlite"));
     try {
-      expect(inspect.getLatestHandoff(mandateId)?.id).toBe(handoff.id);
+      expect(inspect.getLatestHandoff(mandateId)?.id).toBe(qaFgHandoff.id);
     } finally {
       inspect.close();
     }

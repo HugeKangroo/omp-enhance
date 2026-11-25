@@ -624,6 +624,11 @@ async function runMultiWindowMultiProjectE2E(): Promise<void> {
     assert((finalA.userSteers ?? []).some((s) => s.text.includes("ZERO_REJECT")), "Final A missing ZERO_REJECT userSteer.");
     assert((finalB.userSteers ?? []).length === 0, `Final B has unexpected userSteers: ${JSON.stringify(finalB.userSteers)}`);
     assert((finalC.userSteers ?? []).length === 0, `Final C has unexpected userSteers: ${JSON.stringify(finalC.userSteers)}`);
+    const persistedSteersA = withReadStore(proj1, (s) => s.listFlowSteers(flowAId)) ?? [];
+    assert(
+      persistedSteersA.some((s) => s.text.includes("ZERO_REJECT") && s.consumedAt !== null),
+      `Expected Flow A steer in flow_steers table marked consumed, got ${JSON.stringify(persistedSteersA)}`,
+    );
 
     const snapA = JSON.parse(finalA.snapshotJson) as { stages: FlowStageTrace[] };
     const snapB = JSON.parse(finalB.snapshotJson) as { stages: FlowStageTrace[] };
@@ -687,7 +692,17 @@ async function main(): Promise<void> {
   const overriddenStatus = runPrintCommand("/coord status", "status-override");
   assert(overriddenStatus.includes("flowMaxRepairRounds=4") && overriddenStatus.includes("supervisorModel=@smol"), "Plugin overrides failed.");
   rmSync(overridePath, { force: true });
-  console.log("ok: native plugin settings override (.omp/plugin-overrides.json) dynamically applied");
+
+  // Verify retired .omp/enhance.yaml is ignored (single configuration home).
+  const legacyYamlPath = path.join(workspace, ".omp", "enhance.yaml");
+  writeFileSync(legacyYamlPath, 'supervisorModel: "@slow"\nflowMaxRepairRounds: 9\n', "utf8");
+  const legacyIgnoredStatus = runPrintCommand("/coord status", "status-legacy-yaml-ignored");
+  assert(
+    legacyIgnoredStatus.includes("supervisorModel=@advisor") && legacyIgnoredStatus.includes("flowMaxRepairRounds=2"),
+    `Retired .omp/enhance.yaml should not override settings:\n${legacyIgnoredStatus}`,
+  );
+  rmSync(legacyYamlPath, { force: true });
+  console.log("ok: native plugin settings override (.omp/plugin-overrides.json) applied and retired .omp/enhance.yaml ignored");
 
   const before = snapshotWorkspace(workspace);
   const beforeMathHash = createHash("sha256").update(readFileSync(path.join(workspace, "src", "math.ts"))).digest("hex");

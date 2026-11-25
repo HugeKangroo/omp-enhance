@@ -1,19 +1,11 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import type { ObservedToolCall, RoleSpec, SupervisorActiveTool } from "./types.ts";
-import {
-  matchesGlobList, resolveSafeTargetRealpath, snapshotConfigIntegrity, snapshotWorkspace,
-  type SnapshotEntry,
-} from "./fs.ts";
+import { matchesGlobList, resolveSafeTargetRealpath, snapshotConfigIntegrity, snapshotWorkspace, type SnapshotEntry } from "./fs.ts";
 
-export const COMPANION_TOOL_NAMES = [
-  "enhance_mandate", "enhance_handoff", "enhance_flow", "enhance_job",
-] as const;
-
+export const COMPANION_TOOL_NAMES = ["enhance_mandate", "enhance_handoff", "enhance_flow", "enhance_job"] as const;
 export const READONLY_SUBAGENTS = ["scout", "reviewer", "security-reviewer"] as const;
-export const WRITE_TOOLS: Readonly<Record<string, true>> = {
-  write: true, edit: true, apply_patch: true, ast_edit: true,
-};
+export const WRITE_TOOLS: Readonly<Record<string, true>> = { write: true, edit: true, apply_patch: true, ast_edit: true };
 export const MUTATING_HOST_TOOLS = [
   "write", "edit", "apply_patch", "ast_edit", "bash", "eval",
   "manage_skill", "learn", "memory_edit", "retain", "context_notes", "new_context",
@@ -28,6 +20,8 @@ const STRICT_READONLY_BLOCKED_TOOLS = new Set<string>([
 ]);
 const COORDINATOR_BLOCKED_DIRECT_TOOLS = new Set<string>([...MUTATING_HOST_TOOLS]);
 const FG_COORD_HINT = "(/coord off 退回标准 OMP，或 /coord 切回总秘书)";
+const ANSI_STRIP_RE = /\x1b\[[0-9;:?]*[A-Za-z]/g;
+const BG_LAUNCH_OUTPUT_RE = /^\s*(?:Started background job|Background job started|Launched background|bg_[a-zA-Z0-9_-]+\s+started)\b/i;
 
 export const isCompanionTool = (toolName: string): boolean => (COMPANION_TOOL_NAMES as readonly string[]).includes(toolName);
 export const isInternalRole = (role: RoleSpec | null | undefined): boolean => Boolean(role?.internal || role?.id === "supervisor");
@@ -57,13 +51,11 @@ export function canRoleUseCompanionTool(
   role: RoleSpec | null | undefined, toolName: string, action?: string, targetRoles?: readonly RoleSpec[],
 ): { allowed: boolean; reason?: string } {
   if (!role || toolName === "enhance_mandate") return { allowed: true };
+  const norm = action?.trim().toLowerCase();
   if (canRoleDispatch(role)) {
-    if (toolName === "enhance_handoff") {
-      return { allowed: false, reason: `Role "${role.id}" dispatches specialists via enhance_flow and never submits stage handoffs directly.` };
-    }
+    if (toolName === "enhance_handoff") return { allowed: false, reason: `Role "${role.id}" dispatches specialists via enhance_flow and never submits stage handoffs directly.` };
     if (toolName === "enhance_flow") return { allowed: true };
     if (toolName === "enhance_job") {
-      const norm = action?.trim().toLowerCase();
       if (norm === "list" || norm === "reconcile" || norm === "tail" || norm === "watch" || norm === "cancel") return { allowed: true };
       return { allowed: false, reason: `Role "${role.id}" never spawns shell commands directly — dispatch specialist ["algo"] or ["dev"] via enhance_flow to run background jobs.` };
     }
@@ -71,7 +63,6 @@ export function canRoleUseCompanionTool(
   }
   if (toolName === "enhance_handoff") return { allowed: true };
   if (toolName === "enhance_job") {
-    const norm = action?.trim().toLowerCase();
     if (norm === "list" || norm === "tail" || norm === "reconcile") return { allowed: true };
     if (isRoleReadOnly(role) || !roleAllowsBash(role)) {
       return { allowed: false, reason: `Role "${role.id}" does not permit background shell job execution (requires bash + non-readonly permissions).` };
@@ -79,7 +70,6 @@ export function canRoleUseCompanionTool(
     return { allowed: true };
   }
   if (toolName === "enhance_flow") {
-    const norm = action?.trim().toLowerCase();
     if (norm === "status" || norm === "cancel") return { allowed: true };
     if (isRoleReadOnly(role)) {
       if (targetRoles && targetRoles.length > 0 && targetRoles.every((r) => isRoleReadOnly(r))) return { allowed: true };
@@ -183,17 +173,12 @@ function staticPrefixOfGlob(raw: string): string {
 
 function validateWriteTarget(cwd: string, rawTarget: string, role: RoleSpec): { block: boolean; reason?: string } {
   const writable = role.permissions.writable, protectedGlobs = role.permissions.protected ?? [];
-  const hasGlob = GLOB_META.test(rawTarget);
-  if (!hasGlob) {
+  if (!GLOB_META.test(rawTarget)) {
     const resolved = resolveSafeTargetRealpath(cwd, rawTarget);
     if (resolved.escapesWorkspace) return { block: true, reason: `Path "${rawTarget}" escapes the workspace boundary.` };
     if (resolved.relPath !== "" && !isExistingDir(resolved.resolvedPath)) {
-      if (matchesGlobList(resolved.relPath, protectedGlobs)) {
-        return { block: true, reason: `Path "${resolved.relPath}" is protected for role "${role.id}".` };
-      }
-      if (writable && !matchesGlobList(resolved.relPath, writable)) {
-        return { block: true, reason: `Path "${resolved.relPath}" is outside the writable globs for role "${role.id}".` };
-      }
+      if (matchesGlobList(resolved.relPath, protectedGlobs)) return { block: true, reason: `Path "${resolved.relPath}" is protected for role "${role.id}".` };
+      if (writable && !matchesGlobList(resolved.relPath, writable)) return { block: true, reason: `Path "${resolved.relPath}" is outside the writable globs for role "${role.id}".` };
       return { block: false };
     }
   }
@@ -207,9 +192,7 @@ function validateWriteTarget(cwd: string, rawTarget: string, role: RoleSpec): { 
   const resolvedBase = resolveSafeTargetRealpath(cwd, prefixTarget);
   if (resolvedBase.escapesWorkspace) return { block: true, reason: `Path "${rawTarget}" escapes the workspace boundary.` };
   const subRoot = resolvedBase.relPath;
-  if (!subRoot) {
-    return { block: true, reason: `Role "${role.id}" restricts write paths; "${rawTarget}" must target a bounded subdirectory or file.` };
-  }
+  if (!subRoot) return { block: true, reason: `Role "${role.id}" restricts write paths; "${rawTarget}" must target a bounded subdirectory or file.` };
 
   const tailSegs = restSegs.slice(staticSegs.length);
   const probeTail = tailSegs.length > 0
@@ -223,12 +206,8 @@ function validateWriteTarget(cwd: string, rawTarget: string, role: RoleSpec): { 
       return { block: true, reason: `Target "${rawTarget}" overlaps protected path "${pGlob}" for role "${role.id}".` };
     }
   }
-  if (probes.some((p) => matchesGlobList(p, protectedGlobs))) {
-    return { block: true, reason: `Target "${rawTarget}" is protected for role "${role.id}".` };
-  }
-  if (writable && !matchesGlobList(probes[0]!, writable)) {
-    return { block: true, reason: `Target "${rawTarget}" is outside the writable globs for role "${role.id}".` };
-  }
+  if (probes.some((p) => matchesGlobList(p, protectedGlobs))) return { block: true, reason: `Target "${rawTarget}" is protected for role "${role.id}".` };
+  if (writable && !matchesGlobList(probes[0]!, writable)) return { block: true, reason: `Target "${rawTarget}" is outside the writable globs for role "${role.id}".` };
 
   if (existsSync(resolvedBase.resolvedPath)) {
     const stack = [resolvedBase.resolvedPath];
@@ -236,8 +215,7 @@ function validateWriteTarget(cwd: string, rawTarget: string, role: RoleSpec): { 
       const dir = stack.pop()!;
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         if (entry.name === ".git" || entry.name === "node_modules" || entry.name === ".omp-enhance") continue;
-        const full = path.join(dir, entry.name);
-        const safe = resolveSafeTargetRealpath(cwd, full);
+        const full = path.join(dir, entry.name), safe = resolveSafeTargetRealpath(cwd, full);
         if (safe.escapesWorkspace) return { block: true, reason: `Symlink "${safe.relPath}" inside "${subRoot}" escapes workspace.` };
         const checkPath = isExistingDir(safe.resolvedPath) ? `${safe.relPath}/__probe__` : safe.relPath;
         if (matchesGlobList(safe.relPath, protectedGlobs) || matchesGlobList(checkPath, protectedGlobs)) {
@@ -255,26 +233,20 @@ function validateWriteTarget(cwd: string, rawTarget: string, role: RoleSpec): { 
 
 export function extractWriteTargetPaths(cwd: string, toolName: string, input: unknown): string[] {
   const { targets } = extractRawWriteTargets(toolName, input);
-  const resolved = targets
-    .filter((t) => !GLOB_META.test(t))
-    .flatMap((target) => {
-      const safe = resolveSafeTargetRealpath(cwd, target);
-      if (!safe.escapesWorkspace && (safe.relPath === "" || isExistingDir(safe.resolvedPath))) return [];
-      return [safe.escapesWorkspace ? `../${safe.relPath.replace(/^(?:\.\.\/)+/, "")}` : safe.relPath];
-    });
+  const resolved = targets.filter((t) => !GLOB_META.test(t)).flatMap((target) => {
+    const safe = resolveSafeTargetRealpath(cwd, target);
+    if (!safe.escapesWorkspace && (safe.relPath === "" || isExistingDir(safe.resolvedPath))) return [];
+    return [safe.escapesWorkspace ? `../${safe.relPath.replace(/^(?:\.\.\/)+/, "")}` : safe.relPath];
+  });
   return [...new Set(resolved)];
 }
 
 export function checkToolCallAllowed(
-  cwd: string,
-  role: RoleSpec | null,
-  event: { toolName: string; input?: unknown },
-  rolesMap?: ReadonlyMap<string, RoleSpec>,
-  mode: "foreground" | "stage" = "foreground",
+  cwd: string, role: RoleSpec | null, event: { toolName: string; input?: unknown },
+  rolesMap?: ReadonlyMap<string, RoleSpec>, mode: "foreground" | "stage" = "foreground",
 ): { block: boolean; reason?: string } {
   if (!role) return { block: false };
-  const record = typeof event.input === "object" && event.input !== null && !Array.isArray(event.input)
-    ? (event.input as Record<string, unknown>) : {};
+  const record = typeof event.input === "object" && event.input !== null && !Array.isArray(event.input) ? (event.input as Record<string, unknown>) : {};
   const addFgHint = (reason: string): string => (mode === "foreground" ? `${reason} ${FG_COORD_HINT}` : reason);
 
   if (isCompanionTool(event.toolName)) {
@@ -315,14 +287,11 @@ export function checkToolCallAllowed(
     return { block: true, reason: !canRoleDispatch(role) && isMut ? addFgHint(base) : base };
   }
 
-  const readOnly = isRoleReadOnly(role);
-  if (readOnly) {
+  if (isRoleReadOnly(role)) {
     if (STRICT_READONLY_BLOCKED_TOOLS.has(event.toolName)) {
       return { block: true, reason: addFgHint(`Role "${role.id}" is read-only; tool "${event.toolName}" is not permitted.`) };
     }
-    if (event.toolName === "bash" && !allowedTools) {
-      return { block: true, reason: addFgHint(`Role "${role.id}" is read-only; bash is not permitted.`) };
-    }
+    if (event.toolName === "bash" && !allowedTools) return { block: true, reason: addFgHint(`Role "${role.id}" is read-only; bash is not permitted.`) };
   }
 
   const boundary = hasWriteBoundary(role);
@@ -330,29 +299,19 @@ export function checkToolCallAllowed(
     if (boundary) {
       const forbidden = extractTaskSubagents(event.input).find((agent) => !READONLY_SUBAGENT_SET.has(agent));
       if (forbidden) {
-        return {
-          block: true,
-          reason: `Role "${role.id}" restricts write paths and may only spawn read-only subagents (${READONLY_SUBAGENTS.join(", ")}); blocked "${forbidden}".`,
-        };
+        return { block: true, reason: `Role "${role.id}" restricts write paths and may only spawn read-only subagents (${READONLY_SUBAGENTS.join(", ")}); blocked "${forbidden}".` };
       }
     }
     return { block: false };
   }
 
   if (!WRITE_TOOLS[event.toolName] || !boundary) return { block: false };
-  const writable = role.permissions.writable;
-  if (writable?.length === 0) {
-    return { block: true, reason: addFgHint(`Role "${role.id}" is read-only; write operations are not permitted.`) };
-  }
+  if (role.permissions.writable?.length === 0) return { block: true, reason: addFgHint(`Role "${role.id}" is read-only; write operations are not permitted.`) };
 
   const { targets: rawTargets, invalid } = extractRawWriteTargets(event.toolName, event.input);
   if (invalid || rawTargets.length === 0) {
-    return {
-      block: true,
-      reason: addFgHint(`Role "${role.id}" restricts write paths and could not verify target path for "${event.toolName}".`),
-    };
+    return { block: true, reason: addFgHint(`Role "${role.id}" restricts write paths and could not verify target path for "${event.toolName}".`) };
   }
-
   for (const rawTarget of rawTargets) {
     const res = validateWriteTarget(cwd, rawTarget, role);
     if (res.block) return { block: true, reason: res.reason ? addFgHint(res.reason) : undefined };
@@ -360,11 +319,57 @@ export function checkToolCallAllowed(
   return { block: false };
 }
 
-export function isValidExecutionEvidence(toolName: string, isError: boolean): boolean {
-  if (isError) return false;
+export function isValidExecutionEvidence(
+  toolName: string, isError: boolean, call?: Pick<ObservedToolCall, "isBackgroundLaunch" | "exitCode">,
+): boolean {
+  if (isError || call?.isBackgroundLaunch || (typeof call?.exitCode === "number" && call.exitCode !== 0)) return false;
   if (toolName === "enhance_job") return true;
-  if (isCompanionTool(toolName)) return false;
-  return Boolean(toolName && toolName !== "unknown");
+  return !isCompanionTool(toolName) && Boolean(toolName && toolName !== "unknown");
+}
+
+function extractToolResultText(rawResult: unknown, rawOutput?: unknown): string {
+  if (typeof rawOutput === "string") return rawOutput;
+  if (typeof rawResult === "string") return rawResult;
+  if (!rawResult || typeof rawResult !== "object") return "";
+  const r = rawResult as Record<string, unknown>;
+  if (Array.isArray(r.content)) {
+    const joined = r.content.map((p) => (p && typeof p === "object" && typeof (p as { text?: unknown }).text === "string" ? (p as { text: string }).text : "")).filter(Boolean).join("\n");
+    if (joined) return joined;
+  }
+  for (const k of ["output", "stdout", "stderr", "text"] as const) if (typeof r[k] === "string" && r[k]) return r[k] as string;
+  return "";
+}
+
+function extractToolOutcomeMeta(
+  toolName: string, args: unknown,
+  event: { isError?: boolean; result?: unknown; output?: unknown; details?: unknown; exitCode?: number | null },
+): Pick<ObservedToolCall, "command" | "exitCode" | "outputSnippet" | "isBackgroundLaunch"> {
+  const rec = typeof args === "object" && args !== null && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
+  const isExec = toolName === "bash" || toolName === "enhance_job";
+  const rawCmd = isExec ? ([rec.command, rec.cmd].find((v): v is string => typeof v === "string" && Boolean(v.trim()))?.trim()) : undefined;
+  const rawText = extractToolResultText(event.result, event.output).replace(ANSI_STRIP_RE, "").trim();
+  const outputSnippet = rawText ? (rawText.length > 240 ? `${rawText.slice(0, 239)}…` : rawText) : undefined;
+  const resObj = event.result && typeof event.result === "object" && !Array.isArray(event.result) ? (event.result as Record<string, unknown>) : null;
+  const details = (event.details && typeof event.details === "object" ? event.details : resObj?.details) as Record<string, unknown> | undefined;
+  const action = typeof rec.action === "string" ? rec.action.trim().toLowerCase() : "";
+  const isBackgroundLaunch = (toolName === "enhance_job" && (action === "start" || (!action && Boolean(rawCmd)))) ||
+    (toolName === "bash" && (rec.background === true || rec.run_in_background === true || rec.async === true || details?.background === true || BG_LAUNCH_OUTPUT_RE.test(rawText)));
+
+  let exitCode: number | null | undefined = event.exitCode;
+  if (exitCode === undefined && details) exitCode = typeof details.exitCode === "number" ? details.exitCode : (typeof details.code === "number" ? details.code : undefined);
+  if (exitCode === undefined && toolName === "enhance_job" && rawText.startsWith("{")) {
+    try {
+      const p = JSON.parse(rawText) as { exitCode?: unknown; status?: unknown; job?: { exitCode?: unknown; status?: unknown } };
+      const jc = typeof p.exitCode === "number" ? p.exitCode : (typeof p.job?.exitCode === "number" ? p.job.exitCode : undefined);
+      if (jc !== undefined) exitCode = jc; else if (p.status === "running" || p.job?.status === "running") exitCode = null;
+    } catch {}
+  }
+  if (exitCode === undefined && rawText) { const m = /(?:Exit code:|exited with code)\s*(-?\d+)/i.exec(rawText); if (m) exitCode = Number.parseInt(m[1]!, 10); }
+  if (exitCode === undefined && (isExec || event.result !== undefined || event.output !== undefined)) exitCode = isBackgroundLaunch ? null : (event.isError ? 1 : 0);
+  return {
+    ...(rawCmd !== undefined ? { command: rawCmd } : {}), ...(exitCode !== undefined ? { exitCode } : {}),
+    ...(outputSnippet !== undefined ? { outputSnippet } : {}), ...(isBackgroundLaunch ? { isBackgroundLaunch: true } : {}),
+  };
 }
 
 export class TurnTracker {
@@ -372,67 +377,65 @@ export class TurnTracker {
   private configBaseline: Map<string, SnapshotEntry> | null = null;
   private lastCwd: string | null = null;
   private calls: ObservedToolCall[] = [];
+  private pendingInputs = new Map<string, unknown>();
+  private lastStartInput: { toolName: string; input: unknown } | null = null;
   private inFlightTool: { name: string; startedMs: number; summary?: string } | null = null;
   private turnOpen = false;
   private turnFailed = false;
 
   resetTurn(cwd?: string): void {
     if (cwd) this.lastCwd = cwd;
-    this.baseline = null; this.configBaseline = null; this.calls = [];
+    this.baseline = null; this.configBaseline = null; this.calls = []; this.pendingInputs.clear(); this.lastStartInput = null;
     this.inFlightTool = null; this.turnOpen = false; this.turnFailed = false;
   }
-
   beginTurn(cwd: string, preserveIfIncomplete = true): void {
     this.lastCwd = cwd;
     if (preserveIfIncomplete && this.turnOpen && this.baseline !== null) return;
     this.baseline = snapshotWorkspace(cwd); this.configBaseline = snapshotConfigIntegrity(cwd);
-    this.calls = []; this.inFlightTool = null; this.turnOpen = true; this.turnFailed = false;
+    this.calls = []; this.pendingInputs.clear(); this.lastStartInput = null;
+    this.inFlightTool = null; this.turnOpen = true; this.turnFailed = false;
   }
-
   markTurnFailed(): void { this.turnFailed = true; this.inFlightTool = null; }
   completeTurn(): void { this.turnOpen = false; this.turnFailed = false; this.inFlightTool = null; }
   isTurnFailed(): boolean { return this.turnFailed; }
-
   checkToolCallAllowed(
     cwd: string, role: RoleSpec | null, event: { toolName: string; input?: unknown },
     rolesMap?: ReadonlyMap<string, RoleSpec>, mode: "foreground" | "stage" = "foreground",
   ): { block: boolean; reason?: string } {
     return checkToolCallAllowed(cwd, role, event, rolesMap, mode);
   }
-
-  recordToolExecutionStart(toolName: string, input?: unknown): void {
+  recordToolExecutionStart(toolName: string, input?: unknown, toolCallId?: string): void {
     this.inFlightTool = { name: toolName, startedMs: Date.now(), summary: summarizeToolCall(toolName, input) };
+    this.lastStartInput = { toolName, input };
+    if (toolCallId) this.pendingInputs.set(toolCallId, input);
   }
-
-  recordToolExecutionEnd(cwd: string, event: { toolCallId: string; toolName: string; args?: unknown; isError?: boolean }): ObservedToolCall {
+  recordToolExecutionEnd(
+    cwd: string,
+    event: { toolCallId: string; toolName: string; args?: unknown; input?: unknown; result?: unknown; output?: unknown; details?: unknown; exitCode?: number | null; isError?: boolean },
+  ): ObservedToolCall {
     this.inFlightTool = null;
+    const effArgs = event.args ?? event.input ?? this.pendingInputs.get(event.toolCallId) ?? (this.lastStartInput?.toolName === event.toolName ? this.lastStartInput.input : undefined);
+    this.pendingInputs.delete(event.toolCallId); this.lastStartInput = null;
     const call: ObservedToolCall = {
       toolCallId: event.toolCallId, toolName: event.toolName, isError: event.isError ?? false,
-      touchedPaths: extractWriteTargetPaths(cwd, event.toolName, event.args),
-      timestamp: new Date().toISOString(), summary: summarizeToolCall(event.toolName, event.args),
+      touchedPaths: extractWriteTargetPaths(cwd, event.toolName, effArgs),
+      timestamp: new Date().toISOString(), summary: summarizeToolCall(event.toolName, effArgs), ...extractToolOutcomeMeta(event.toolName, effArgs, event),
     };
     this.calls.push(call);
     return call;
   }
-
   getActiveTool(): SupervisorActiveTool | null {
     if (!this.inFlightTool) return null;
     return {
-      name: this.inFlightTool.name,
-      elapsedSec: Math.max(0, Math.round((Date.now() - this.inFlightTool.startedMs) / 100) / 10),
+      name: this.inFlightTool.name, elapsedSec: Math.max(0, Math.round((Date.now() - this.inFlightTool.startedMs) / 100) / 10),
       ...(this.inFlightTool.summary ? { summary: this.inFlightTool.summary } : {}),
     };
   }
-
   getObservedCalls(): ObservedToolCall[] { return [...this.calls]; }
   getBaselineSnapshot(cwd?: string): ReadonlyMap<string, SnapshotEntry> | null {
-    const target = cwd ?? this.lastCwd;
-    if (this.baseline === null && target) this.baseline = snapshotWorkspace(target);
-    return this.baseline;
+    const target = cwd ?? this.lastCwd; if (this.baseline === null && target) this.baseline = snapshotWorkspace(target); return this.baseline;
   }
   getBaselineConfigSnapshot(cwd?: string): ReadonlyMap<string, SnapshotEntry> | null {
-    const target = cwd ?? this.lastCwd;
-    if (this.configBaseline === null && target) this.configBaseline = snapshotConfigIntegrity(target);
-    return this.configBaseline;
+    const target = cwd ?? this.lastCwd; if (this.configBaseline === null && target) this.configBaseline = snapshotConfigIntegrity(target); return this.configBaseline;
   }
 }

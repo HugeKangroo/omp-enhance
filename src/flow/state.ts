@@ -1,12 +1,17 @@
 import {
-  captureProcessStartToken, isProcessAliveWithToken,
+  captureProcessStartToken, isProcessAliveWithToken, LeaseLostError,
   type EnhanceStore, type PersistedFlowCheckpoint,
 } from "../core/store.ts";
 import type {
   FlowRoomStatus, FlowRunResult, FlowStageTrace, FlowUserSteer, HandoffEnvelope,
   ObservedToolCall, RoleSpec, RoomEntry, SupervisorDecision, UsageSummary,
 } from "../core/types.ts";
+import {
+  applyStageEndToRoom, computeMaxIdSeq, drainPendingFlowSteers, isCheckpointResumable,
+  parseDirectedSteer, snapshotFromCheckpoint, syncSteerRecord,
+} from "./state-helpers.ts";
 
+export { isCheckpointResumable, parseDirectedSteer, snapshotFromCheckpoint };
 export type { FlowRoomStatus } from "../core/types.ts";
 
 export interface ActiveStageControls {
@@ -24,6 +29,7 @@ export interface FlowObserver {
   isCancelled?: () => boolean;
   allocateStageId?: (info: { roleId: string; round: number; stepIndex: number }) => string;
   getUserSteers?: () => readonly FlowUserSteer[];
+  drainPendingSteers?: (info?: { roleId?: string; stageId?: string; phase?: "pre_stage" | "mid_stage" }) => Promise<number>;
   bindControls?: (controls: ActiveStageControls | null, stageId?: string) => void;
   onProgress?: (info: {
     currentIndex: number; repairRound: number; lastHandoffId: string | null;
@@ -54,50 +60,6 @@ export interface FlowRoomUiAdapter {
   requestRender?: () => void;
 }
 
-const MAX_ASSISTANT_TEXT_CHARS = 16_384;
-const DIRECTED_STEER_RE = /^(?:\[@([a-zA-Z0-9][a-zA-Z0-9_-]*)\]|@([a-zA-Z0-9][a-zA-Z0-9_-]*))\s+([\s\S]+)$/;
-
-export function parseDirectedSteer(rawMessage: string): { text: string; targetRole?: string } {
-  const clean = rawMessage.trim(), m = DIRECTED_STEER_RE.exec(clean);
-  const candidate = m ? (m[1] ?? m[2] ?? "").trim() : "";
-  const targetRole = candidate && candidate !== "supervisor" ? candidate : undefined;
-  return { text: targetRole && m?.[3] ? m[3].trim() : clean, ...(targetRole ? { targetRole } : {}) };
-}
-
-export function isCheckpointResumable(cp: PersistedFlowCheckpoint | null | undefined): boolean {
-  return Boolean(
-    cp?.flowId && cp.mandateId && cp.roleChain.length > 0 && cp.currentIndex < cp.roleChain.length &&
-    (cp.status === "waiting_input" || cp.status === "interrupted" || cp.status === "failed" || cp.status === "cancelled"),
-  );
-}
-
-export function snapshotFromCheckpoint(cp: PersistedFlowCheckpoint, fallbackCwd?: string): FlowRoomSnapshot {
-  let snap: Partial<FlowRoomSnapshot> = {};
-  try {
-    const parsed: unknown = JSON.parse(cp.snapshotJson);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) snap = parsed as Partial<FlowRoomSnapshot>;
-  } catch {}
-  const resolvedCwd = cp.cwd ?? snap.cwd ?? fallbackCwd;
-  const steers = Array.isArray(cp.userSteers) ? cp.userSteers.map((u) => ({ ...u })) : (Array.isArray(snap.userSteers) ? snap.userSteers.map((u) => ({ ...u })) : []);
-  return {
-    flowId: cp.flowId, mandateId: cp.mandateId, goal: cp.goal, ...(resolvedCwd ? { cwd: resolvedCwd } : {}),
-    roleChain: [...cp.roleChain], status: cp.status as FlowRoomStatus, currentIndex: cp.currentIndex, repairRound: cp.repairRound,
-    ...(typeof snap.reason === "string" && snap.reason ? { reason: snap.reason } : {}),
-    startedAt: typeof snap.startedAt === "string" ? snap.startedAt : null, endedAt: typeof snap.endedAt === "string" ? snap.endedAt : null,
-    activeStageId: cp.status === "running" && typeof snap.activeStageId === "string" ? snap.activeStageId : null,
-    entries: Array.isArray(snap.entries) ? snap.entries.map((e) => ({ ...e })) : [],
-    stages: Array.isArray(snap.stages) ? snap.stages.map((s) => ({ ...s, calls: (s.calls ?? []).map((c) => ({ ...c, touchedPaths: [...(c.touchedPaths ?? [])] })), notes: [...(s.notes ?? [])] })) : [],
-    userSteers: steers,
-  };
-}
-
-function computeMaxIdSeq(entries: readonly RoomEntry[], stages: readonly FlowStageTrace[]): number {
-  let max = 0;
-  for (const e of entries) for (const m of e.id.matchAll(/(\d+)/g)) max = Math.max(max, Number(m[1]));
-  for (const s of stages) for (const m of s.stageId.matchAll(/(\d+)/g)) max = Math.max(max, Number(m[1]));
-  return max;
-}
-
 export class FlowRoomManager {
   private flowId: string | null = null;
   private mandateId = ""; private goal = ""; private roleChain: string[] = [];
@@ -108,6 +70,8 @@ export class FlowRoomManager {
   private activeStageId: string | null = null; private entries: RoomEntry[] = []; private stages: FlowStageTrace[] = [];
   private controlStack: Array<{ stageId: string; controls: ActiveStageControls }> = [];
   private flowAbortController: AbortController | null = null;
+  private leaseToken: string | null = null; private stateVersion = 0;
+  private steerPollTimer: ReturnType<typeof setInterval> | null = null; private drainingSteers = false;
   private cancelled = false; private disposed = false; private seq = 0; private cwd: string | undefined;
   private readonly selfStartToken = captureProcessStartToken(process.pid);
   private readonly listeners = new Set<() => void>();
@@ -121,20 +85,46 @@ export class FlowRoomManager {
   getMandateId(): string { return this.mandateId; }
   getUserSteers(): readonly FlowUserSteer[] { return this.userSteers; }
   getAbortSignal(): AbortSignal | undefined { return this.flowAbortController?.signal; }
+  getLeaseToken(): string | null { return this.leaseToken; }
+
+  hasActiveLeaseOwnership(): boolean {
+    if (this.status !== "running" || !this.flowId) return false;
+    if (!this.store || this.store.isClosed()) return true;
+    if (!this.leaseToken) return false;
+    const live = this.store.getProjectFlowLease();
+    return Boolean(live && live.flowId === this.flowId && live.leaseToken === this.leaseToken);
+  }
+
   isResumable(): boolean {
     return Boolean(
       this.flowId && this.mandateId && this.roleChain.length > 0 && this.currentIndex < this.roleChain.length &&
       (this.status === "waiting_input" || this.status === "interrupted" || this.status === "failed" || this.status === "cancelled"),
     );
   }
+
   subscribe(fn: () => void): () => void { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; }
   private notify(): void {
     try { this.ui?.requestRender?.(); } catch {}
     for (const fn of this.listeners) { try { fn(); } catch {} }
   }
 
-  private persist(): void {
+  private startSteerPoll(): void {
+    this.stopSteerPoll();
+    if (!this.store || this.store.isClosed() || this.status !== "running") return;
+    this.steerPollTimer = setInterval(() => {
+      if (this.status !== "running") { this.stopSteerPoll(); return; }
+      void this.drainPendingSteersInternal({ phase: "mid_stage" });
+    }, 150);
+    this.steerPollTimer.unref?.();
+  }
+
+  private stopSteerPoll(): void {
+    if (this.steerPollTimer !== null) { clearInterval(this.steerPollTimer); this.steerPollTimer = null; }
+  }
+
+  private persist(opts?: { allowUnfencedRecovery?: boolean }): void {
     if (this.disposed || !this.store || this.store.isClosed() || !this.flowId || !this.mandateId) return;
+    if (!this.leaseToken && !opts?.allowUnfencedRecovery) return;
     try {
       const owned = this.status === "running";
       const snapJson = JSON.stringify({
@@ -143,15 +133,24 @@ export class FlowRoomManager {
         ...(this.reason ? { reason: this.reason } : {}), startedAt: this.startedAt, endedAt: this.endedAt,
         activeStageId: this.activeStageId, entries: this.entries, stages: this.stages, userSteers: this.userSteers,
       });
-      this.store.saveFlowCheckpoint({
+      const saved = this.store.saveFlowCheckpoint({
         flowId: this.flowId, mandateId: this.mandateId, goal: this.goal, ...(this.cwd ? { cwd: this.cwd } : {}),
         roleChain: this.roleChain, status: this.status, currentIndex: this.currentIndex, repairRound: this.repairRound,
         lastHandoffId: this.lastHandoffId, maxRepairRounds: this.maxRepairRounds, snapshotJson: snapJson,
         ownerPid: owned ? process.pid : null, ownerStartToken: owned ? this.selfStartToken : null,
+        leaseToken: owned ? this.leaseToken : null, stateVersion: this.stateVersion,
         nextStageSeq: this.nextStageSeq, lastRejectionSig: this.lastRejectionSig,
         userSteers: this.userSteers, updatedAt: new Date().toISOString(),
-      });
-    } catch {}
+      }, this.leaseToken ? { expectedLeaseToken: this.leaseToken } : undefined);
+      if (saved) {
+        if (typeof saved.stateVersion === "number") this.stateVersion = saved.stateVersion;
+        if (Array.isArray(saved.userSteers)) this.userSteers = saved.userSteers.map((u) => ({ ...u }));
+      }
+    } catch (err) {
+      if (err instanceof LeaseLostError) {
+        this.leaseToken = null; this.cancelled = true; this.stopSteerPoll(); this.flowAbortController?.abort();
+      }
+    }
   }
 
   private applyCheckpointState(cp: PersistedFlowCheckpoint): void {
@@ -160,6 +159,7 @@ export class FlowRoomManager {
     this.cwd = snap.cwd ?? this.cwd; this.roleChain = [...cp.roleChain];
     this.currentIndex = cp.currentIndex; this.repairRound = cp.repairRound;
     this.lastHandoffId = cp.lastHandoffId; this.maxRepairRounds = cp.maxRepairRounds;
+    this.stateVersion = cp.stateVersion ?? 0;
     this.startedAt = snap.startedAt; this.endedAt = snap.endedAt; this.reason = snap.reason;
     this.entries = snap.entries; this.stages = snap.stages; this.userSteers = snap.userSteers ?? [];
     this.lastRejectionSig = cp.lastRejectionSig ?? null;
@@ -168,7 +168,7 @@ export class FlowRoomManager {
   }
 
   syncFromCheckpoint(cp: PersistedFlowCheckpoint, ctx?: any): void {
-    if (this.status === "running" || this.flowId !== cp.flowId) return;
+    if (this.status === "running" || this.flowId !== cp.flowId || cp.status === "running") return;
     this.applyCheckpointState(cp);
     this.status = cp.status as FlowRoomStatus; this.activeStageId = null;
     if (this.status !== "waiting_input") this.ui?.clearWidget?.(ctx);
@@ -188,7 +188,7 @@ export class FlowRoomManager {
     for (const en of this.entries) if (en.badge?.startsWith("●")) {
       en.badge = "⏸ 中断"; en.tone = "warning"; en.text = "进程中断，可在总秘书 (/coord) 中从本阶段断点续跑";
     }
-    this.persist();
+    this.persist({ allowUnfencedRecovery: true });
   }
 
   getSnapshot(): FlowRoomSnapshot {
@@ -207,13 +207,34 @@ export class FlowRoomManager {
     if (idx >= 0) this.entries.splice(idx, 0, entry); else this.entries.push(entry);
   }
 
+  private syncSteerIntoMemory(s: FlowUserSteer, deliveredLive: boolean, stageId?: string | null): boolean {
+    return syncSteerRecord(this.userSteers, (e) => this.insertBeforeRunning(e), this.entries, () => ++this.seq, s, deliveredLive, stageId);
+  }
+
+  private async drainPendingSteersInternal(info?: { roleId?: string; stageId?: string; phase?: "pre_stage" | "mid_stage" }): Promise<number> {
+    if (this.drainingSteers || this.disposed || this.status !== "running" || !this.flowId || !this.store || this.store.isClosed()) return 0;
+    if (!this.hasActiveLeaseOwnership()) return 0;
+    this.drainingSteers = true;
+    try {
+      return await drainPendingFlowSteers({
+        store: this.store, flowId: this.flowId, stages: this.stages, controlStack: this.controlStack, activeStageId: this.activeStageId,
+        syncSteer: (s, live, sid) => this.syncSteerIntoMemory(s, live, sid),
+        onChanged: (persisted) => { if (persisted) this.persist(); this.notify(); },
+        info,
+      });
+    } finally { this.drainingSteers = false; }
+  }
+
   beginFlow(input: {
     flowId?: string; mandateId?: string; goal: string; roleChain: string[];
     maxRepairRounds?: number; lastHandoffId?: string | null; initiatorText?: string; ctx?: any;
   }): string {
     if (this.status === "running") throw new Error("已有正在运行的协作 Flow；可通过 steer 插话、/flow 查看或 cancel 取消。");
     const nextFlowId = input.flowId ?? `flow-${Date.now().toString(36)}-${this.seq + 1}`;
-    if (this.store && !this.store.isClosed()) this.store.acquireProjectFlowLease(nextFlowId, process.pid, this.selfStartToken);
+    if (this.store && !this.store.isClosed()) {
+      const acq = this.store.acquireProjectFlowLease(nextFlowId, process.pid, this.selfStartToken);
+      this.leaseToken = acq.leaseToken; this.stateVersion = acq.stateVersion;
+    } else { this.leaseToken = null; this.stateVersion = 0; }
     this.disposed = false; this.seq += 1; this.flowId = nextFlowId;
     this.mandateId = input.mandateId ?? ""; this.goal = input.goal; this.roleChain = [...input.roleChain];
     this.currentIndex = 0; this.repairRound = 0; this.lastHandoffId = input.lastHandoffId ?? null;
@@ -221,11 +242,8 @@ export class FlowRoomManager {
     this.userSteers = []; this.status = "running"; this.reason = undefined;
     this.startedAt = new Date().toISOString(); this.endedAt = null; this.activeStageId = null;
     this.controlStack = []; this.flowAbortController = new AbortController(); this.cancelled = false; this.stages = [];
-    this.entries = [{
-      id: `user-${this.seq}-init`, side: "right", speaker: "你", badge: "目标",
-      tone: "success", text: input.initiatorText ?? input.goal, timestamp: this.startedAt,
-    }];
-    this.persist(); this.ui?.mountWidget?.(this, input.ctx); this.notify();
+    this.entries = [{ id: `user-${this.seq}-init`, side: "right", speaker: "你", badge: "目标", tone: "success", text: input.initiatorText ?? input.goal, timestamp: this.startedAt }];
+    this.persist(); this.startSteerPoll(); this.ui?.mountWidget?.(this, input.ctx); this.notify();
     return this.flowId;
   }
 
@@ -243,8 +261,12 @@ export class FlowRoomManager {
     }
     if (!cp && !this.isResumable()) throw new Error("当前没有可断点续跑的中断/失败 Flow。");
     const leaseFlowId = cp?.flowId ?? effectiveId!;
-    if (this.store && !this.store.isClosed()) this.store.acquireProjectFlowLease(leaseFlowId, process.pid, this.selfStartToken);
-    if (cp) this.applyCheckpointState(cp);
+    if (this.store && !this.store.isClosed()) {
+      const acq = this.store.acquireProjectFlowLease(leaseFlowId, process.pid, this.selfStartToken);
+      cp = this.store.getFlowCheckpoint(leaseFlowId) ?? cp;
+      if (cp) this.applyCheckpointState(cp);
+      this.leaseToken = acq.leaseToken; this.stateVersion = acq.stateVersion;
+    } else { this.leaseToken = null; this.stateVersion = 0; }
 
     this.disposed = false; this.status = "running"; this.cancelled = false;
     this.endedAt = null; this.reason = undefined; this.controlStack = [];
@@ -252,11 +274,8 @@ export class FlowRoomManager {
     const now = new Date().toISOString();
     for (const st of this.stages) if (st.status === "running") { st.status = "aborted"; st.endedAt = now; st.activeTool = null; }
     const roleId = this.roleChain[this.currentIndex]!;
-    this.entries.push({
-      id: `user-${this.seq}-resume`, side: "right", speaker: "你", badge: "续跑", tone: "success",
-      text: `从阶段 ${this.currentIndex + 1}/${this.roleChain.length} (${roleId}) 断点继续`, timestamp: now,
-    });
-    this.persist(); this.ui?.mountWidget?.(this, ctx); this.notify();
+    this.entries.push({ id: `user-${this.seq}-resume`, side: "right", speaker: "你", badge: "续跑", tone: "success", text: `从阶段 ${this.currentIndex + 1}/${this.roleChain.length} (${roleId}) 断点继续`, timestamp: now });
+    this.persist(); this.startSteerPoll(); this.ui?.mountWidget?.(this, ctx); this.notify();
     return {
       flowId: this.flowId!, mandateId: this.mandateId, roleChain: [...this.roleChain],
       startIndex: this.currentIndex, repairRound: this.repairRound, lastHandoffId: this.lastHandoffId,
@@ -264,39 +283,55 @@ export class FlowRoomManager {
     };
   }
 
-  async postUserSteer(message: string, ctx?: any): Promise<{ delivered: boolean; queuedForRole?: string; activeStageId: string | null }> {
+  async postUserSteer(message: string, ctx?: any): Promise<{
+    steerId?: string; deliveryState: "delivered_to_stage" | "saved_pending_delivery";
+    savedToCheckpoint: boolean; delivered: boolean; queuedForRole?: string; activeStageId: string | null;
+  }> {
     const clean = message.trim();
-    if (!clean) return { delivered: false, activeStageId: this.activeStageId };
+    if (!clean) return { deliveryState: "saved_pending_delivery", savedToCheckpoint: false, delivered: false, activeStageId: this.activeStageId };
     const { text: steerText, targetRole } = parseDirectedSteer(clean), now = new Date().toISOString();
-    this.userSteers.push({ text: steerText, ...(targetRole ? { targetRole } : {}), createdAt: now });
-
     const topControl = this.controlStack.at(-1) ?? null, currentStageId = topControl?.stageId ?? this.activeStageId;
     const activeStage = currentStageId ? this.stages.find((s) => s.stageId === currentStageId) : undefined;
-    const canDeliverNow = this.status === "running" && Boolean(topControl) && (!targetRole || activeStage?.roleId === targetRole);
+    const ownsLive = this.hasActiveLeaseOwnership();
+    const canDeliverNow = ownsLive && Boolean(topControl) && (!targetRole || activeStage?.roleId === targetRole);
 
-    this.seq += 1;
-    this.insertBeforeRunning({
-      id: `user-${this.seq}`, side: "right", speaker: "你", ...(targetRole ? { target: targetRole } : {}),
-      badge: canDeliverNow ? "插话" : (targetRole ? `@${targetRole}` : "留言"),
-      tone: "success", text: targetRole ? `[@${targetRole}] ${steerText}` : steerText, timestamp: now,
-      ...(currentStageId && canDeliverNow ? { stageId: currentStageId } : {}),
-    });
-    if (canDeliverNow && activeStage) activeStage.notes.push(`你插话: ${steerText}`);
+    let steerId: string | undefined, savedToCheckpoint = false;
+    if (this.store && !this.store.isClosed() && this.flowId) {
+      const appended = this.store.appendFlowSteer(this.flowId, { text: steerText, targetRole: targetRole ?? null, createdAt: now });
+      steerId = appended.steerId; savedToCheckpoint = true;
+      this.syncSteerIntoMemory(appended, canDeliverNow, currentStageId);
+    } else {
+      this.seq += 1;
+      const localSteer: FlowUserSteer = { steerId: `local-${this.seq}`, text: steerText, ...(targetRole ? { targetRole } : {}), createdAt: now };
+      steerId = localSteer.steerId;
+      this.syncSteerIntoMemory(localSteer, canDeliverNow, currentStageId);
+    }
 
     let delivered = false;
-    if (canDeliverNow && topControl) { await topControl.controls.steer(steerText); delivered = true; }
-    if (this.status === "running") this.ui?.mountWidget?.(this, ctx);
-    this.persist(); this.notify();
-    return { delivered, ...(targetRole && !delivered ? { queuedForRole: targetRole } : {}), activeStageId: currentStageId };
+    if (canDeliverNow && topControl && currentStageId) {
+      const claimed = savedToCheckpoint && this.store && this.flowId && steerId
+        ? this.store.markFlowSteersConsumed(this.flowId, [steerId], currentStageId) > 0 : true;
+      if (claimed) {
+        await topControl.controls.steer(steerText);
+        if (activeStage) activeStage.notes.push(`你插话: ${steerText}`);
+        const hit = steerId ? this.userSteers.find((u) => u.steerId === steerId) : undefined;
+        if (hit) { hit.consumedAt = now; hit.consumedByStage = currentStageId; }
+        delivered = true;
+      }
+    }
+    if (ownsLive) { this.ui?.mountWidget?.(this, ctx); this.persist(); }
+    this.notify();
+    return {
+      ...(steerId ? { steerId } : {}), deliveryState: delivered ? "delivered_to_stage" : "saved_pending_delivery",
+      savedToCheckpoint, delivered, ...(targetRole && !delivered ? { queuedForRole: targetRole } : {}),
+      activeStageId: canDeliverNow ? currentStageId : null,
+    };
   }
 
   async cancelActiveFlow(ctx?: any): Promise<boolean> {
     if (this.status !== "running") return false;
-    this.cancelled = true; this.flowAbortController?.abort(); this.seq += 1;
-    this.insertBeforeRunning({
-      id: `user-${this.seq}-cancel`, side: "right", speaker: "你", badge: "中止",
-      tone: "warning", text: "停止当前协作 Flow", timestamp: new Date().toISOString(),
-    });
+    this.cancelled = true; this.stopSteerPoll(); this.flowAbortController?.abort(); this.seq += 1;
+    this.insertBeforeRunning({ id: `user-${this.seq}-cancel`, side: "right", speaker: "你", badge: "中止", tone: "warning", text: "停止当前协作 Flow", timestamp: new Date().toISOString() });
     for (const item of [...this.controlStack].reverse()) { try { await item.controls.abort(); } catch {} }
     this.ui?.clearWidget?.(ctx); this.persist(); this.notify();
     return true;
@@ -307,6 +342,7 @@ export class FlowRoomManager {
       isCancelled: () => this.cancelled,
       allocateStageId: ({ roleId, round, stepIndex }) => `step-${++this.nextStageSeq}-r${round}-${stepIndex}-${roleId}`,
       getUserSteers: () => this.userSteers,
+      drainPendingSteers: (info) => this.drainPendingSteersInternal(info),
       bindControls: (controls, stageId) => {
         const key = stageId ?? this.activeStageId ?? "stage";
         if (controls) this.controlStack = [...this.controlStack.filter((i) => i.stageId !== key), { stageId: key, controls }];
@@ -321,19 +357,10 @@ export class FlowRoomManager {
       },
       onStageStart: ({ stageId, role, round, toTarget, modelLabel }) => {
         const existing = this.stages.find((s) => s.stageId === stageId);
-        if (existing && existing.status === "running") {
-          existing.modelLabel = modelLabel; this.activeStageId = stageId; this.persist(); this.notify(); return;
-        }
+        if (existing && existing.status === "running") { existing.modelLabel = modelLabel; this.activeStageId = stageId; this.persist(); this.notify(); return; }
         const finalStageId = existing ? `${stageId}-${++this.nextStageSeq}` : stageId, now = new Date().toISOString();
-        this.insertBeforeRunning({
-          id: `stage-${finalStageId}`, side: "left", speaker: role.id, target: toTarget,
-          badge: round > 0 ? `● 返修#${round}` : "● 执行中", tone: "info",
-          text: "正在分析上下文并准备执行...", timestamp: now, stageId: finalStageId,
-        });
-        this.stages.push({
-          stageId: finalStageId, roleId: role.id, roleName: role.name, round, status: "running", modelLabel,
-          startedAt: now, endedAt: null, activeTool: null, calls: [], assistantText: "", envelope: null, notes: [],
-        });
+        this.insertBeforeRunning({ id: `stage-${finalStageId}`, side: "left", speaker: role.id, target: toTarget, badge: round > 0 ? `● 返修#${round}` : "● 执行中", tone: "info", text: "正在分析上下文并准备执行...", timestamp: now, stageId: finalStageId });
+        this.stages.push({ stageId: finalStageId, roleId: role.id, roleName: role.name, round, status: "running", modelLabel, startedAt: now, endedAt: null, activeTool: null, calls: [], assistantText: "", envelope: null, notes: [] });
         this.activeStageId = finalStageId; this.persist(); this.notify();
       },
       onStageModelResolved: (stageId, modelLabel) => {
@@ -358,44 +385,11 @@ export class FlowRoomManager {
       onSupervisorNote: (stageId, note) => {
         const st = this.stages.find((s) => s.stageId === stageId); if (st) st.notes.push(note);
         this.seq += 1;
-        this.insertBeforeRunning({
-          id: `sup-${this.seq}`, side: "left", speaker: "supervisor", target: st?.roleId,
-          badge: "↺ 督导", tone: "warning", text: note, timestamp: new Date().toISOString(), stageId,
-        });
+        this.insertBeforeRunning({ id: `sup-${this.seq}`, side: "left", speaker: "supervisor", target: st?.roleId, badge: "↺ 督导", tone: "warning", text: note, timestamp: new Date().toISOString(), stageId });
         this.persist(); this.notify();
       },
       onStageEnd: (stageId, { status, outcome, reason, hostError }) => {
-        const st = this.stages.find((s) => s.stageId === stageId), effHostErr = hostError ?? outcome?.hostError ?? null;
-        if (st) {
-          st.status = status; st.endedAt = new Date().toISOString(); st.activeTool = null;
-          if (effHostErr) st.hostError = effHostErr;
-          const raw = outcome?.assistantText ?? "";
-          st.assistantText = raw.length > MAX_ASSISTANT_TEXT_CHARS ? `${raw.slice(0, MAX_ASSISTANT_TEXT_CHARS)}…` : raw;
-          st.envelope = outcome?.envelope ?? null;
-          for (const c of outcome?.observedCalls ?? []) if (!st.calls.some((p) => p.toolCallId === c.toolCallId)) st.calls.push(c);
-        }
-        const en = this.entries.find((e) => e.id === `stage-${stageId}`);
-        if (en) {
-          if (status === "ready") {
-            en.badge = "✓ ready"; en.tone = "success"; en.text = outcome?.envelope?.summary ?? (outcome?.assistantText || "阶段完成");
-          } else if (status === "needs_input") {
-            en.badge = "? 待确认"; en.tone = "warning"; en.target = "user";
-            const qs = outcome?.envelope?.questionsForUser;
-            en.text = qs?.length ? `${outcome?.envelope?.summary ?? ""}\n• ${qs.join("\n• ")}`.trim() : (outcome?.envelope?.summary ?? reason ?? "需补充信息后继续");
-          } else if (status === "rejected") {
-            en.badge = "✕ rejected"; en.tone = "warning";
-            en.target = outcome?.envelope?.toTarget && outcome.envelope.toTarget !== en.speaker
-              ? outcome.envelope.toTarget : (this.roleChain[0] && this.roleChain[0] !== en.speaker ? this.roleChain[0] : "user");
-            en.text = outcome?.envelope?.feedbackForUpstream ?? outcome?.envelope?.summary ?? reason ?? "验收未通过";
-          } else if (status === "blocked") {
-            en.badge = "! blocked"; en.tone = "warning"; en.target = "user";
-            en.text = outcome?.envelope?.summary ?? reason ?? "阶段受阻，需你确认";
-          } else {
-            en.badge = status === "aborted" ? "⏹ aborted" : status === "host_error" ? "! 服务异常" : status === "missing_handoff" ? "! 未交接" : "✕ violation";
-            en.tone = "error"; en.target = "user"; en.text = reason ?? outcome?.envelope?.summary ?? "执行中止";
-          }
-        }
-        this.activeStageId = [...this.stages].reverse().find((s) => s.status === "running")?.stageId ?? null;
+        this.activeStageId = applyStageEndToRoom({ stageId, status, outcome, reason, hostError, stages: this.stages, entries: this.entries, roleChain: this.roleChain });
         this.persist(); this.notify();
       },
     };
@@ -403,6 +397,7 @@ export class FlowRoomManager {
 
   finishFlow(result: FlowRunResult, ctx?: any): FlowRoomSnapshot {
     if (this.disposed) return this.getSnapshot();
+    this.stopSteerPoll();
     this.endedAt = new Date().toISOString(); this.activeStageId = null; this.controlStack = [];
     this.flowAbortController = null; this.reason = result.reason;
     this.status = result.status === "completed" ? "completed" : result.status === "waiting_input" ? "waiting_input"
@@ -410,14 +405,11 @@ export class FlowRoomManager {
         : (result.status === "blocked" || result.status === "rejected_max_rounds" || result.status === "stagnated") ? "blocked" : "failed";
     if (result.status === "rejected_max_rounds" || result.status === "stagnated") {
       this.seq += 1;
-      this.entries.push({
-        id: `sys-${this.seq}`, side: "left", speaker: "flow", target: "user",
-        badge: result.status === "stagnated" ? "! 停滞升级" : "! 超轮次升级",
-        tone: "warning", text: result.reason ?? "多轮修复未收敛，请介入决策。", timestamp: this.endedAt,
-      });
+      this.entries.push({ id: `sys-${this.seq}`, side: "left", speaker: "flow", target: "user", badge: result.status === "stagnated" ? "! 停滞升级" : "! 超轮次升级", tone: "warning", text: result.reason ?? "多轮修复未收敛，请介入决策。", timestamp: this.endedAt });
     }
     this.ui?.clearWidget?.(ctx); this.persist();
-    try { this.store?.releaseProjectFlowLease(this.flowId ?? undefined); } catch {}
+    const tok = this.leaseToken; this.leaseToken = null;
+    if (tok) { try { this.store?.releaseProjectFlowLease(this.flowId ?? undefined, tok); } catch {} }
     const snap = this.getSnapshot();
     this.ui?.sendSummaryCard?.(snap, result.finalEnvelope?.summary ?? result.reason ?? snap.status, ctx);
     this.notify(); return snap;
@@ -425,22 +417,26 @@ export class FlowRoomManager {
 
   failFlow(error: unknown, ctx?: any): FlowRoomSnapshot {
     if (this.disposed) return this.getSnapshot();
+    this.stopSteerPoll();
     const msg = error instanceof Error ? error.message : String(error);
     this.endedAt = new Date().toISOString(); this.activeStageId = null; this.controlStack = []; this.flowAbortController = null;
     this.status = "failed"; this.reason = msg; this.seq += 1;
     this.entries.push({ id: `err-${this.seq}`, side: "left", speaker: "flow", target: "user", badge: "✕ 错误", tone: "error", text: msg, timestamp: this.endedAt });
     this.ui?.clearWidget?.(ctx); this.persist();
-    try { this.store?.releaseProjectFlowLease(this.flowId ?? undefined); } catch {}
+    const tok = this.leaseToken; this.leaseToken = null;
+    if (tok) { try { this.store?.releaseProjectFlowLease(this.flowId ?? undefined, tok); } catch {} }
     const snap = this.getSnapshot();
     this.ui?.sendSummaryCard?.(snap, msg, ctx);
     this.notify(); return snap;
   }
 
   dispose(ctx?: any): void {
-    this.disposed = true; this.cancelled = true; this.flowAbortController?.abort(); this.flowAbortController = null;
-    if (this.status === "running") {
-      try { this.store?.releaseFlowOwnership(this.flowId, process.pid); } catch {}
-      try { this.store?.releaseProjectFlowLease(this.flowId ?? undefined); } catch {}
+    this.disposed = true; this.cancelled = true; this.stopSteerPoll();
+    this.flowAbortController?.abort(); this.flowAbortController = null;
+    const tok = this.leaseToken; this.leaseToken = null;
+    if (this.status === "running" && tok) {
+      try { this.store?.releaseFlowOwnership(this.flowId, process.pid, tok); } catch {}
+      try { this.store?.releaseProjectFlowLease(this.flowId ?? undefined, tok); } catch {}
     }
     for (const item of [...this.controlStack].reverse()) void Promise.resolve(item.controls.abort()).catch(() => {});
     this.controlStack = []; this.ui?.clearWidget?.(ctx); this.listeners.clear();

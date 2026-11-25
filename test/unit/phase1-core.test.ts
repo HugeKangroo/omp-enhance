@@ -8,8 +8,8 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  diffSnapshots, findBoundaryViolations, findProtectedViolations, matchesGlobList,
-  resolveSafeTargetRealpath, snapshotConfigIntegrity, snapshotWorkspace, splitBraceSafeGlobs,
+  computeWorkspaceFingerprint, diffSnapshots, findBoundaryViolations, findProtectedViolations,
+  matchesGlobList, resolveSafeTargetRealpath, snapshotConfigIntegrity, snapshotWorkspace, splitBraceSafeGlobs,
 } from "../../src/core/fs.ts";
 import {
   canRoleDispatch, COMPANION_TOOL_NAMES, DEFAULT_READONLY_TOOLS, checkToolCallAllowed,
@@ -17,7 +17,7 @@ import {
   resolveEffectiveActiveTools, resolveRoleActiveTools, TurnTracker,
 } from "../../src/core/policy.ts";
 import {
-  EnhanceStore, ProjectBusyError, captureProcessStartToken, isProcessAliveWithToken,
+  EnhanceStore, LeaseLostError, ProjectBusyError, captureProcessStartToken, isProcessAliveWithToken,
 } from "../../src/core/store.ts";
 import type {
   BackgroundJob, EpistemicItem, HandoffEnvelope, Mandate, ObservedToolCall,
@@ -460,8 +460,8 @@ describe("EnhanceStore", () => {
       const steeredA = store1.appendFlowCheckpointSteer("flow-A", {
         text: "@algo Prioritize low false negatives", createdAt: "2026-01-01T00:03:00.000Z",
       });
-      expect(steeredA.userSteers).toEqual([
-        { text: "Prioritize low false negatives", targetRole: "algo", createdAt: "2026-01-01T00:03:00.000Z" },
+      expect(steeredA.userSteers).toMatchObject([
+        { text: "Prioritize low false negatives", targetRole: "algo", createdAt: "2026-01-01T00:03:00.000Z", seq: 1, consumedAt: null },
       ]);
       expect(JSON.parse(steeredA.snapshotJson).entries).toHaveLength(1);
       expect(store2.getFlowCheckpoint("flow-B")?.userSteers).toEqual([]);
@@ -483,6 +483,101 @@ describe("EnhanceStore", () => {
       try { process.kill(-otherPid, "SIGKILL"); } catch { try { process.kill(otherPid, "SIGKILL"); } catch {} }
       store1.close();
       store2.close();
+    }
+  });
+
+  test("fences stale non-owner checkpoint saves via LeaseLostError and preserves append-only flow_steers across concurrent progress saves (GPT #1)", () => {
+    const workspaceDir = tempDir();
+    const dbPath = path.join(workspaceDir, ".omp-enhance", "state.sqlite");
+    const storeA = new EnhanceStore(dbPath);
+    const storeB = new EnhanceStore(dbPath);
+    const storeC = new EnhanceStore(dbPath);
+
+    try {
+      const mX = storeA.upsertMandate({ goal: "Task X", flowId: "flow-X" });
+      // Window A suspends flow-X into waiting_input
+      const leaseA = storeA.acquireProjectFlowLease("flow-X");
+      storeA.saveFlowCheckpoint({
+        flowId: "flow-X", mandateId: mX.id, goal: mX.goal, cwd: workspaceDir, roleChain: ["dev", "qa"],
+        status: "waiting_input", currentIndex: 0, repairRound: 0, lastHandoffId: null, maxRepairRounds: 2,
+        leaseToken: leaseA.leaseToken,
+        snapshotJson: JSON.stringify({ flowId: "flow-X", status: "waiting_input", entries: [], stages: [], userSteers: [] }),
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      }, { expectedLeaseToken: leaseA.leaseToken });
+      expect(storeA.getProjectFlowLease()).toBeNull();
+
+      // Window B resumes flow-X and acquires a fresh leaseToken
+      const leaseB = storeB.acquireProjectFlowLease("flow-X");
+      expect(leaseB.leaseToken).not.toBe(leaseA.leaseToken);
+      const savedB1 = storeB.saveFlowCheckpoint({
+        flowId: "flow-X", mandateId: mX.id, goal: mX.goal, cwd: workspaceDir, roleChain: ["dev", "qa"],
+        status: "running", currentIndex: 0, repairRound: 0, lastHandoffId: null, maxRepairRounds: 2,
+        ownerPid: process.pid, leaseToken: leaseB.leaseToken,
+        snapshotJson: JSON.stringify({ flowId: "flow-X", status: "running", entries: [], stages: [], userSteers: [] }),
+        updatedAt: "2026-01-01T00:01:00.000Z",
+      }, { expectedLeaseToken: leaseB.leaseToken });
+      expect(savedB1?.status).toBe("running");
+
+      // 1) Stale Window A attempts to write back old waiting_input snapshot or release B's lease -> REFUSED!
+      storeA.saveFlowCheckpoint({
+        flowId: "flow-X", mandateId: mX.id, goal: mX.goal, cwd: workspaceDir, roleChain: ["dev", "qa"],
+        status: "waiting_input", currentIndex: 0, repairRound: 0, lastHandoffId: null, maxRepairRounds: 2,
+        leaseToken: null,
+        snapshotJson: JSON.stringify({ flowId: "flow-X", status: "waiting_input", entries: [], stages: [], userSteers: [] }),
+        updatedAt: "2026-01-01T00:01:30.000Z",
+      });
+      expect(storeB.getFlowCheckpoint("flow-X")?.status).toBe("running");
+      expect(storeB.getProjectFlowLease()?.leaseToken).toBe(leaseB.leaseToken);
+      expect(storeA.releaseProjectFlowLease("flow-X", leaseA.leaseToken)).toBe(false);
+      expect(storeB.getProjectFlowLease()?.leaseToken).toBe(leaseB.leaseToken);
+      expect(() => storeC.acquireProjectFlowLease("flow-Y")).toThrow(ProjectBusyError);
+      expect(() => storeA.saveFlowCheckpoint({
+        flowId: "flow-X", mandateId: mX.id, goal: mX.goal, cwd: workspaceDir, roleChain: ["dev", "qa"],
+        status: "running", currentIndex: 0, repairRound: 0, lastHandoffId: null, maxRepairRounds: 2,
+        snapshotJson: "{}", updatedAt: "2026-01-01T00:01:40.000Z",
+      }, { expectedLeaseToken: leaseA.leaseToken })).toThrow(LeaseLostError);
+
+      // 2) Window A appends steer to flow_steers while B is running -> B saves progress with empty in-memory userSteers -> steer is NEVER wiped!
+      const s1 = storeA.appendFlowSteer("flow-X", {
+        steerId: "steer-1", text: "@dev Keep REST response schema intact", createdAt: "2026-01-01T00:02:00.000Z",
+      });
+      expect(s1.seq).toBeGreaterThan(0);
+      expect(s1.targetRole).toBe("dev");
+
+      storeB.saveFlowCheckpoint({
+        flowId: "flow-X", mandateId: mX.id, goal: mX.goal, cwd: workspaceDir, roleChain: ["dev", "qa"],
+        status: "running", currentIndex: 1, repairRound: 0, lastHandoffId: "h-1", maxRepairRounds: 2,
+        ownerPid: process.pid, leaseToken: leaseB.leaseToken, userSteers: [],
+        snapshotJson: JSON.stringify({ flowId: "flow-X", status: "running", entries: [], stages: [], userSteers: [] }),
+        updatedAt: "2026-01-01T00:02:30.000Z",
+      }, { expectedLeaseToken: leaseB.leaseToken });
+
+      expect(storeA.listFlowSteers("flow-X")).toHaveLength(1);
+      expect(storeA.getFlowCheckpoint("flow-X")?.userSteers?.map((s) => s.steerId)).toEqual(["steer-1"]);
+
+      const s2 = storeA.appendFlowSteer("flow-X", {
+        steerId: "steer-2", text: "Run edge-case tests too", createdAt: "2026-01-01T00:03:00.000Z",
+      });
+      expect(storeB.listFlowSteers("flow-X", { afterSeq: s1.seq }).map((s) => s.steerId)).toEqual([s2.steerId]);
+      expect(storeB.markFlowSteersConsumed("flow-X", ["steer-1"], "step-1-dev")).toBe(1);
+      expect(storeB.markFlowSteersConsumed("flow-X", ["steer-1"], "step-1-dev")).toBe(0); // idempotent!
+      expect(storeB.listFlowSteers("flow-X", { unconsumedOnly: true }).map((s) => s.steerId)).toEqual(["steer-2"]);
+
+      // Also verify verificationEvidence persists cleanly across EnhanceStore restarts (GPT #3)
+      storeB.saveHandoff({
+        id: "ho-ev", mandateId: mX.id, mandateRev: mX.rev, parentHandoffId: null, fromRole: "qa", toTarget: "user",
+        verdict: "ready", summary: "Tests passed", artifacts: [], verifiedFacts: [],
+        verificationEvidence: [{
+          command: "bun test", exitCode: 0, outputSnippet: "12 pass, 0 fail",
+          testedTreeFingerprint: "a".repeat(64), toolCallId: "call-test-1",
+        }],
+        openRisks: [], feedbackForUpstream: null, observedUsage: null, createdAt: "2026-01-01T00:04:00.000Z",
+      });
+      expect(storeA.getHandoff("ho-ev")?.verificationEvidence?.[0]?.command).toBe("bun test");
+    } finally {
+      storeA.close();
+      storeB.close();
+      storeC.close();
     }
   });
 });
@@ -527,6 +622,7 @@ describe("roles loader, serializer, and conditioning", () => {
 
     expect(roles.get("algo")?.exit.requireToolEvidence).toBe(true);
     expect(roles.get("algo")?.exit.requiredArtifacts).toEqual(["algo_work/REPORT.md", "algo_work/runs/**/metrics.json"]);
+    expect(roles.get("algo")?.exit.requireAlgoDeliverables).toBe(true);
     expect(roles.get("algo")?.stance).toContain("needs_input");
     expect(roles.get("algo")?.stance).toContain("questionsForUser");
     expect(roles.get("vision")?.model).toBe("@vision");
@@ -538,6 +634,7 @@ describe("roles loader, serializer, and conditioning", () => {
     expect(roles.get("qa")?.permissions.writable).toEqual(["test/**", "tests/**", "**/*.test.*", "**/*.spec.*"]);
     expect(roles.get("qa")?.exit.requireToolEvidence).toBe(true);
     expect(roles.get("qa")?.exit.requiredTools).toEqual(["bash"]);
+    expect(roles.get("qa")?.exit.requireTestExecution).toBe(true);
     expect(roles.get("reviewer")?.permissions.writable).toEqual([]);
     expect(roles.get("reviewer")?.permissions.protected).toEqual(["**"]);
   });
@@ -635,6 +732,8 @@ describe("roles loader, serializer, and conditioning", () => {
           requireToolEvidence: true,
           requiredTools: ["bash", "read"],
           requiredArtifacts: ["algo_work/REPORT.md", "algo_work/runs/**/metrics.json"],
+          requireTestExecution: true,
+          requireAlgoDeliverables: true,
           criteria: ["verified"],
         },
       }),
@@ -644,6 +743,8 @@ describe("roles loader, serializer, and conditioning", () => {
     expect(roundTripDispatch.internal).toBe(false);
     expect(roundTripDispatch.exit.requiredTools).toEqual(["bash", "read"]);
     expect(roundTripDispatch.exit.requiredArtifacts).toEqual(["algo_work/REPORT.md", "algo_work/runs/**/metrics.json"]);
+    expect(roundTripDispatch.exit.requireTestExecution).toBe(true);
+    expect(roundTripDispatch.exit.requireAlgoDeliverables).toBe(true);
     expect(() => parseRoleYaml(`${base}exit:\n  required_tools: [123]\n`, "project", filePath))
       .toThrow(/exit\.required_tools must be an array of non-empty strings/);
     expect(() => parseRoleYaml(base, "project", path.join(root, "other.yaml")))
@@ -972,6 +1073,29 @@ describe("policy & TurnTracker", () => {
     ]);
     expect(isValidExecutionEvidence("enhance_job", false)).toBe(true);
     expect(isValidExecutionEvidence("bash", true)).toBe(false);
+
+    // GPT #3: TurnTracker captures command, exitCode, outputSnippet (<=240 chars), & isBackgroundLaunch
+    tracker.recordToolExecutionStart("bash", { command: "bun test test/app.test.ts" }, "call-test");
+    const testCall = tracker.recordToolExecutionEnd(cwd, {
+      toolCallId: "call-test", toolName: "bash",
+      result: { content: [{ type: "text", text: `${"x".repeat(300)}\nExit code: 0` }], details: { exitCode: 0 } },
+    });
+    expect(testCall.command).toBe("bun test test/app.test.ts");
+    expect(testCall.exitCode).toBe(0);
+    expect(testCall.outputSnippet?.length).toBe(240);
+    expect(testCall.isBackgroundLaunch).toBeUndefined();
+    expect(isValidExecutionEvidence("bash", false, testCall)).toBe(true);
+
+    const bgJobLaunch = tracker.recordToolExecutionEnd(cwd, {
+      toolCallId: "call-bg-1", toolName: "enhance_job",
+      args: { action: "start", command: "python train.py" },
+      result: { content: [{ type: "text", text: JSON.stringify({ job: { status: "running", exitCode: null } }) }] },
+    });
+    expect(bgJobLaunch.command).toBe("python train.py");
+    expect(bgJobLaunch.isBackgroundLaunch).toBe(true);
+    expect(bgJobLaunch.exitCode).toBeNull();
+    expect(isValidExecutionEvidence("enhance_job", false, bgJobLaunch)).toBe(false);
+    expect(computeWorkspaceFingerprint(cwd)).toMatch(/^[a-f0-9]{64}$/);
   });
 });
 

@@ -260,8 +260,14 @@ export function createManagedWorkspace(
   const resolveGlobalDir = () => options.globalRolesDir ?? resolveDefaultGlobalRolesDir();
   const initTrusted = typeof initialTrust === "boolean" ? initialTrust : initialTrust.trusted;
   const initNotice = typeof initialTrust === "boolean" ? undefined : initialTrust.trustNotice;
+  const seenWarnings = new Set<string>();
+  const warnOnce = (ctxForWarn?: any) => (warning: string): void => {
+    if (seenWarnings.has(warning)) return;
+    seenWarnings.add(warning);
+    try { ctxForWarn?.ui?.notify?.(warning, "warning"); } catch {}
+  };
   const { roles } = discoverRolesWithDiagnostics({ cwd, globalRolesDir: resolveGlobalDir(), builtinRolesDir: options.builtinRolesDir, isProjectTrusted: initTrusted });
-  const settings = loadEnhanceSettings({ cwd, pluginLockPath: options.pluginLockPath, isProjectTrusted: initTrusted });
+  const settings = loadEnhanceSettings({ cwd, pluginLockPath: options.pluginLockPath, isProjectTrusted: initTrusted, onWarning: warnOnce() });
   const store = new EnhanceStore(path.join(cwd, ".omp-enhance", "state.sqlite"));
   const trackers = new SessionTrackerRegistry(), baselines = new SessionBaselineManager();
   const room = new FlowRoomManager(createFlowRoomUiAdapter(pi, hooks?.getActiveTargets), store, cwd);
@@ -314,7 +320,7 @@ export function createManagedWorkspace(
       }
       ws.globalRolesDir = resolveGlobalDir();
       ws.roles = discoverRolesWithDiagnostics({ cwd, globalRolesDir: ws.globalRolesDir, builtinRolesDir: options.builtinRolesDir, isProjectTrusted: ws.isTrusted }).roles;
-      ws.settings = loadEnhanceSettings({ cwd, pluginLockPath: options.pluginLockPath, isProjectTrusted: ws.isTrusted });
+      ws.settings = loadEnhanceSettings({ cwd, pluginLockPath: options.pluginLockPath, isProjectTrusted: ws.isTrusted, onWarning: warnOnce(c) });
       return ws.roles;
     },
     syncStatusBar: (c) => {
@@ -337,7 +343,10 @@ export function createManagedWorkspace(
       const effectiveId = validRole && !isInternalRole(validRole) ? validRole.id : null;
       const role = effectiveId ? validRole : null;
       rolesBySession.set(sid, effectiveId);
-      if (persist) { try { pi.appendEntry?.("omp-enhance-role", { roleId: effectiveId }); } catch {} }
+      if (persist) {
+        ws.trackers.reset(sid, ws.cwd);
+        try { pi.appendEntry?.("omp-enhance-role", { roleId: effectiveId }); } catch {}
+      }
       ws.lastSessionId = sid; ws.lastBranchOverrideSig = branchOverrideSignature(c);
       await baselines.applyToolOverrides(role, pi);
       await baselines.applyRoleOverrides(sid, role, pi, c);

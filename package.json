@@ -86,7 +86,8 @@
     "check:loc": "bun run scripts/check-loc.ts",
     "check": "bun run typecheck && bun run check:loc && bun run test",
     "probe:phase0": "bun run scripts/phase0-probe.ts",
-    "verify:omp": "bun run scripts/verify-omp-e2e.ts"
+    "verify:omp": "bun run scripts/verify-omp-e2e.ts",
+    "eval:ci-pilot": "bun run scripts/eval-ci-diagnosis.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",

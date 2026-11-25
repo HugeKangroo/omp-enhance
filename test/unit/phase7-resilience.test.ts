@@ -175,6 +175,7 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
         const toolName = stepCtx.role.id === "qa" ? "bash" : "read";
         const call: ObservedToolCall = {
           toolCallId: `${stepCtx.role.id}-ok`, toolName, isError: false,
+          ...(toolName === "bash" ? { command: "bun test", exitCode: 0 } : {}),
           touchedPaths: [], timestamp: new Date().toISOString(), summary: `${toolName} src/feature.ts`,
         };
         stepCtx.observer?.onToolEnd?.(stageId, call);
@@ -380,8 +381,14 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
 
     await h.emit("before_agent_start", { systemPrompt: ["Base"] }, ctx);
     writeText(path.join(cwd, "src", "bugfix.ts"), "export const fixed = true;\n");
-    writeText(path.join(cwd, "algo_work", "REPORT.md"), "# F5 Retry Report\n");
-    writeText(path.join(cwd, "algo_work", "runs", "r1", "metrics.json"), '{"score":0.99}\n');
+    writeText(
+      path.join(cwd, "algo_work", "REPORT.md"),
+      "# F5 Retry Benchmark Report\nVerified retry preserved workspace baseline and improved validation score to 0.99.\n",
+    );
+    writeText(
+      path.join(cwd, "algo_work", "runs", "r1", "metrics.json"),
+      JSON.stringify({ experimentId: "r1", split: "val_v1", evaluatorVersion: "eval@1", baseline: "exp_000", score: 0.99 }) + "\n",
+    );
     await h.emit("tool_execution_end", {
       toolCallId: "tc-write-1", toolName: "write", args: { path: "src/bugfix.ts" }, isError: false,
     }, ctx);
@@ -853,5 +860,227 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     }, null, null, ctx)).content[0].text);
     expect(okResume.status).toBe("completed");
     await h.emit("session_shutdown", {}, ctx);
+  });
+
+  test("preserves Window B lease ownership on Window A flowId-omitted steer, survives interleaved progress saves across real OS processes, and consumes each steer once (GPT #1)", async () => {
+    const cwd = makeTempDir("p7-multiproc-ws");
+    const globalDir = makeTempDir("p7-multiproc-global");
+    const ctrlDir = makeTempDir("p7-multiproc-ctrl");
+    const lockPath = path.join(ctrlDir, "omp-plugins.lock.json");
+    writeText(lockPath, JSON.stringify({ settings: { "omp-enhance": { flowRoutingMode: "auto" } } }));
+
+    // 1. Window A (this process) starts Flow X -> suspends at dev (waiting_input), so Window A's room holds stale waiting_input state!
+    const pauseRunnerA: RoleSessionRunner = {
+      async runRoleTurn(stepCtx) {
+        const call: ObservedToolCall = { toolCallId: "pa-1", toolName: "read", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+        const env = createAndVerifyHandoff({
+          store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
+          toTarget: stepCtx.toTarget, verdict: "needs_input", summary: "Need DB isolation level",
+          questionsForUser: ["Use SERIALIZABLE or WAL?"], observedCalls: [call],
+        });
+        return { envelope: env, observedCalls: [call], assistantText: "pause", usage: null };
+      },
+    };
+    const winA = createHarness({ cwd, globalDir, lockPath, runner: pauseRunnerA });
+    const ctxA = { cwd, hasUI: false };
+    const pausedOut = JSON.parse((await winA.tools.get("enhance_flow")!.execute("start-x", {
+      roles: ["dev", "reviewer"], goal: "Cross-window Flow X", wait: true,
+    }, null, null, ctxA)).content[0].text);
+    expect(pausedOut.status).toBe("waiting_input");
+    const flowXId = (JSON.parse((await winA.tools.get("enhance_flow")!.execute("st-x", { action: "status" }, null, null, ctxA)).content[0].text)).flowId as string;
+
+    // 2. Spawn REAL independent Bun OS Process B to resume Flow X and interleave progress saves!
+    const bReadyFile = path.join(ctrlDir, "b-in-stage.json");
+    const pulseGateFile = path.join(ctrlDir, "trigger-b-progress.flag");
+    const bProgressSavedFile = path.join(ctrlDir, "b-progress-saved.flag");
+    const releaseBDevFile = path.join(ctrlDir, "release-b-dev.flag");
+    const bSummaryFile = path.join(ctrlDir, "b-summary.json");
+    const entryModulePath = path.resolve(import.meta.dir, "../../src/entry.ts");
+    const handoffModulePath = path.resolve(import.meta.dir, "../../src/flow/handoff.ts");
+
+    const workerScript = `
+      import { existsSync, readFileSync, writeFileSync } from "node:fs";
+      import ompEnhance from ${JSON.stringify(entryModulePath)};
+      import { createAndVerifyHandoff } from ${JSON.stringify(handoffModulePath)};
+
+      const cwd = ${JSON.stringify(cwd)};
+      const globalDir = ${JSON.stringify(globalDir)};
+      const builtinRolesDir = ${JSON.stringify(builtinRolesDir)};
+      const lockPath = ${JSON.stringify(lockPath)};
+      const flowXId = ${JSON.stringify(flowXId)};
+      const bReadyFile = ${JSON.stringify(bReadyFile)};
+      const pulseGateFile = ${JSON.stringify(pulseGateFile)};
+      const bProgressSavedFile = ${JSON.stringify(bProgressSavedFile)};
+      const releaseBDevFile = ${JSON.stringify(releaseBDevFile)};
+      const bSummaryFile = ${JSON.stringify(bSummaryFile)};
+
+      const liveSteersReceived: string[] = [];
+      let reviewerPrompt = "";
+      const tools = new Map<string, any>();
+      const handlers = new Map<string, Array<(...args: any[]) => any>>();
+      const pi: any = {
+        cwd,
+        on(ev: string, fn: any) { handlers.set(ev, [...(handlers.get(ev) ?? []), fn]); },
+        registerTool(t: any) { tools.set(t.name, t); },
+        registerCommand() {},
+        registerMessageRenderer() {},
+        getAllTools: () => [{ name: "read" }, { name: "write" }, { name: "bash" }],
+        setActiveTools: async () => {},
+        sendMessage() {},
+      };
+
+      const runner = {
+        async runRoleTurn(stepCtx: any) {
+          const stageId = stepCtx.stageId ?? stepCtx.role.id;
+          if (stepCtx.role.id === "dev") {
+            stepCtx.observer?.bindControls?.({
+              steer: async (m: string) => { liveSteersReceived.push(m); },
+              abort: async () => {},
+            }, stageId);
+            writeFileSync(bReadyFile, JSON.stringify({ pid: process.pid, stageId }), "utf8");
+            while (!existsSync(pulseGateFile)) await Bun.sleep(15);
+            // Trigger multiple progress/tool checkpoint saves in Window B AFTER Window A sent steers!
+            for (let i = 1; i <= 3; i++) {
+              stepCtx.observer?.onToolEnd?.(stageId, {
+                toolCallId: "b-dev-" + i, toolName: "read", isError: false,
+                touchedPaths: [], timestamp: new Date().toISOString(), summary: "read step " + i,
+              });
+              await stepCtx.observer?.drainPendingSteers?.({ roleId: "dev", stageId, phase: "mid_stage" });
+            }
+            writeFileSync(bProgressSavedFile, "saved\\n", "utf8");
+            while (!existsSync(releaseBDevFile)) await Bun.sleep(15);
+            await stepCtx.observer?.drainPendingSteers?.({ roleId: "dev", stageId, phase: "mid_stage" });
+            stepCtx.observer?.bindControls?.(null, stageId);
+            const call = { toolCallId: "b-dev-ok", toolName: "read", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+            const env = createAndVerifyHandoff({
+              store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
+              parentHandoffId: stepCtx.upstreamHandoff?.id ?? null, toTarget: stepCtx.toTarget,
+              verdict: "ready", summary: "Window B dev finished", observedCalls: [call],
+            });
+            return { envelope: env, observedCalls: [call], assistantText: "dev ok", usage: null };
+          }
+          reviewerPrompt = stepCtx.conditioningPrompt;
+          const revCall = { toolCallId: "b-rev-ok", toolName: "read", isError: false, touchedPaths: [], timestamp: new Date().toISOString() };
+          const env = createAndVerifyHandoff({
+            store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
+            parentHandoffId: stepCtx.upstreamHandoff?.id ?? null, toTarget: stepCtx.toTarget,
+            verdict: "ready", summary: "Window B reviewer finished", observedCalls: [revCall],
+          });
+          return { envelope: env, observedCalls: [revCall], assistantText: "rev ok", usage: null };
+        },
+      };
+
+      ompEnhance(pi, { builtinRolesDir, globalRolesDir: globalDir, pluginLockPath: lockPath, runnerFactory: () => runner });
+      const res = JSON.parse((await tools.get("enhance_flow")!.execute("res-b", {
+        action: "resume", flowId: flowXId, wait: true,
+      }, null, null, { cwd, hasUI: false })).content[0].text);
+      writeFileSync(bSummaryFile, JSON.stringify({ status: res.status, liveSteersReceived, reviewerPrompt }), "utf8");
+      for (const fn of handlers.get("session_shutdown") ?? []) await fn({}, { cwd });
+    `;
+
+    const childB = Bun.spawn([process.execPath, "-e", workerScript], { stdout: "pipe", stderr: "pipe" });
+    try {
+      for (let i = 0; i < 120 && !existsSync(bReadyFile); i++) await Bun.sleep(25);
+      expect(existsSync(bReadyFile)).toBe(true);
+      const bInfo = JSON.parse(readFileSync(bReadyFile, "utf8")) as { pid: number; stageId: string };
+      expect(bInfo.pid).not.toBe(process.pid);
+
+      // 3. Repro (a): Window A steers WITHOUT flowId while Window B is executing Flow X!
+      const steerNoId = JSON.parse((await winA.tools.get("enhance_flow")!.execute("st-noid", {
+        action: "steer", message: "A_OMITTED_ID_REPLY_WAL",
+      }, null, null, ctxA)).content[0].text);
+      expect(steerNoId).toMatchObject({
+        ok: true, flowId: flowXId, deliveryState: "saved_pending_delivery",
+        delivered: false, savedToCheckpoint: true, status: "running",
+      });
+
+      // Verify Window B's lease & running checkpoint are 100% intact AND a 3rd executor Y is blocked!
+      const inspectMid = new EnhanceStore(path.join(cwd, ".omp-enhance", "state.sqlite"));
+      try {
+        const leaseMid = inspectMid.getProjectFlowLease();
+        expect(leaseMid?.flowId).toBe(flowXId);
+        expect(leaseMid?.ownerPid).toBe(bInfo.pid);
+        expect(inspectMid.getFlowCheckpoint(flowXId)?.status).toBe("running");
+      } finally {
+        inspectMid.close();
+      }
+
+      const executorY = createHarness({ cwd, globalDir, lockPath, runner: pauseRunnerA });
+      const yAttempt = await executorY.tools.get("enhance_flow")!.execute("start-y", {
+        roles: ["dev"], goal: "Intruder Y",
+      }, null, null, { cwd, hasUI: false });
+      expect(yAttempt.isError).toBe(true);
+      expect(JSON.parse(yAttempt.content[0].text)).toMatchObject({
+        started: false, busy: true, activeFlowId: flowXId, ownerPid: bInfo.pid,
+      });
+      await executorY.emit("session_shutdown", {}, { cwd });
+
+      // 4. Repro (b): Window A steers WITH explicit flowId=X (+ directed [@reviewer] steer), then Window B saves progress 3 times!
+      const steerExplicit = JSON.parse((await winA.tools.get("enhance_flow")!.execute("st-exp", {
+        action: "steer", flowId: flowXId, message: "A_EXPLICIT_ID_REPLY_STRICT",
+      }, null, null, ctxA)).content[0].text);
+      expect(steerExplicit).toMatchObject({
+        ok: true, flowId: flowXId, deliveryState: "saved_pending_delivery", delivered: false, savedToCheckpoint: true,
+      });
+      await winA.tools.get("enhance_flow")!.execute("st-rev", {
+        action: "steer", flowId: flowXId, message: "[@reviewer] CHECK_WAL_LOCKING",
+      }, null, null, ctxA);
+
+      writeText(pulseGateFile, "go\n");
+      for (let i = 0; i < 120 && !existsSync(bProgressSavedFile); i++) await Bun.sleep(25);
+      expect(existsSync(bProgressSavedFile)).toBe(true);
+
+      // Verify steers survived Window B's 3 progress saves (NEVER wiped to 0!) and dev steers are consumed once while @reviewer stays pending!
+      const inspectAfterSave = new EnhanceStore(path.join(cwd, ".omp-enhance", "state.sqlite"));
+      try {
+        const cpAfterSave = inspectAfterSave.getFlowCheckpoint(flowXId)!;
+        expect(cpAfterSave.status).toBe("running");
+        expect(cpAfterSave.userSteers?.map((s) => s.text)).toEqual([
+          "A_OMITTED_ID_REPLY_WAL",
+          "A_EXPLICIT_ID_REPLY_STRICT",
+          "CHECK_WAL_LOCKING",
+        ]);
+        const dbSteers = inspectAfterSave.listFlowSteers(flowXId);
+        expect(dbSteers).toHaveLength(3);
+        expect(dbSteers[0]?.consumedByStage).toBe(bInfo.stageId);
+        expect(dbSteers[1]?.consumedByStage).toBe(bInfo.stageId);
+        expect(dbSteers[2]?.consumedAt).toBeNull();
+      } finally {
+        inspectAfterSave.close();
+      }
+
+      // 5. Release Window B's dev stage -> reviewer runs and consumes [@reviewer] steer -> Flow X completes!
+      writeText(releaseBDevFile, "done\n");
+      const exitCode = await childB.exited;
+      const stderrText = await new Response(childB.stderr).text();
+      expect({ exitCode, stderrText }).toEqual({ exitCode: 0, stderrText: "" });
+
+      const bSummary = JSON.parse(readFileSync(bSummaryFile, "utf8")) as {
+        status: string; liveSteersReceived: string[]; reviewerPrompt: string;
+      };
+      expect(bSummary.status).toBe("completed");
+      // Each dev-applicable steer was delivered to dev's live controls EXACTLY ONCE!
+      expect(bSummary.liveSteersReceived).toEqual([
+        "A_OMITTED_ID_REPLY_WAL",
+        "A_EXPLICIT_ID_REPLY_STRICT",
+      ]);
+      expect(bSummary.reviewerPrompt).toContain("A_OMITTED_ID_REPLY_WAL");
+      expect(bSummary.reviewerPrompt).toContain("A_EXPLICIT_ID_REPLY_STRICT");
+      expect(bSummary.reviewerPrompt).toContain("[@reviewer] CHECK_WAL_LOCKING");
+
+      const finalStore = new EnhanceStore(path.join(cwd, ".omp-enhance", "state.sqlite"));
+      try {
+        expect(finalStore.getProjectFlowLease()).toBeNull();
+        const finalSteers = finalStore.listFlowSteers(flowXId);
+        expect(finalSteers).toHaveLength(3);
+        expect(finalSteers.every((s) => Boolean(s.consumedAt && s.consumedByStage))).toBe(true);
+        expect(finalSteers[2]?.consumedByStage).toContain("reviewer");
+      } finally {
+        finalStore.close();
+      }
+    } finally {
+      if (childB.exitCode === null) { try { childB.kill(); } catch {} }
+      await winA.emit("session_shutdown", {}, ctxA);
+    }
   });
 });

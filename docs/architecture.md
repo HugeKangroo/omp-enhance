@@ -35,10 +35,10 @@ flowchart TB
         Entry["src/entry.ts (生命周期协调器)"]
         OMP["src/omp/{hub,trust,workspace,session,tools,flow-tool,commands}.ts (跨项目池 / 信任隔离 / 3 命令)"]
         UI["src/ui/{kit,role-studio,flow-room}.ts (Role Studio 与跨项目只读监控窗)"]
-        Flow["src/flow/{tracker,handoff,state,orchestrator}.ts (交接门禁、租约互斥、挂起与返修编排)"]
-        Jobs["src/jobs/{runner,supervisor}.ts (预登记后台长作业与自适应巡检)"]
+        Flow["src/flow/{tracker,handoff,state,orchestrator}.ts (交接门禁、租约栅栏、挂起与返修编排)"]
+        Jobs["src/jobs/{runner,supervisor}.ts (GO 握手幂等后台作业与自适应巡检)"]
         Roles["src/roles/{serializer,loader,conditioning}.ts (YAML 序列化、角色发现与总控条件块)"]
-        Core["src/core/{types,fs,store-schema,store,policy,settings}.ts (契约、流式哈希、SQLite 7 表、策略)"]
+        Core["src/core/{types,fs,store-schema,store,policy,settings}.ts (契约、流式哈希、SQLite 8 表、单一设置)"]
     end
 
     P --> Roles
@@ -62,30 +62,31 @@ flowchart TB
 
 | 层级与模块 | 核心职责 | 严守边界 |
 | --- | --- | --- |
-| `src/core/types.ts` | 共享纯数据类型契约（含 `dispatch`、`internal`、`digestKind`、`requiredTools`/`requiredArtifacts`、`host_error`/`missing_handoff`） | 零外部模块依赖与运行时副作用 |
+| `src/core/types.ts` | 共享纯数据类型契约（含 `dispatch`、`internal`、`digestKind`、`verificationEvidence`、`requireTestExecution`/`requireAlgoDeliverables`、`host_error`/`missing_handoff`） | 零外部模块依赖与运行时副作用 |
 | `src/core/fs.ts` | 遵循 `.gitignore` 的 64 KiB 分块流式 `sha256`（`<= 512 MiB`）与 `stat_fingerprint` 快照、符号链接真实路径校验与 `.omp/` 完整性封印 | 区分真实内容摘要与元数据指纹，杜绝阻塞或伪装哈希 |
-| `src/core/{store-schema,store}.ts` | `bun:sqlite` WAL + `busy_timeout = 5000` **7 张表**事务存储（含 `project_leases` 执行互斥锁、按 `flowId` 精准留言/取消、自动写入 `.omp-enhance/.gitignore` `*`） | 纯读不建空库；`BEGIN IMMEDIATE` 跨进程防双跑 |
+| `src/core/{store-schema,store}.ts` | `bun:sqlite` WAL + `busy_timeout = 5000` **8 张表**事务存储（含 `project_leases` `lease_token` 栅栏、独立追加留言表 `flow_steers`、`idempotency_key` 作业复用与 `.omp-enhance/.gitignore`） | 纯读不建空库；`LeaseLostError` 阻止旧窗口覆写新持锁者 |
 | `src/core/policy.ts` | `dispatch` 总控事前拦截、内部角色过滤、`write`/`edit`/`apply_patch`/`ast_edit` 路径守卫与 `0ms` 惰性 `TurnTracker` | 前台与子会话共享单一权限真源 |
-| `src/core/settings.ts` | 读取 OMP 原生插件设置（默认 `defaultRole: null`、`flowRoutingMode: "auto"`，按目标目录独立校验 `isProjectTrusted`）及 `@<role>:thinking` 解析 | 与系统内置 `/settings → Plugins` 无缝互通 |
-| `src/roles/{serializer,loader,conditioning}.ts` | 无损 YAML 序列化（含 `required_tools`/`required_artifacts`）、三级角色发现与 `coordinator` 在途负载条件块渲染 | 单个损坏 YAML 绝不拖垮宿主钩子 |
-| `src/jobs/{runner,supervisor}.ts` | **先落库登记后派生进程**的原子 `.exit` 后台作业执行、启动异常可查记录、防 PID 复用信号终止（`cancelJobsByIds`）与竞态安全巡检 | 登记失败零副作用；启动失败可查询诊断 |
-| `src/flow/{tracker,handoff,state,orchestrator}.ts` | 行号越界与准出交付物硬校验、纯只读审计与混合交付链打回区分、创建前后三段取消屏障、`project_leases` 租约守卫与 `host_error` 故障归类 | 恢复前预验角色与租约；未执行开发阶段绝不误标完成 |
+| `src/core/settings.ts` | **单一原生设置源**：仅读取 OMP `/settings → Plugins → omp-enhance`（`omp-plugins.lock.json`）与受信任 `.omp/plugin-overrides.json`（历史 `.omp/enhance.yaml` 已退役告警） | 100% 复用 OMP 原生设置体系，零重复配置文件 |
+| `src/roles/{serializer,loader,conditioning}.ts` | 无损 YAML 序列化（含 `require_test_execution`/`require_algo_deliverables`）、三级角色发现与 `coordinator` 在途负载条件块渲染 | 单个损坏 YAML 绝不拖垮宿主钩子 |
+| `src/jobs/{runner,supervisor}.ts` | **四阶段 `stdin "GO"` 握手门禁**（预登记 → 阻塞派生 → 落盘真实 PID/指纹 → 写入 `"GO"` 放行）、`idempotencyKey` 幂等复用与竞态安全巡检 | 常规命令优先走 OMP 原生 `bash`/`bg_*`；`enhance_job` 专管跨重启长作业且零孤儿副作用 |
+| `src/flow/{tracker,handoff,state,orchestrator}.ts` | `qa` 真实测试回执与 `algo` 实验血统硬核验、游标拉取消费 `flow_steers`、`lease_token` 版本栅栏、创建前后三段取消屏障与 `host_error` 故障归类 | 恢复前预验角色与租约；跨窗口留言每条严格只消费一次 |
 | `src/ui/{kit,role-studio,flow-room}.ts` | Kitty CSI-u 键盘解析、ANSI 安全截断折行、纯配置导向 Role Studio 与跨项目只读 `/flow` 监控面板 | 纯 UI 渲染，不含草稿误触框、SQLite 或子进程逻辑 |
-| `src/omp/{hub,trust,workspace,session,tools,flow-tool,commands}.ts` & `src/entry.ts` | 跨项目 `WorkspaceHub`、按目标目录独立的信任授权（`trusted-projects.json`）、按 `flowId` 精准路由、静默去重唤醒与 `/coord` / `/role` / `/flow` 三命令 | 零 `@oh-my-pi/` 私有导入；跨目录未确认信任前绝不启用对方 `.omp` 覆盖 |
+| `src/omp/{hub,trust,workspace,session,tools,flow-tool,commands}.ts` & `src/entry.ts` | 跨项目 `WorkspaceHub`、按目标目录独立的信任授权（`trusted-projects.json`）、区分“已保存 (`saved_pending_delivery`)”与“专员已收到 (`delivered_to_stage`)”留言路由及三命令 | 零 `@oh-my-pi/` 私有导入；跨目录未确认信任前绝不启用对方 `.omp` 覆盖 |
 
 ---
 
-## 3. 任务身份隔离、跨进程租约互斥与跨目录信任边界
+## 3. 任务身份隔离、跨窗口追加式留言与原生能力复用
 
-1. **按 `flowId` 精准寻址与跨进程 SQLite 租约互斥（P1-1 & P1-2）**
-   - 每个目标项目通过 `project_leases` 表（`BEGIN IMMEDIATE` 事务 + `owner_pid` / `owner_start_token` 存活核验）授予唯一活跃执行权：无论同一进程内多个实例还是两个独立 `omp` 终端同时向同一目录派单，最多只有一个 Flow 获得 `running` 执行权；属主进程崩溃后自动将其残留 `running` 记录转为 `interrupted` 并移交租约。
-   - 当同项目的 Flow `A` 挂起于 `waiting_input`、随后启动 Flow `B` 时，通过 `enhance_flow` 或 `/flow cancel <flowId>` 按 `A` 的 ID 执行 `status`、`steer`、`cancel` 或 `resume` 均严格作用于 `A` 的检查点记录——绝不误读或误停正在运行的 `B`；若 `B` 仍持有租约时请求恢复 `A`，系统先保存用户对 `A` 的答复，再明确返回 `busy: true` 与当前占用者 `activeFlowId`，待 `B` 释放后 `A` 从原挂起阶段继续。
-2. **创建前后三段取消屏障与恢复前预校验（P1-3 & P2-3）**
-   子阶段在 `createAgentSession` 调用前、返回后（若已取消立即 `dispose()` 且零次 `prompt()`）及首轮模型执行中全程绑定取消信号，杜绝“取消已返回成功仍跑出首轮请求”。执行 `resume` 进入 `running` 状态与占用租约前，预先校验检查点可恢复性与整条 `roleChain` 角色完整性——若自定义角色已被误删，诊断报错的同时保持原检查点可重试且零租约残留。
-3. **跨目录独立信任门禁（P1-6：`src/omp/trust.ts`）**
-   从受信任主目录 `A` 跨目录派单至目录 `B` 时，绝不沿用 `A` 的信任状态：若宿主未对 `B` 提供路径级信任确认且用户未通过 `/coord trust <B>` 授权（持久化于 `~/.omp/enhance/trusted-projects.json`），`B` 默认以 `isProjectTrusted = false` 运行（仅加载内置与全局角色/设置，跳过 `B/.omp/*` 并给出明确提示）。
-4. **静默去重唤醒与混合链完成判定（P1-4）**
-   纯只读审计链（如单跑 `reviewer` 或 `planner → reviewer`）给出 `verdict: "rejected"` 时作为“审计完成且发现阻断项”收束为 `status: "completed"`；而包含待执行可写交付阶段的混合链（如 `planner → dev → qa` 中 `planner` 首轮返回 `rejected`）严禁提前宣称完成，统一进入 `status: "blocked"` 并保持 `Mandate` 为 `active`。后台事件通过 `display: false` + `pendingWakeups` 去重合并唤醒 `coordinator`。
+1. **按 `flowId` 精准寻址、`lease_token` 栅栏与跨窗口追加留言表 `flow_steers`（P1-1 & P1-2 & GPT #1）**
+   - 每个目标项目通过 `project_leases` 表授予带唯一 `lease_token` 与递增 `state_version` 的活跃执行权：所有检查点写入与释放均在同一事务内核对 `expectedLeaseToken`（不匹配即抛出 `LeaseLostError`），彻底杜绝已交出任务的旧窗口把陈旧快照写回或误释放新持锁窗口的租约。
+   - 用户答复与插话独立存入追加表 **`flow_steers`**（绝不触发旧窗口 `room.persist()` 覆写）：若目标任务正在本窗口执行，实时送达并标记已消费（`deliveryState: "delivered_to_stage"`）；若任务正在另一窗口运行或处于挂起态，仅追加落库并返回 `deliveryState: "saved_pending_delivery"`，由持锁执行窗口在阶段前与运行中按游标拉取并幂等标记 `consumed_at`（跨保存进度与进程重启不丢失、不重复消费）。
+2. **OMP 原生能力优先复用与 `enhance_job` 四阶段握手去重（GPT #2）**
+   - **配置零重复**：插件设置统一收敛至 OMP 原生 `/settings → Plugins → omp-enhance` 与 `.omp/plugin-overrides.json`，不再维护独立 `.omp/enhance.yaml`。
+   - **作业职责正交**：常规验证命令与同会话短异步作业直接使用 OMP 原生 `bash`、`bg_*` 与 `/jobs`；`enhance_job` 仅面向跨终端重启的脱机长时作业，子进程在收到父进程完成真实 `pid` 与启动指纹落库后发出的 `"GO\n"` 信号前绝不执行用户命令，并支持通过 `idempotencyKey` 在中断续跑时自动复用已有运行/完成作业（`reused: true`）。
+3. **创建前后三段取消屏障与恢复前预校验（P1-3 & P2-3）**
+   子阶段在 `createAgentSession` 调用前、返回后（若已取消立即 `dispose()` 且零次 `prompt()`）及首轮模型执行中全程绑定取消信号。执行 `resume` 前预先校验检查点状态、租约空闲及 `roleChain` 角色完整性。
+4. **可复验交付证据、跨目录信任门禁与混合链完成判定（P1-4 & P1-6 & GPT #3）**
+   `qa` 结项强制核验本轮真实测试/检查命令回执并固化 `verificationEvidence`（含 `testedTreeFingerprint`）；`algo` 结项强制核验非空 `REPORT.md` 与带实验血统且本轮产出的合法 JSON `metrics.json`（允许显式声明 `reusedBaseline: true` 复用历史基线对照）。外部目标目录默认不继承主目录信任状态（须经 `/coord trust <B>` 授权）；混合交付链上游只读角色返回 `rejected` 时进入 `status: "blocked"` 而非提前完结。
 
 ---
 

@@ -94,15 +94,13 @@ export function resolveDefaultGlobalRolesDir(explicitProfile?: string): string {
   return path.join(homedir(), ".omp", "enhance", "roles");
 }
 
-function readRecord(
+function readJsonRecord(
   filePath: string,
-  yaml = false,
   onWarning?: (warning: string) => void,
 ): Record<string, unknown> | null {
   if (!existsSync(filePath)) return null;
   try {
-    const raw = readFileSync(filePath, "utf8");
-    const parsed: unknown = yaml ? Bun.YAML.parse(raw) : JSON.parse(raw);
+    const parsed: unknown = JSON.parse(readFileSync(filePath, "utf8"));
     return parsed && typeof parsed === "object" && !Array.isArray(parsed)
       ? (parsed as Record<string, unknown>)
       : null;
@@ -159,13 +157,14 @@ function applyRawPatch(target: EnhanceSettings, raw: unknown): void {
 export function loadEnhanceSettings(options: LoadEnhanceSettingsOptions): EnhanceSettings {
   const effective: EnhanceSettings = { ...DEFAULT_ENHANCE_SETTINGS };
   const lockPath = options.pluginLockPath ?? resolveDefaultPluginLockPath(options.profile);
-  const lock = readRecord(lockPath, false, options.onWarning);
+  const lock = readJsonRecord(lockPath, options.onWarning);
   applyRawPatch(effective, (lock?.settings as Record<string, unknown> | undefined)?.[PLUGIN_NAME]);
 
+  const enhanceYaml = path.join(options.cwd, ".omp", "enhance.yaml");
+  const enhanceYml = path.join(options.cwd, ".omp", "enhance.yml");
   if (options.isProjectTrusted === false) {
-    const enhanceYaml = path.join(options.cwd, ".omp", "enhance.yaml");
     const localOverrides = path.join(options.cwd, ".omp", "plugin-overrides.json");
-    if (existsSync(enhanceYaml) || existsSync(localOverrides)) {
+    if (existsSync(localOverrides) || existsSync(enhanceYaml) || existsSync(enhanceYml)) {
       options.onWarning?.(
         `Skipped untrusted project settings in ${path.join(options.cwd, ".omp")} (workspace is not trusted).`,
       );
@@ -174,13 +173,15 @@ export function loadEnhanceSettings(options: LoadEnhanceSettingsOptions): Enhanc
   }
 
   for (const overrideFile of collectProjectOverrideFiles(options.cwd)) {
-    const proj = readRecord(overrideFile, false, options.onWarning);
+    const proj = readJsonRecord(overrideFile, options.onWarning);
     applyRawPatch(effective, (proj?.settings as Record<string, unknown> | undefined)?.[PLUGIN_NAME]);
   }
-  applyRawPatch(
-    effective,
-    readRecord(path.join(options.cwd, ".omp", "enhance.yaml"), true, options.onWarning),
-  );
+  const deprecatedFile = existsSync(enhanceYaml) ? enhanceYaml : (existsSync(enhanceYml) ? enhanceYml : null);
+  if (deprecatedFile) {
+    options.onWarning?.(
+      `Deprecated config file ${deprecatedFile} is ignored; configure omp-enhance exclusively via OMP /settings → Plugins or .omp/plugin-overrides.json.`,
+    );
+  }
   return effective;
 }
 

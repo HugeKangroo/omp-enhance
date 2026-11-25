@@ -188,11 +188,24 @@ export function createOmpRoleSessionRunner(
         const calls = new Map<string, ObservedToolCall>();
         for (const call of childTracker.getObservedCalls()) calls.set(call.toolCallId, call);
         const messages: any[] = Array.isArray(childSession?.messages) ? childSession.messages : [];
+        const argsByCallId = new Map<string, unknown>();
+        for (const m of messages) {
+          if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
+          for (const part of m.content) {
+            if (part?.type === "toolCall" && typeof part.id === "string") argsByCallId.set(part.id, part.arguments ?? part.input ?? part.args);
+          }
+        }
+        const fallbackTracker = new TurnTracker();
         for (const m of messages) {
           if (m?.role !== "toolResult" || typeof m.toolCallId !== "string" || calls.has(m.toolCallId)) continue;
-          calls.set(m.toolCallId, {
+          const parsed = fallbackTracker.recordToolExecutionEnd(stepCtx.cwd, {
             toolCallId: m.toolCallId, toolName: typeof m.toolName === "string" ? m.toolName : "unknown",
-            isError: m.isError === true, touchedPaths: [], timestamp: typeof m.timestamp === "string" ? m.timestamp : new Date().toISOString(),
+            args: m.args ?? m.input ?? argsByCallId.get(m.toolCallId), result: m, output: m.output, details: m.details,
+            exitCode: typeof m.exitCode === "number" ? m.exitCode : undefined, isError: m.isError === true,
+          });
+          calls.set(m.toolCallId, {
+            ...parsed,
+            timestamp: typeof m.timestamp === "string" ? m.timestamp : parsed.timestamp,
           });
         }
         return [...calls.values()];
@@ -238,6 +251,7 @@ export function createOmpRoleSessionRunner(
               return { content: [{ type: "text", text: JSON.stringify({ handoff: envelope, delegated }, null, 2) }], ...(!delegated.ok ? { isError: true } : {}) };
             }
             submittedEnvelope = envelope;
+            stepCtx.observer?.bindControls?.(null, stageId);
             return { content: [{ type: "text", text: JSON.stringify(envelope, null, 2) }] };
           } catch (error) {
             if (error instanceof BoundaryViolationError) boundaryViolations.push(...error.violations);
@@ -249,20 +263,24 @@ export function createOmpRoleSessionRunner(
       const childGuardExt = (childPi: any): void => {
         childPi.on("tool_call", (ev: any) => {
           const toolName = ev.toolName ?? ev.name ?? "", input = ev.input ?? ev.args;
-          const decision = childTracker.checkToolCallAllowed(stepCtx.cwd, stepCtx.role, { toolName, input }, roles);
+          const decision = childTracker.checkToolCallAllowed(stepCtx.cwd, stepCtx.role, { toolName, input }, roles, "stage");
           return decision.block ? decision : undefined;
         });
         childPi.on("tool_execution_start", (ev: any) => {
           const toolName = ev.toolName ?? ev.name ?? "", input = ev.args ?? ev.input;
-          childTracker.recordToolExecutionStart(toolName, input);
+          childTracker.recordToolExecutionStart(toolName, input, ev.toolCallId ?? ev.id);
           stepCtx.observer?.onToolStart?.(stageId, summarizeToolCall(toolName, input));
+          void stepCtx.observer?.drainPendingSteers?.({ roleId: stepCtx.role.id, stageId, phase: "mid_stage" });
         });
         childPi.on("tool_execution_end", (ev: any) => {
           const call = childTracker.recordToolExecutionEnd(stepCtx.cwd, {
             toolCallId: ev.toolCallId ?? ev.id ?? "call", toolName: ev.toolName ?? ev.name ?? "unknown",
-            args: ev.args ?? ev.input, isError: Boolean(ev.isError ?? ev.result?.isError),
+            args: ev.args, input: ev.input, result: ev.result, output: ev.output, details: ev.details,
+            exitCode: typeof ev.exitCode === "number" ? ev.exitCode : undefined,
+            isError: Boolean(ev.isError ?? ev.result?.isError),
           });
           stepCtx.observer?.onToolEnd?.(stageId, call);
+          void stepCtx.observer?.drainPendingSteers?.({ roleId: stepCtx.role.id, stageId, phase: "mid_stage" });
         });
       };
 
@@ -315,6 +333,7 @@ export function createOmpRoleSessionRunner(
           steer: async (msg: string) => { await created.session.steer?.(`[User interjection in Flow room]: ${msg}`); },
           abort: async () => { await triggerSessionAbort(); },
         }, stageId);
+        await stepCtx.observer?.drainPendingSteers?.({ roleId: stepCtx.role.id, stageId, phase: "mid_stage" });
 
         const finish = (abortedBySupervisor: SupervisorDecision | null = null): RoleTurnOutcome => {
           const usage = extractSessionUsage(created.session);
@@ -339,6 +358,9 @@ export function createOmpRoleSessionRunner(
         const runTurn = async (control: SessionSupervisorControl): Promise<RoleTurnOutcome> => {
           try {
             await created.session.prompt(stepCtx.taskPrompt);
+            if (!submittedEnvelope) {
+              await stepCtx.observer?.drainPendingSteers?.({ roleId: stepCtx.role.id, stageId, phase: "mid_stage" });
+            }
             if (
               !control.aborted && !isCancelledNow() &&
               !submittedEnvelope && !lastAssistantErroredOrAborted(created.session)
@@ -360,6 +382,7 @@ export function createOmpRoleSessionRunner(
           initialDelayMs: supervisor.initialDelayMs, minIntervalMs: supervisor.minIntervalMs, maxIntervalMs: supervisor.maxIntervalMs,
           signal: stepCtx.signal,
           getPulse: () => {
+            void stepCtx.observer?.drainPendingSteers?.({ roleId: stepCtx.role.id, stageId, phase: "mid_stage" });
             const calls = collectObservedCalls(), handoffErrs = calls.filter((c) => c.toolName === "enhance_handoff" && c.isError).length;
             return {
               calls: calls.length, activeTool: childTracker.getActiveTool(),

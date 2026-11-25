@@ -1,6 +1,6 @@
 # 交接协议与 YAML 角色编写指南
 
-本文定义 `omp-enhance` 的纯 YAML 角色规范（`RoleSpec`）、三级角色发现与跨目录信任门禁、跨主体标准交接包（`HandoffEnvelope`）以及 SQLite **7 张表**持久化结构。
+本文定义 `omp-enhance` 的纯 YAML 角色规范（`RoleSpec`）、单一原生配置与跨目录信任门禁、跨主体标准交接包（`HandoffEnvelope`）以及 SQLite **8 张表**持久化结构。
 
 ---
 
@@ -55,10 +55,14 @@ permissions:
 exit:
   # 声明 ready 时，本轮是否必须至少有一次非报错的真实工具执行证据（默认 false）
   require_tool_evidence: true
-  # 可选：声明 ready 时必须在本轮非报错调用过的工具名列表（如 qa 要求 ["bash"]，非报错 bash 或 enhance_job 均可满足）
+  # 可选：声明 ready 时必须在本轮非报错调用过的工具名列表（如 qa 要求 ["bash"]）
   required_tools: ["bash"]
-  # 可选：声明 ready 时工作区快照必须存在的交付产物 glob 列表（如 algo 要求 ["algo_work/REPORT.md", "algo_work/runs/**/metrics.json"]，缺件时精确报错指出缺失模式）
+  # 可选：声明 ready 时强制核验本轮真实测试/类型检查命令完结且 exitCode === 0（如 qa 设为 true，拒绝 bash pwd/echo 或刚启动未完结的后台任务，并自动记录 verificationEvidence）
+  require_test_execution: true
+  # 可选：声明 ready 时工作区快照必须存在的交付产物 glob 列表（如 algo 要求 ["algo_work/REPORT.md", "algo_work/runs/**/metrics.json"]）
   required_artifacts: []
+  # 可选：声明 ready 时强制核验非空 REPORT.md 与本轮产出的合法 JSON 实验血统 metrics.json（如 algo 设为 true）
+  require_algo_deliverables: false
   # 交付前必须逐条核对的准出条件列表
   criteria:
     - 核心验收条件均有本轮真实测试运行记录支撑
@@ -121,20 +125,24 @@ exit:
 | `artifacts` | `ArtifactRecord[]` | 自动扫描工作区新增/修改/匹配交付文件并记录 `{ path, sha256, digestKind, byteSize, role }`：`<= 512 MiB` 文件采用 64 KiB 分块流式计算真实 `sha256`（`digestKind: "sha256"`），`> 512 MiB` 文件记录 `stat:<size>:<mtime>` 并明确标为 `digestKind: "stat_fingerprint"`；未变被审文件 `role` 标为 `"inspected"` |
 | `deletedFiles` | `string[] \| undefined` | 本阶段相对基线被删除的文件路径列表，随条件块同步告知下游 |
 | `verifiedFacts` | `{ claim, evidenceRef }[]` | 已验证结论列表，`evidenceRef` 必须命中本轮**非报错真实执行 `toolCallId`** 或有效工作区路径/行号选择器（带 `:line` / `:start-end` / `#Lstart-Lend` 行号引用时强制核验 `1 <= start <= end <= 文件实际总行数`，越界行号直接拒收） |
+| `verificationEvidence` | `VerificationEvidenceRecord[] \| undefined` | 当角色启用 `require_test_execution` 时自动记录的实测回执 `{ command, exitCode, outputSnippet, testedTreeFingerprint, toolCallId }`，绑定受测工作区完整文件树哈希指纹 |
 | `openRisks` | `string[]` | 诚实披露的未覆盖边界、已知限制或待下游重点核查的疑点 |
 | `feedbackForUpstream` | `string \| null` | 当 `verdict === "rejected"` 时必填最小复现步骤与期望/实际差异 |
 | `observedUsage` | `UsageSummary \| null` | 被动归一化的实测 `{ inputTokens, outputTokens, costUsd }`（不作阻断限制） |
 
 ---
 
-## 3. SQLite 持久化表结构 (`.omp-enhance/state.sqlite`)
+## 3. 单一原生设置与 SQLite **8 张表**持久化结构 (`.omp-enhance/state.sqlite`)
 
-每个目标项目下的 `.omp-enhance/state.sqlite` 按需惰性创建（纯只读查询不建空库、不脏写 WAL；首次建目录时自动写入 `.omp-enhance/.gitignore` `*`；跨子项目索引与信任记录分别存于 `~/.omp/enhance/{hub-projects,trusted-projects}.json`），启用 `PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;`，共包含 **7 张表**：
+**单一插件设置入口**：插件参数仅从 OMP 原生 `/settings → Plugins → omp-enhance`（`omp-plugins.lock.json`）及受信任工作区的 `.omp/plugin-overrides.json` 读取（历史 `.omp/enhance.yaml` 已退役停用并发出迁移提示）。
+
+每个目标项目下的 `.omp-enhance/state.sqlite` 按需惰性创建（纯只读查询不建空库、不脏写 WAL；首次建目录时自动写入 `.omp-enhance/.gitignore` `*`；跨子项目索引与信任记录分别存于 `~/.omp/enhance/{hub-projects,trusted-projects}.json`），启用 `PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;`，共包含 **8 张表**：
 
 1. **`mandates`**：保存原始目标、硬约束数组、验收标准数组、版本号 `rev`、状态（`active` | `completed` | `archived`）及 `session_id` / `flow_id` 作用域字段。
 2. **`epistemic_items`**：外键关联 `mandates(id)` 的认知黑板条目（`fact` | `hypothesis` | `inquiry` | `decision`）；`CHECK` 约束强制 `fact` 附带非空 `evidence_ref`。
 3. **`artifacts`**：外键关联 `mandates(id)`，按 `(mandate_id, path, sha256)` 记录文件指纹与 `digest_kind`（`"sha256"` 或 `"stat_fingerprint"`）。
-4. **`handoffs`**：外键关联 `mandates(id)`，完整持久化历次 `HandoffEnvelope`（含 `deleted_files`、`verified_facts`、`questions_for_user` 与 `observed_usage`）及父子链路。
-5. **`jobs`**：**先校验外键并落库登记（`pid=0, status="running"`）再派生子进程**——登记失败时零命令副作用，派生失败时记录 `[spawn_error]` 并置为 `status: "failed"` 可查询；正常作业通过原子 `.exit` 与进程启动指纹支撑跨重启对账。
-6. **`flow_runs`**：外键关联 `mandates(id)`，持久化各 `flow_id` 检查点（区分可恢复的 `waiting_input` / `interrupted` / `failed` 与不可恢复的 `violation`），支持通过 `appendFlowCheckpointSteer` 与 `cancelFlowCheckpoint` 按指定 `flowId` 独立留言或取消而不干扰同项目其他在途任务。
-7. **`project_leases`**：以 `BEGIN IMMEDIATE` 事务维护单项目执行互斥租约（`lease_key = 'active_flow'`, `flow_id`, `owner_pid`, `owner_start_token`, `acquired_at`），阻断跨进程或双实例同目录并发双跑，并在原属主进程异常退出后自动将孤儿 `running` 记录转为 `interrupted` 并安全移交执行权。
+4. **`handoffs`**：外键关联 `mandates(id)`，完整持久化历次 `HandoffEnvelope`（含 `deleted_files`、`verified_facts`、`verification_evidence`、`questions_for_user` 与 `observed_usage`）及父子链路。
+5. **`jobs`**：面向跨会话脱机长作业（常规命令优先使用 OMP 原生 `bash`/`bg_*`），采用**四阶段 `stdin "GO"` 握手**（先落库 `pid=0` → 派生阻塞子进程 → 持久化真实 `pid` 与 `process_start_token` → 发送 `"GO\n"` 放行执行；任一中间写库失败立即销毁管道终止子进程，零无记录副作用），并支持 `idempotency_key` 幂等复用在途或已完成作业。
+6. **`flow_runs`**：外键关联 `mandates(id)`，持久化各 `flow_id` 检查点及 `lease_token` / `state_version` 版本栅栏（非当前持锁 `lease_token` 的陈旧写回一律拒绝覆写）。
+7. **`flow_steers`**：外键级联关联 `flow_runs(flow_id)` 的**独立追加式留言表**（`seq`, `steer_id`, `flow_id`, `text`, `target_role`, `created_at`, `consumed_at`, `consumed_by_stage`），跨窗口留言纯追加不覆写快照，执行窗口按游标拉取并幂等消费。
+8. **`project_leases`**：以 `BEGIN IMMEDIATE` 事务维护单项目执行互斥租约（`lease_key = 'active_flow'`, `flow_id`, `owner_pid`, `owner_start_token`, `lease_token`, `acquired_at`），仅匹配的 `lease_token` 允许释放或更新执行态，并在原属主进程异常退出后自动移交执行权。

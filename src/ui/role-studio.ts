@@ -45,6 +45,8 @@ function stripRoleDraft(role: RoleSpec): Omit<RoleSpec, "source" | "filePath" | 
       requireToolEvidence: role.exit.requireToolEvidence,
       ...(role.exit.requiredTools ? { requiredTools: [...role.exit.requiredTools] } : {}),
       ...(role.exit.requiredArtifacts ? { requiredArtifacts: [...role.exit.requiredArtifacts] } : {}),
+      ...(role.exit.requireTestExecution !== undefined ? { requireTestExecution: role.exit.requireTestExecution } : {}),
+      ...(role.exit.requireAlgoDeliverables !== undefined ? { requireAlgoDeliverables: role.exit.requireAlgoDeliverables } : {}),
       criteria: [...role.exit.criteria],
     },
   };

@@ -129,9 +129,10 @@ async function executeJobParams(input: {
       store: input.store, cwd: input.cwd, command,
       mandateId: asString(input.params.mandateId) ?? input.defaultMandateId ?? null,
       hypothesisId: asString(input.params.hypothesisId),
+      idempotencyKey: asString(input.params.idempotencyKey),
     });
-    input.onJobStarted?.(job.jobId);
-    return { job };
+    if (!job.reused) input.onJobStarted?.(job.jobId);
+    return { job, ...(job.reused ? { reused: true } : {}) };
   }
   if (action === "list" || action === "reconcile") { reconcileJobs(input.store); return { jobs: input.store.listJobs() }; }
   if (action === "tail") {
@@ -148,10 +149,15 @@ async function executeJobParams(input: {
   if (action === "watch") {
     const jobId = asString(input.params.jobId), command = asString(input.params.command);
     const job = jobId ? input.store.getJob(jobId) : command
-      ? startBackgroundJob({ store: input.store, cwd: input.cwd, command, mandateId: asString(input.params.mandateId) ?? input.defaultMandateId ?? null, hypothesisId: asString(input.params.hypothesisId) })
+      ? startBackgroundJob({
+          store: input.store, cwd: input.cwd, command,
+          mandateId: asString(input.params.mandateId) ?? input.defaultMandateId ?? null,
+          hypothesisId: asString(input.params.hypothesisId),
+          idempotencyKey: asString(input.params.idempotencyKey),
+        })
       : null;
     if (!job) throw new Error(jobId ? `Unknown jobId "${jobId}".` : "enhance_job watch requires a jobId or command.");
-    if (!jobId) input.onJobStarted?.(job.jobId);
+    if (!jobId && !job.reused) input.onJobStarted?.(job.jobId);
     const supEnabled = input.settings.supervisorEnabled !== false && Boolean(input.supervisor);
     const delaySec = typeof input.params.initialDelaySec === "number" && Number.isFinite(input.params.initialDelaySec)
       ? Math.max(0, input.params.initialDelaySec) : input.settings.supervisorInitialDelaySec;
@@ -161,7 +167,7 @@ async function executeJobParams(input: {
       goal: asString(input.params.goal) ?? input.defaultGoal ?? job.command,
       initialDelayMs: delaySec * 1000, signal: input.signal,
     });
-    return { started: !jobId, ...result };
+    return { started: !jobId && !job.reused, ...(job.reused ? { reused: true } : {}), ...result };
   }
   throw new Error(`Unknown enhance_job action "${action}".`);
 }
@@ -190,7 +196,8 @@ export function buildStageCompanionTools(
       description: "Start, watch, list, reconcile, tail, or cancel background jobs inside this stage.",
       parameters: kit.obj({
         action: kit.en(["start", "watch", "list", "reconcile", "tail", "cancel"]),
-        command: kit.str(), jobId: kit.str(), mandateId: kit.str(), hypothesisId: kit.str(), initialDelaySec: kit.num(), goal: kit.str(),
+        command: kit.str(), jobId: kit.str(), mandateId: kit.str(), hypothesisId: kit.str(),
+        idempotencyKey: kit.str(), initialDelaySec: kit.num(), goal: kit.str(),
       }, ["action"]),
       async execute(_id: string, params: Record<string, unknown>, toolSignal?: unknown) {
         try {
@@ -310,7 +317,7 @@ export function registerEnhanceTools(pi: any, hub: WorkspaceHub): void {
     parameters: kit.obj({
       action: kit.en(["start", "watch", "list", "reconcile", "tail", "cancel"]),
       cwd: kit.str(), command: kit.str(), jobId: kit.str(), mandateId: kit.str(),
-      hypothesisId: kit.str(), initialDelaySec: kit.num(), goal: kit.str(),
+      hypothesisId: kit.str(), idempotencyKey: kit.str(), initialDelaySec: kit.num(), goal: kit.str(),
     }, ["action"]),
     async execute(params, ctx, signal) {
       try {

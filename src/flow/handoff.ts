@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import {
   diffSnapshots, findBoundaryViolations, matchesGlobList, normalizeRelPath, snapshotWorkspace,
@@ -9,56 +9,16 @@ import { hasWriteBoundary, isRoleReadOnly, isValidExecutionEvidence } from "../c
 import type { EnhanceStore } from "../core/store.ts";
 import type {
   ArtifactRecord, HandoffEnvelope, HandoffVerdict, Mandate, ObservedToolCall, RoleSpec,
-  UsageSummary, VerifiedFact,
+  UsageSummary, VerificationEvidenceRecord, VerifiedFact,
 } from "../core/types.ts";
+import {
+  countFileLines, extractEvidenceLineRange, isRecognizedTestCommand, MAX_LINE_CHECK_BYTES,
+  stripEvidenceSelectorAndNotes, verifyAlgoDeliverables, verifyQaTestExecution,
+} from "./evidence.ts";
+
+export { isRecognizedTestCommand };
 
 const TEST_GLOBS = ["test/**", "tests/**", "**/*.test.*", "**/*.spec.*"] as const;
-const MAX_LINE_CHECK_BYTES = 32 * 1024 * 1024;
-
-function stripTrailingEvidenceNotes(rawRef: string): string {
-  return rawRef
-    .trim()
-    .replace(/\s+\([^)]*\)\s*$/, "")
-    .replace(/\s+(?:—|--)\s+[\s\S]*$/, "")
-    .replace(/\s*;\s+[\s\S]*$/, "")
-    .trim();
-}
-
-function extractEvidenceLineRange(rawRef: string): { start: number; end: number; malformed?: boolean } | null {
-  const cleaned = stripTrailingEvidenceNotes(rawRef).replace(/:(?:raw|summary)$/i, "").trim();
-  const hashMatch = /#L(\d+)(?:-L?(\d+))?$/i.exec(cleaned);
-  if (hashMatch) {
-    const start = Number(hashMatch[1]), end = hashMatch[2] ? Number(hashMatch[2]) : start;
-    return { start, end, malformed: start < 1 || end < start };
-  }
-  const colonMatch = /:(\d+)(?:-(\d+))?(?::\d+)?$/.exec(cleaned);
-  if (colonMatch) {
-    const start = Number(colonMatch[1]), end = colonMatch[2] ? Number(colonMatch[2]) : start;
-    return { start, end, malformed: start < 1 || end < start };
-  }
-  return null;
-}
-
-function stripEvidenceSelectorAndNotes(rawRef: string): string {
-  let s = stripTrailingEvidenceNotes(rawRef);
-  let prev = "";
-  while (s && s !== prev) {
-    prev = s;
-    s = s
-      .replace(/:(?:raw|summary)$/i, "")
-      .replace(/#L\d+(?:-L?\d+)?$/i, "")
-      .replace(/:\d+(?:-\d+)?(?::\d+)?$/i, "")
-      .trim();
-  }
-  return s;
-}
-
-function countFileLines(filePath: string): number {
-  const raw = readFileSync(filePath, "utf8");
-  if (raw.length === 0) return 0;
-  const trimmedNewline = raw.endsWith("\n") ? raw.slice(0, -1) : raw;
-  return trimmedNewline.replace(/\r/g, "").split("\n").length;
-}
 
 export class BoundaryViolationError extends Error {
   readonly violations: string[];
@@ -112,7 +72,7 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
   if (input.verdict === "ready") {
     if (
       input.role.exit.requireToolEvidence &&
-      !observedCalls.some((call) => isValidExecutionEvidence(call.toolName, call.isError))
+      !observedCalls.some((call) => isValidExecutionEvidence(call.toolName, call.isError, call))
     ) {
       throw new Error(
         `Role "${input.role.id}" requires at least one successful non-companion tool execution before a ready handoff.`,
@@ -120,7 +80,9 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
     }
     const reqTools = !input.isConsultation ? (input.role.exit.requiredTools ?? []) : [];
     if (reqTools.length > 0) {
-      const okTools = new Set(observedCalls.filter((c) => !c.isError).map((c) => c.toolName));
+      const okTools = new Set(
+        observedCalls.filter((c) => isValidExecutionEvidence(c.toolName, c.isError, c)).map((c) => c.toolName),
+      );
       const missingTools = reqTools.filter((req) => !okTools.has(req) && !(req === "bash" && okTools.has("enhance_job")));
       if (missingTools.length > 0) {
         throw new Error(
@@ -141,15 +103,20 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
   }
 
   const afterPaths = [...after.keys()];
-  const candidates = new Set<string>(), deletedSet = new Set<string>();
+  const candidates = new Set<string>(), deletedSet = new Set<string>(), turnChangedSet = new Set<string>();
   if (input.baselineSnapshot) {
     const diff = diffSnapshots(input.baselineSnapshot, after);
-    for (const relPath of [...diff.added, ...diff.modified]) candidates.add(relPath);
+    for (const relPath of [...diff.added, ...diff.modified]) {
+      candidates.add(relPath);
+      turnChangedSet.add(relPath);
+    }
     for (const relPath of diff.deleted) deletedSet.add(relPath);
   }
+  const explicitRelPaths = new Set<string>();
   for (const artifactPath of input.artifactPaths ?? []) {
     const rel = normalizeRelPath(path.relative(input.cwd, path.resolve(input.cwd, artifactPath)));
     if (!rel || rel === ".." || rel.startsWith("../")) continue;
+    explicitRelPaths.add(rel);
     if (after.has(rel)) candidates.add(rel);
     else if (input.baselineSnapshot?.has(rel)) deletedSet.add(rel);
   }
@@ -168,6 +135,19 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
     }
   }
 
+  let verificationEvidence: VerificationEvidenceRecord[] | undefined;
+  if (input.verdict === "ready" && !input.isConsultation && input.role.exit.requireTestExecution) {
+    verificationEvidence = verifyQaTestExecution(input.role.id, observedCalls, after, input.store);
+  }
+
+  const resolvedCwd = path.resolve(input.cwd);
+  if (input.verdict === "ready" && !input.isConsultation && input.role.exit.requireAlgoDeliverables) {
+    verifyAlgoDeliverables({
+      roleId: input.role.id, resolvedCwd, after, afterPaths,
+      hasBaselineSnapshot: Boolean(input.baselineSnapshot), turnChangedSet, explicitRelPaths,
+    });
+  }
+
   const artifacts: ArtifactRecord[] = [...candidates]
     .filter((relPath) => after.has(relPath))
     .map((relPath): ArtifactRecord => {
@@ -175,11 +155,16 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
       const beforeSha = input.baselineSnapshot?.get(relPath)?.sha256;
       const unchanged = beforeSha !== undefined ? beforeSha === entry.sha256 : isRoleReadOnly(input.role);
       const digestKind = entry.digestKind === "sha256" || entry.digestKind === "stat_fingerprint" ? entry.digestKind : undefined;
-      return {
-        path: relPath, sha256: entry.sha256, byteSize: entry.byteSize,
-        role: unchanged ? "inspected" : (matchesGlobList(relPath, TEST_GLOBS) ? "test" : "changed"),
-        ...(digestKind ? { digestKind } : {}),
-      };
+      const role = unchanged
+        ? "inspected"
+        : relPath === "algo_work/REPORT.md"
+          ? "report"
+          : matchesGlobList(relPath, ["algo_work/runs/**/metrics.json"])
+            ? "metrics"
+            : matchesGlobList(relPath, TEST_GLOBS)
+              ? "test"
+              : "changed";
+      return { path: relPath, sha256: entry.sha256, byteSize: entry.byteSize, role, ...(digestKind ? { digestKind } : {}) };
     })
     .sort((left, right) => left.path.localeCompare(right.path));
   const deletedFiles = [...deletedSet].sort();
@@ -192,14 +177,13 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
   const allowedEvidence = new Set<string>();
   const validCallIds: string[] = [];
   for (const call of observedCalls) {
-    if (isValidExecutionEvidence(call.toolName, call.isError)) {
+    if (isValidExecutionEvidence(call.toolName, call.isError, call)) {
       allowedEvidence.add(call.toolCallId);
       validCallIds.push(call.toolCallId);
     }
   }
   const hasValidTool = validCallIds.length > 0;
-  const priorMandateArtifacts = existingMandate ? input.store.listArtifacts(existingMandate.id) : [];
-  for (const artifact of [...artifacts, ...priorMandateArtifacts]) {
+  for (const artifact of [...artifacts, ...(existingMandate ? input.store.listArtifacts(existingMandate.id) : [])]) {
     const live = after.get(artifact.path);
     if (live && live.sha256 === artifact.sha256) {
       allowedEvidence.add(artifact.sha256);
@@ -207,7 +191,6 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
     }
   }
 
-  const resolvedCwd = path.resolve(input.cwd);
   const verifiedFacts = [...(input.verifiedFacts ?? [])];
   const lineCountCache = new Map<string, number>();
   for (const fact of verifiedFacts) {
@@ -226,11 +209,8 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
         } else {
           const normRel = normalizeRelPath(path.relative(resolvedCwd, absTarget));
           if (
-            normRel &&
-            normRel !== ".." &&
-            !normRel.startsWith("../") &&
-            normRel !== ".omp-enhance" &&
-            !normRel.startsWith(".omp-enhance/")
+            normRel && normRel !== ".." && !normRel.startsWith("../") &&
+            normRel !== ".omp-enhance" && !normRel.startsWith(".omp-enhance/")
           ) {
             const fileEntry = after.get(normRel);
             const fileAllowed = allowedEvidence.has(normRel) || (hasValidTool && fileEntry !== undefined);
@@ -272,6 +252,7 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
     parentHandoffId: input.parentHandoffId ?? null, fromRole: input.role.id,
     toTarget: input.toTarget ?? "user", verdict: input.verdict, summary, artifacts,
     ...(deletedFiles.length > 0 ? { deletedFiles } : {}), verifiedFacts,
+    ...(verificationEvidence ? { verificationEvidence } : {}),
     openRisks: [...(input.openRisks ?? [])],
     ...(questionsForUser.length > 0 ? { questionsForUser } : {}),
     feedbackForUpstream, observedUsage: input.observedUsage ?? null, createdAt: new Date().toISOString(),

@@ -97,8 +97,10 @@ export async function executeRoleStep(input: ExecuteRoleStepInput): Promise<Exec
   }
   const stageId = input.stageId ?? `${input.role.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   const before = snapshotWorkspace(input.cwd), beforeIntegrity = snapshotConfigIntegrity(input.cwd);
+  await input.observer?.drainPendingSteers?.({ roleId: input.role.id, stageId, phase: "pre_stage" });
   const epistemicItems = input.store.listEpistemicItems(input.mandate.id);
-  const userSteers = input.userSteers ?? input.observer?.getUserSteers?.() ?? [];
+  const userSteers = input.userSteers ?? input.observer?.getUserSteers?.() ??
+    (input.flowId ? input.store.listFlowSteers(input.flowId) : []);
   const conditioningPrompt = renderConditioningBlock({
     role: input.role, mandate: input.mandate, epistemicItems, upstreamHandoff: input.upstreamHandoff, userSteers,
   });

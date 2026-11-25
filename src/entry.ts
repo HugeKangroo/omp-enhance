@@ -121,6 +121,7 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
       ws.trackers.get(sessionKey(ctx)).recordToolExecutionStart(
         event?.toolName ?? event?.name ?? "",
         event?.args ?? event?.input,
+        event?.toolCallId ?? event?.id,
       );
     } catch {}
   });
@@ -131,7 +132,9 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
       if (!ws.getActiveRole(ctx)) return;
       ws.trackers.get(sessionKey(ctx)).recordToolExecutionEnd(ws.cwd, {
         toolCallId: event?.toolCallId ?? event?.id ?? "call", toolName: event?.toolName ?? event?.name ?? "unknown",
-        args: event?.args ?? event?.input, isError: Boolean(evHasError(event)),
+        args: event?.args, input: event?.input, result: event?.result, output: event?.output, details: event?.details,
+        exitCode: typeof event?.exitCode === "number" ? event.exitCode : undefined,
+        isError: Boolean(evHasError(event)),
       });
     } catch {}
   });

@@ -264,6 +264,12 @@ export function cloneRoleSpec(input: {
         ...(input.sourceRole.exit.requiredArtifacts
           ? { requiredArtifacts: [...input.sourceRole.exit.requiredArtifacts] }
           : {}),
+        ...(input.sourceRole.exit.requireTestExecution !== undefined
+          ? { requireTestExecution: input.sourceRole.exit.requireTestExecution }
+          : {}),
+        ...(input.sourceRole.exit.requireAlgoDeliverables !== undefined
+          ? { requireAlgoDeliverables: input.sourceRole.exit.requireAlgoDeliverables }
+          : {}),
         criteria: [...input.sourceRole.exit.criteria],
       },
     },

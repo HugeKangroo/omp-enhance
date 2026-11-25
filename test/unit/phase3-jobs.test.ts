@@ -390,4 +390,101 @@ describe("background jobs (src/jobs/runner.ts)", () => {
       store.close();
     }
   });
+
+  test("gates child execution on PID persistence handshake (all 4 fault points) and deduplicates retries via idempotencyKey (GPT #2)", async () => {
+    const cwd = tempDir();
+    const store = new EnhanceStore(path.join(cwd, "state.sqlite"));
+    const delayedMarker = path.join(cwd, "delayed-side-effect.marker");
+    const idemRunsLog = path.join(cwd, "idem-runs.log");
+
+    try {
+      const mandate = store.upsertMandate({ goal: "Idempotent training run" });
+
+      // Fault Point 1: pre-spawn initial DB save failure -> 0 files, 0 rows, 0 side effects
+      expect(() =>
+        startBackgroundJob({
+          store, cwd, mandateId: mandate.id, idempotencyKey: "exp-001",
+          command: `sleep 0.04 && printf "side_effect\\n" >> "${delayedMarker}"`,
+          onBeforeInitialSave() { throw new Error("fault-1: initial DB write failed"); },
+        }),
+      ).toThrow(/fault-1/);
+      expect(store.listJobs()).toHaveLength(0);
+
+      // Fault Point 2: spawn failure -> failed row (pid=0), 0 side effects
+      expect(() =>
+        startBackgroundJob({
+          store, cwd, mandateId: mandate.id, idempotencyKey: "exp-001",
+          command: `sleep 0.04 && printf "side_effect\\n" >> "${delayedMarker}"`,
+          spawnImpl: (() => { throw new Error("fault-2: spawn failed"); }) as unknown as typeof spawn,
+        }),
+      ).toThrow(/fault-2/);
+      expect(store.listJobs()[0]?.status).toBe("failed");
+
+      // Fault Point 3: real shell spawned, THEN PID persistence throws (both hook & real store.saveJob throw!)
+      // Without the stdin GO gate, `sleep 0.04 && printf ...` would write `delayedMarker`!
+      const origSaveJob = store.saveJob.bind(store);
+      let saveCallCount = 0;
+      store.saveJob = (job) => {
+        saveCallCount += 1;
+        if (saveCallCount === 2) throw new Error("fault-3: SQLite SQLITE_FULL on PID saveJob");
+        origSaveJob(job);
+      };
+      expect(() =>
+        startBackgroundJob({
+          store, cwd, mandateId: mandate.id, idempotencyKey: "exp-001",
+          command: `sleep 0.04 && printf "side_effect\\n" >> "${delayedMarker}"`,
+        }),
+      ).toThrow(/fault-3/);
+      store.saveJob = origSaveJob;
+
+      // Also test Fault Point 4a: failure right BEFORE sending "GO\n" release signal
+      expect(() =>
+        startBackgroundJob({
+          store, cwd, mandateId: mandate.id, idempotencyKey: "exp-001",
+          command: `sleep 0.04 && printf "side_effect\\n" >> "${delayedMarker}"`,
+          onBeforeRelease() { throw new Error("fault-4a: crashed before GO release"); },
+        }),
+      ).toThrow(/fault-4a/);
+
+      // Wait well past 40ms to prove NONE of the 4 faulted attempts executed the user command!
+      await Bun.sleep(160);
+      expect(existsSync(delayedMarker)).toBe(false);
+      reconcileJobs(store);
+      expect(store.listJobs("running")).toEqual([]);
+
+      // Fault Point 4b + LangGraph Idempotency: crash AFTER "GO\n" release -> job IS running/completed with real PID;
+      // retrying with the SAME idempotencyKey reuses the existing job instead of executing a second time!
+      expect(() =>
+        startBackgroundJob({
+          store, cwd, mandateId: mandate.id, idempotencyKey: "exp-001",
+          command: `sleep 0.08 && printf "run_ok\\n" >> "${idemRunsLog}"`,
+          onAfterRelease() { throw new Error("fault-4b: caller crashed right after GO release"); },
+        }),
+      ).toThrow(/fault-4b/);
+
+      const inFlight = store.findJobByIdempotencyKey("exp-001", mandate.id)!;
+      expect(inFlight.pid).toBeGreaterThan(0);
+
+      // Immediate retry while still running reuses the in-flight job!
+      const reusedWhileRunning = startBackgroundJob({
+        store, cwd, mandateId: mandate.id, idempotencyKey: "exp-001",
+        command: `sleep 0.08 && printf "run_ok\\n" >> "${idemRunsLog}"`,
+      });
+      expect(reusedWhileRunning.reused).toBe(true);
+      expect(reusedWhileRunning.jobId).toBe(inFlight.jobId);
+
+      await waitUntil(() => existsSync(inFlight.exitFilePath));
+      // Retry after completion ALSO reuses the completed job with zero duplicate execution!
+      const reusedAfterComplete = startBackgroundJob({
+        store, cwd, mandateId: mandate.id, idempotencyKey: "exp-001",
+        command: `printf "run_ok\\n" >> "${idemRunsLog}"`,
+      });
+      expect(reusedAfterComplete.reused).toBe(true);
+      expect(reusedAfterComplete.jobId).toBe(inFlight.jobId);
+      expect(reusedAfterComplete.status).toBe("completed");
+      expect(await Bun.file(idemRunsLog).text()).toBe("run_ok\n");
+    } finally {
+      store.close();
+    }
+  });
 });

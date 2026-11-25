@@ -160,6 +160,7 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
         const toolName = stepCtx.role.id === "qa" ? "bash" : "read";
         const call: ObservedToolCall = {
           toolCallId: `c-${runCount}`, toolName, isError: false,
+          ...(toolName === "bash" ? { command: "bun test", exitCode: 0 } : {}),
           touchedPaths: [], timestamp: new Date().toISOString(), summary: `${toolName} check`,
         };
         const envelope = createAndVerifyHandoff({
@@ -255,7 +256,7 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
         }
         qaConditioningPrompt = stepCtx.conditioningPrompt;
         const qaCall: ObservedToolCall = {
-          toolCallId: "qa-1", toolName: "bash", isError: false,
+          toolCallId: "qa-1", toolName: "bash", command: "bun test", exitCode: 0, isError: false,
           touchedPaths: [], timestamp: new Date().toISOString(), summary: 'bash "bun test"',
         };
         stepCtx.observer?.onToolEnd?.(stageId, qaCall);
@@ -305,6 +306,8 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
       action: "steer", message: "别动旧 RefreshToken 表",
     }, null, null, ctx)).content[0].text);
     expect(steerRes.delivered).toBe(true);
+    expect(steerRes.deliveryState).toBe("delivered_to_stage");
+    expect(steerRes.savedToCheckpoint).toBe(true);
     expect(steeredMessages).toEqual(["dev:别动旧 RefreshToken 表"]);
 
     // 2) Directed `[@qa]` steer while dev runs queues for qa WITHOUT distracting dev!
@@ -312,6 +315,7 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
       action: "steer", message: "[@qa] 重点压测过期边界",
     }, null, null, ctx)).content[0].text);
     expect(directedRes.delivered).toBe(false);
+    expect(directedRes.deliveryState).toBe("saved_pending_delivery");
     expect(directedRes.queuedForRole).toBe("qa");
     expect(steeredMessages).toEqual(["dev:别动旧 RefreshToken 表"]);
 
@@ -820,8 +824,17 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
                 expect(parsedConsult.delegated.ok).toBe(true);
                 expect(parsedConsult.delegated.envelope.summary).toContain("样本 #3/#7 真值框偏移");
 
-                writeText(path.join(cwd, "algo_work", "REPORT.md"), "# Algo Report\nMAE reduced by 32%\n");
-                writeText(path.join(cwd, "algo_work", "runs", "r1", "metrics.json"), '{"mae":0.068}\n');
+                writeText(
+                  path.join(cwd, "algo_work", "REPORT.md"),
+                  "# Algo Sensor Regression Report\nVisual badcase inspection removed dirty labels #3/#7 and reduced holdout MAE by 32%.\n",
+                );
+                writeText(
+                  path.join(cwd, "algo_work", "runs", "r1", "metrics.json"),
+                  JSON.stringify({
+                    experimentId: "r1", split: "holdout_v1", evaluatorVersion: "eval_v1.py",
+                    baseline: "exp_000", mae: 0.068,
+                  }) + "\n",
+                );
                 emitEnd("algo-opt-2", "bash", { command: "python eval_v1.py" });
                 await handoffTool.execute("ah-final", {
                   verdict: "ready",
@@ -1022,11 +1035,19 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
     expect(statusA.status).toBe("waiting_input");
     expect(statusA.resumable).toBe(true);
 
-    // 4. Steer A and attempt resume(A, message) while B holds the project execution lease -> B is 100% untouched!
+    // 4. Steer without flowId while > 1 non-terminal flows exist returns explicit disambiguation; steer(flowId=A) saves ONLY to A!
+    const ambigRaw = await flowTool.execute("st-ambig", {
+      action: "steer", message: "Ambiguous steer without flowId",
+    }, null, null, ctx);
+    expect(ambigRaw.isError).toBe(true);
+    expect(JSON.parse(ambigRaw.content[0].text)).toMatchObject({ ok: false, ambiguous: true, requiresFlowId: true });
+
     const steerA = JSON.parse((await flowTool.execute("st-a", {
       action: "steer", flowId: flowAId, message: "A_STEER_ONE",
     }, null, null, ctx)).content[0].text);
-    expect(steerA).toMatchObject({ ok: true, flowId: flowAId, delivered: false, savedToCheckpoint: true, status: "waiting_input" });
+    expect(steerA).toMatchObject({
+      ok: true, flowId: flowAId, deliveryState: "saved_pending_delivery", delivered: false, savedToCheckpoint: true, status: "waiting_input",
+    });
 
     const busyResumeA = JSON.parse((await flowTool.execute("res-a-busy", {
       action: "resume", flowId: flowAId, message: "A_STEER_TWO",

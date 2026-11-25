@@ -249,11 +249,26 @@ export function snapshotWorkspace(
   return snapshot;
 }
 
-/** Hash `.omp/roles/**`, `.omp/enhance.yaml`, and `.omp/plugin-overrides.json` for tamper detection. */
+/** Compute a deterministic 64-hex SHA-256 fingerprint over a workspace snapshot. */
+export function computeSnapshotFingerprint(snapshot: ReadonlyMap<string, SnapshotEntry>): string {
+  const hasher = new Bun.CryptoHasher("sha256");
+  const sortedPaths = [...snapshot.keys()].sort();
+  for (const relPath of sortedPaths) {
+    const entry = snapshot.get(relPath)!;
+    hasher.update(`${relPath}\0${entry.sha256}\n`);
+  }
+  return hasher.digest("hex");
+}
+
+export function computeWorkspaceFingerprint(cwd: string, options?: SnapshotWorkspaceOptions): string {
+  return computeSnapshotFingerprint(snapshotWorkspace(cwd, options));
+}
+
+/** Hash `.omp/plugin-overrides.json`, `.omp/roles/**`, and legacy `.omp/enhance.y*ml` for tamper detection. */
 export function snapshotConfigIntegrity(cwd: string): Map<string, SnapshotEntry> {
   const integrity = new Map<string, SnapshotEntry>();
   const nowMs = Date.now();
-  for (const relFile of [".omp/enhance.yaml", ".omp/plugin-overrides.json"]) {
+  for (const relFile of [".omp/plugin-overrides.json", ".omp/enhance.yaml", ".omp/enhance.yml"]) {
     const full = path.join(cwd, relFile);
     if (!existsSync(full)) continue;
     try {

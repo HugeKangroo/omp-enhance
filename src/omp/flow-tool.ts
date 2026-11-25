@@ -12,6 +12,8 @@ const asStringArray = (v: unknown): string[] | undefined => {
   return items.length > 0 ? items : undefined;
 };
 
+const NON_TERMINAL_FLOW_STATUSES = new Set(["running", "waiting_input", "interrupted", "failed"]);
+
 const toolResult = (payload: unknown, isError = false) => ({
   content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
   ...(isError ? { isError: true } : {}),
@@ -27,10 +29,10 @@ export async function executeCancelFlow(
 ): Promise<{ cancelled: boolean; cwd: string; flowId: string | null; status: string; reason?: string }> {
   const reqFlowId = params.flowId?.trim() || undefined;
   const reqCwd = params.cwd?.trim() || undefined;
-  const targetWs = hub.resolveFlowWorkspace(originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx, (w) => w.room.isRunning());
+  const targetWs = hub.resolveFlowWorkspace(originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx, (w) => w.room.hasActiveLeaseOwnership());
 
   if (reqFlowId) {
-    if (targetWs.room.isRunning() && targetWs.room.getSnapshot().flowId === reqFlowId) {
+    if (targetWs.room.hasActiveLeaseOwnership() && targetWs.room.getSnapshot().flowId === reqFlowId) {
       const cancelled = await targetWs.room.cancelActiveFlow(ctx);
       hub.syncGlobalUi(ctx, originWs);
       const snap = targetWs.room.getSnapshot();
@@ -51,11 +53,21 @@ export async function executeCancelFlow(
     };
   }
 
-  if (targetWs.room.isRunning()) {
+  if (targetWs.room.hasActiveLeaseOwnership()) {
     const cancelled = await targetWs.room.cancelActiveFlow(ctx);
     hub.syncGlobalUi(ctx, originWs);
     const snap = targetWs.room.getSnapshot();
     return { cancelled, cwd: targetWs.cwd, flowId: snap.flowId, status: snap.status };
+  }
+  const activeLease = !targetWs.store.isClosed() ? targetWs.store.getProjectFlowLease() : null;
+  if (activeLease) {
+    return {
+      cancelled: false,
+      cwd: targetWs.cwd,
+      flowId: activeLease.flowId,
+      status: "running",
+      reason: `Flow "${activeLease.flowId}" is actively running in another OMP window (pid=${activeLease.ownerPid}).`,
+    };
   }
   const snap = targetWs.room.getSnapshot();
   return {
@@ -107,7 +119,7 @@ export function registerFlowTool(
           if (reqFlowId) {
             const targetWs = hub.resolveFlowWorkspace(originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx);
             hub.markFlowSnapshotObserved(targetWs, reqFlowId);
-            if (targetWs.room.isRunning() && targetWs.room.getSnapshot().flowId === reqFlowId) {
+            if (targetWs.room.hasActiveLeaseOwnership() && targetWs.room.getSnapshot().flowId === reqFlowId) {
               return toolResult({ cwd: targetWs.cwd, ...targetWs.room.getSnapshot(), resumable: targetWs.room.isResumable() });
             }
             const cp = !targetWs.store.isClosed() ? targetWs.store.getFlowCheckpoint(reqFlowId) : null;
@@ -122,17 +134,25 @@ export function registerFlowTool(
           if (reqCwd) {
             const targetWs = hub.resolveTargetWorkspace(originWs, reqCwd, ctx);
             hub.markFlowSnapshotObserved(targetWs);
-            const roomSnap = targetWs.room.getSnapshot();
-            if (!roomSnap.flowId && !targetWs.store.isClosed()) {
+            if (!targetWs.room.hasActiveLeaseOwnership() && !targetWs.store.isClosed()) {
               const latest = targetWs.store.getLatestFlowCheckpoint();
-              if (latest) return toolResult({ cwd: targetWs.cwd, ...snapshotFromCheckpoint(latest, targetWs.cwd), resumable: isCheckpointResumable(latest) });
+              if (latest) {
+                return toolResult({
+                  cwd: targetWs.cwd, ...snapshotFromCheckpoint(latest, targetWs.cwd), resumable: isCheckpointResumable(latest),
+                  ...(targetWs.trustNotice ? { trustNotice: targetWs.trustNotice } : {}),
+                });
+              }
             }
-            return toolResult({ cwd: targetWs.cwd, ...roomSnap, resumable: targetWs.room.isResumable(), ...(targetWs.trustNotice ? { trustNotice: targetWs.trustNotice } : {}) });
+            return toolResult({
+              cwd: targetWs.cwd, ...targetWs.room.getSnapshot(), resumable: targetWs.room.isResumable(),
+              ...(targetWs.trustNotice ? { trustNotice: targetWs.trustNotice } : {}),
+            });
           }
           hub.markAllSettledFlowsObserved();
-          const originSnap = originWs.room.getSnapshot();
-          const latestOrigin = !originSnap.flowId && !originWs.store.isClosed() ? originWs.store.getLatestFlowCheckpoint() : null;
-          const baseSnap = latestOrigin ? snapshotFromCheckpoint(latestOrigin, originWs.cwd) : originSnap;
+          const latestOrigin = !originWs.room.hasActiveLeaseOwnership() && !originWs.store.isClosed()
+            ? originWs.store.getLatestFlowCheckpoint()
+            : null;
+          const baseSnap = latestOrigin ? snapshotFromCheckpoint(latestOrigin, originWs.cwd) : originWs.room.getSnapshot();
           const baseResumable = latestOrigin ? isCheckpointResumable(latestOrigin) : originWs.room.isResumable();
           return toolResult({
             cwd: originWs.cwd, ...baseSnap, resumable: baseResumable,
@@ -149,40 +169,53 @@ export function registerFlowTool(
           if (!perm.allowed) throw new Error(perm.reason);
           const msg = asString(params.message) ?? asString(params.goal);
           if (!msg) throw new Error("enhance_flow steer requires a message.");
-          const targetWs = hub.resolveFlowWorkspace(originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx, (w) => w.room.isRunning() || w.room.isResumable());
-          if (reqFlowId) {
-            if (targetWs.room.isRunning() && targetWs.room.getSnapshot().flowId === reqFlowId) {
-              const res = await targetWs.room.postUserSteer(msg, ctx);
-              const snap = targetWs.room.getSnapshot();
-              return toolResult({ ok: true, cwd: targetWs.cwd, flowId: snap.flowId, ...res, status: snap.status });
+          const targetWs = hub.resolveFlowWorkspace(
+            originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx,
+            (w) => w.room.hasActiveLeaseOwnership() || w.room.isResumable() ||
+              (!w.store.isClosed() && w.store.listFlowCheckpoints(20).some((c) => NON_TERMINAL_FLOW_STATUSES.has(c.status))),
+          );
+
+          let resolvedFlowId = reqFlowId;
+          if (!resolvedFlowId && !targetWs.store.isClosed()) {
+            const nonTerminal = targetWs.store.listFlowCheckpoints(50).filter((c) => NON_TERMINAL_FLOW_STATUSES.has(c.status));
+            if (nonTerminal.length > 1) {
+              const choices = nonTerminal.map((c) => `${c.flowId} [${c.status}: ${c.goal}]`).join("; ");
+              return toolResult({
+                ok: false, ambiguous: true, requiresFlowId: true, cwd: targetWs.cwd,
+                candidates: nonTerminal.map((c) => ({ flowId: c.flowId, status: c.status, goal: c.goal, roleChain: c.roleChain })),
+                error: `Multiple active/paused Flows exist in ${targetWs.cwd}; specify flowId (${choices}).`,
+              }, true);
             }
-            const { text: steerText, targetRole } = parseDirectedSteer(msg);
-            const updated = targetWs.store.appendFlowCheckpointSteer(reqFlowId, {
-              text: steerText, ...(targetRole ? { targetRole } : {}), createdAt: new Date().toISOString(),
-            });
-            targetWs.room.syncFromCheckpoint(updated, ctx);
-            return toolResult({
-              ok: true, delivered: false, savedToCheckpoint: true,
-              ...(targetRole ? { queuedForRole: targetRole } : {}),
-              cwd: targetWs.cwd, flowId: reqFlowId, status: updated.status, activeStageId: null,
-            });
+            if (nonTerminal.length === 1) resolvedFlowId = nonTerminal[0]!.flowId;
           }
-          if (targetWs.room.isRunning() || targetWs.room.getSnapshot().flowId) {
+          if (!resolvedFlowId) resolvedFlowId = targetWs.room.getSnapshot().flowId ?? undefined;
+          if (!resolvedFlowId) throw new Error(`No active or resumable Flow found in ${targetWs.cwd}.`);
+
+          if (targetWs.room.hasActiveLeaseOwnership() && targetWs.room.getSnapshot().flowId === resolvedFlowId) {
             const res = await targetWs.room.postUserSteer(msg, ctx);
             const snap = targetWs.room.getSnapshot();
-            return toolResult({ ok: true, cwd: targetWs.cwd, flowId: snap.flowId, ...res, status: snap.status });
+            return toolResult({ ok: true, cwd: targetWs.cwd, flowId: resolvedFlowId, ...res, status: snap.status });
           }
-          const latest = !targetWs.store.isClosed() ? targetWs.store.getLatestFlowCheckpoint() : null;
-          if (!latest) throw new Error(`No active or resumable Flow found in ${targetWs.cwd}.`);
+
           const { text: steerText, targetRole } = parseDirectedSteer(msg);
-          const updated = targetWs.store.appendFlowCheckpointSteer(latest.flowId, {
-            text: steerText, ...(targetRole ? { targetRole } : {}), createdAt: new Date().toISOString(),
-          });
-          targetWs.room.syncFromCheckpoint(updated, ctx);
+          const liveCp = !targetWs.store.isClosed() ? targetWs.store.getFlowCheckpoint(resolvedFlowId) : null;
+          if (!liveCp) throw new Error(`Unknown flowId "${resolvedFlowId}".`);
+          const appended = targetWs.store.appendFlowSteer(resolvedFlowId, { text: steerText, targetRole: targetRole ?? null });
+          if (!targetWs.room.isRunning() && targetWs.room.getSnapshot().flowId === resolvedFlowId && liveCp.status !== "running") {
+            const updatedCp = targetWs.store.getFlowCheckpoint(resolvedFlowId);
+            if (updatedCp) targetWs.room.syncFromCheckpoint(updatedCp, ctx);
+          }
           return toolResult({
-            ok: true, delivered: false, savedToCheckpoint: true,
+            ok: true,
+            deliveryState: "saved_pending_delivery",
+            delivered: false,
+            savedToCheckpoint: true,
+            steerId: appended.steerId,
             ...(targetRole ? { queuedForRole: targetRole } : {}),
-            cwd: targetWs.cwd, flowId: latest.flowId, status: updated.status, activeStageId: null,
+            cwd: targetWs.cwd,
+            flowId: resolvedFlowId,
+            status: liveCp.status,
+            activeStageId: null,
           });
         }
 
@@ -191,13 +224,14 @@ export function registerFlowTool(
           if (!perm.allowed) throw new Error(perm.reason);
           const targetWs = hub.resolveFlowWorkspace(
             originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx,
-            (w) => w.room.isResumable() || (!w.store.isClosed() && w.store.listFlowCheckpoints(10).some((cp) => isCheckpointResumable(cp))),
+            (w) => (!w.store.isClosed() && w.store.listFlowCheckpoints(10).some((cp) => isCheckpointResumable(cp))) || w.room.isResumable(),
           );
           targetWs.refresh(ctx);
           const targetFlowId = reqFlowId ?? (
-            targetWs.room.isResumable() && targetWs.room.getSnapshot().flowId
-              ? targetWs.room.getSnapshot().flowId
-              : (!targetWs.store.isClosed() ? targetWs.store.listFlowCheckpoints(10).find((c) => isCheckpointResumable(c))?.flowId ?? null : null)
+            !targetWs.store.isClosed()
+              ? (targetWs.store.listFlowCheckpoints(10).find((c) => isCheckpointResumable(c))?.flowId ??
+                  (targetWs.room.isResumable() ? targetWs.room.getSnapshot().flowId : null))
+              : (targetWs.room.isResumable() ? targetWs.room.getSnapshot().flowId : null)
           );
           if (!targetFlowId) throw new Error("当前没有可断点续跑的中断/失败 Flow。");
           const cp = !targetWs.store.isClosed() ? targetWs.store.getFlowCheckpoint(targetFlowId) : null;
@@ -207,19 +241,18 @@ export function registerFlowTool(
           const msg = asString(params.message);
           let savedReply = false;
           if (msg) {
-            if (!targetWs.room.isRunning() && targetWs.room.getSnapshot().flowId === targetFlowId) {
-              await targetWs.room.postUserSteer(msg, ctx);
+            const { text: steerText, targetRole } = parseDirectedSteer(msg);
+            if (!targetWs.store.isClosed() && cp) {
+              targetWs.store.appendFlowSteer(targetFlowId, { text: steerText, targetRole: targetRole ?? null });
+              const refreshed = targetWs.store.getFlowCheckpoint(targetFlowId);
+              if (refreshed) targetWs.room.syncFromCheckpoint(refreshed, ctx);
             } else {
-              const { text: steerText, targetRole } = parseDirectedSteer(msg);
-              const updated = targetWs.store.appendFlowCheckpointSteer(targetFlowId, {
-                text: steerText, ...(targetRole ? { targetRole } : {}), createdAt: new Date().toISOString(),
-              });
-              targetWs.room.syncFromCheckpoint(updated, ctx);
+              await targetWs.room.postUserSteer(msg, ctx);
             }
             savedReply = true;
           }
 
-          if (targetWs.room.isRunning() && targetWs.room.getSnapshot().flowId !== targetFlowId) {
+          if (targetWs.room.hasActiveLeaseOwnership() && targetWs.room.getSnapshot().flowId !== targetFlowId) {
             const activeFlowId = targetWs.room.getSnapshot().flowId ?? "unknown";
             return toolResult({
               started: false, resumed: false, busy: true, cwd: targetWs.cwd, flowId: targetFlowId,
@@ -259,7 +292,7 @@ export function registerFlowTool(
         });
         const perm = canRoleUseCompanionTool(activeRole, "enhance_flow", "start", roles);
         if (!perm.allowed) throw new Error(perm.reason);
-        if (targetWs.room.isRunning()) {
+        if (targetWs.room.hasActiveLeaseOwnership()) {
           const activeId = targetWs.room.getSnapshot().flowId ?? "unknown";
           return toolResult({
             error: `项目 ${targetWs.cwd} 已有正在运行的协作 Flow (${activeId})；可通过 steer 留言、/flow 查看或 cancel 取消。`,
@@ -286,7 +319,7 @@ export function registerFlowTool(
         }
 
         const flowId = `flow-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-        targetWs.store.acquireProjectFlowLease(flowId, process.pid);
+        const preflightLease = targetWs.store.acquireProjectFlowLease(flowId, process.pid);
         try {
           const mandate = goal ? targetWs.store.upsertMandate({ goal, flowId }) : existingMandate!;
           const initialHandoffId = asString(params.initialHandoffId);
@@ -304,8 +337,8 @@ export function registerFlowTool(
           hub.syncGlobalUi(ctx, originWs);
           return toolResult({ ...(started as object), ...(targetWs.trustNotice ? { trustNotice: targetWs.trustNotice } : {}) });
         } catch (startErr) {
-          if (!targetWs.room.isRunning() || targetWs.room.getSnapshot().flowId !== flowId) {
-            try { targetWs.store.releaseProjectFlowLease(flowId); } catch {}
+          if (!targetWs.room.hasActiveLeaseOwnership() || targetWs.room.getSnapshot().flowId !== flowId) {
+            try { targetWs.store.releaseProjectFlowLease(flowId, preflightLease.leaseToken); } catch {}
           }
           throw startErr;
         }

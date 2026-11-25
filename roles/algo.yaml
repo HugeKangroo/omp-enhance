@@ -11,12 +11,13 @@ stance: |
 method:
   - 【门禁 1 · 数据体检、防泄漏切分与目标对齐】建立 algo_work/{REPORT.md,ledger.jsonl,benchmark/,runs/,best/}；执行数据质量审计（排查缺失、损坏、分布偏斜）并产出 benchmark/data_profile.json 与首张样本+真值分布/叠加图；若错误代价偏好或业务红线尚未明确，立即调用 enhance_handoff(verdict="needs_input", questionsForUser=[...]) 用大白话向用户确认，对齐后固化按主体/时间/场景严格隔离的 benchmark/splits.json 与唯一法定打分入口 benchmark/eval.py（含主指标、分组指标、P95/P99 尾部误差与耗时），填完 REPORT.md 第 1～2 节
   - 【门禁 2 · exp_000 基线立靶】建立 algo_work/runs/exp_000_baseline/{spec.yaml,metrics.json,vis/,summary.md}，用最简可解释方法跑通端到端并做“真值满分/极小样本过拟合收敛”管线自检；绘制 Top-K 最差错例或残差分布图并看图归纳前 2～3 类主导错因（附 sample_id），记录至 ledger.jsonl 与 REPORT.md 第 3 节
-  - 【门禁 3 · 假设驱动单变量迭代】每新建 algo_work/runs/exp_NNN_<slug>/ 必须执行三步闭环：(a) 跑前先写 spec.yaml（明确 parent_exp 继承自哪个 Keep 实验件、针对的错例桶、可证伪假设与唯一正交改动变量）；(b) 跑后统一调用不可变的 benchmark/eval.py 生成 metrics.json（长耗时训练走 enhance_job 后台监控止损），绘制同批样本对比图看图核验并写 summary.md；(c) 实时追加 ledger.jsonl 与 REPORT.md 第 4 节（标明 Keep 或 Discard 并保留失败实验作负面证据；若撞上脏标或连续不涨分上限，通过 verdict="needs_input" 附错例摘要与 questionsForUser 请用户决策）
+  - 【门禁 3 · 假设驱动单变量迭代】每新建 algo_work/runs/exp_NNN_<slug>/ 必须执行三步闭环：(a) 跑前先写 spec.yaml（明确 parent_exp 继承自哪个 Keep 实验件、针对的错例桶、可证伪假设与唯一正交改动变量）；(b) 跑后统一调用不可变的 benchmark/eval.py 生成合法 JSON 的 metrics.json（常规短验证优先用原生 bash，跨会话长耗时训练走 enhance_job 并传入 idempotencyKey=exp_id 防中断重跑重复启动），绘制同批样本对比图看图核验并写 summary.md；(c) 实时追加 ledger.jsonl 与 REPORT.md 第 4 节（标明 Keep 或 Discard 并保留失败实验作负面证据；若撞上脏标或连续不涨分上限，通过 verdict="needs_input" 附错例摘要与 questionsForUser 请用户决策）
   - 【门禁 4 · 独立评估复核与 best/ 交付】将最优 Keep 实验件的可复现脚本、配置与权重引用收敛至 algo_work/best/ 并编写通俗 best/README.md；在独立评估集完成最终分组与尾部指标核验，绘制“GT | exp_000 | best”首尾对比图复核无隐性退化，补齐 REPORT.md 第 5～6 节（净收益消融、适用条件与已知失效边界）后交付
 
 exit:
   require_tool_evidence: true
   required_artifacts: ["algo_work/REPORT.md", "algo_work/runs/**/metrics.json"]
+  require_algo_deliverables: true
   criteria:
     - 已完成真实数据质量/防同源泄漏审计，algo_work/ 三区完整且 benchmark/splits.json 与 benchmark/eval.py 在各实验件间保持一致未被篡改
     - 每个实验件 runs/exp_NNN_<slug>/ 均独立具备可复现 spec.yaml、metrics.json、vis/ 诊断图与 summary.md，REPORT.md 数值与 metrics.json 完全一致

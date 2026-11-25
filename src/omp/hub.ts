@@ -294,7 +294,11 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
       } catch { return null; }
     },
     markFlowSnapshotObserved(ws: ManagedWorkspace, flowId?: string): void {
-      const cp = flowId && ws.room.getSnapshot().flowId !== flowId && !ws.store.isClosed() ? ws.store.getFlowCheckpoint(flowId) : null;
+      const ownsLive = ws.room.hasActiveLeaseOwnership();
+      const targetId = flowId ?? ws.room.getSnapshot().flowId;
+      const cp = targetId && (!ownsLive || ws.room.getSnapshot().flowId !== targetId) && !ws.store.isClosed()
+        ? ws.store.getFlowCheckpoint(targetId)
+        : null;
       const snap = cp ? snapshotFromCheckpoint(cp, ws.cwd) : ws.room.getSnapshot();
       const key = computeSettlementKey(snap);
       if (!key || !snap.flowId) return;
@@ -326,7 +330,7 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
       for (const ws of workspaces.values()) {
         let emittedForWs = 0;
         const roomSnap = ws.room.getSnapshot();
-        if (roomSnap.flowId) {
+        if (ws.room.hasActiveLeaseOwnership() && roomSnap.flowId) {
           out.push(toFlowSummary(ws.cwd, roomSnap, ws.room.isResumable()));
           seen.add(roomSnap.flowId); emittedForWs += 1;
         }
@@ -339,7 +343,7 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
             seen.add(cp.flowId); emittedForWs += 1;
           }
         }
-        if (emittedForWs === 0) out.push(toFlowSummary(ws.cwd, roomSnap, false));
+        if (emittedForWs === 0) out.push(toFlowSummary(ws.cwd, roomSnap, ws.room.isResumable()));
       }
       return out;
     },

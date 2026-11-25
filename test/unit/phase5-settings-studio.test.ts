@@ -62,7 +62,7 @@ describe("package.json omp.settings parity & native OMP settings loader", () => 
     expect(schema.supervisorThinking.default).toBe("inherit");
   });
 
-  test("merges lockfile < parent/project plugin-overrides < .omp/enhance.yaml, clamps bounds, supports --profile, and gates untrusted projects", () => {
+  test("uses OMP native lockfile + .omp/plugin-overrides.json exclusively, warns on deprecated .omp/enhance.yaml, clamps bounds, and gates untrusted projects", () => {
     const root = tempDir();
     const monorepoRoot = path.join(root, "repo");
     const cwd = path.join(monorepoRoot, "packages", "sub");
@@ -121,18 +121,32 @@ describe("package.json omp.settings parity & native OMP settings loader", () => 
       flowRoutingMode: "ask",
     });
 
+    // Deprecated .omp/enhance.yaml is IGNORED (never applied!) and emits a single clear deprecation warning
     writeText(path.join(cwd, ".omp", "enhance.yaml"), [
       "defaultRole: reviewer",
       "supervisorModel: openai-codex/gpt-6.1-sol",
       "flowMaxRepairRounds: 4",
     ].join("\n"));
-    expect(loadEnhanceSettings({ cwd, pluginLockPath: lockPath })).toMatchObject({
-      defaultRole: "reviewer",
-      supervisorModel: "openai-codex/gpt-6.1-sol",
-      flowMaxRepairRounds: 4,
+    const depWarnings: string[] = [];
+    const withDeprecatedYaml = loadEnhanceSettings({
+      cwd, pluginLockPath: lockPath, onWarning: (w) => depWarnings.push(w),
     });
+    expect(withDeprecatedYaml).toEqual({
+      defaultRole: null,
+      showStatusBar: false,
+      supervisorEnabled: false,
+      supervisorModel: "smol",
+      supervisorThinking: "xhigh",
+      supervisorInitialDelaySec: 600,
+      flowMaxRepairRounds: 0,
+      flowRoutingMode: "ask",
+    });
+    expect(depWarnings).toHaveLength(1);
+    expect(depWarnings[0]).toContain("Deprecated config file");
+    expect(depWarnings[0]).toContain("enhance.yaml");
+    expect(depWarnings[0]).toContain("plugin-overrides.json");
 
-    // Untrusted workspace (isProjectTrusted: false) ignores .omp/plugin-overrides.json & .omp/enhance.yaml!
+    // Untrusted workspace (isProjectTrusted: false) ignores .omp/plugin-overrides.json!
     const warnings: string[] = [];
     const untrusted = loadEnhanceSettings({
       cwd, pluginLockPath: lockPath, isProjectTrusted: false, onWarning: (w) => warnings.push(w),
@@ -142,13 +156,13 @@ describe("package.json omp.settings parity & native OMP settings loader", () => 
     expect(untrusted.supervisorEnabled).toBe(true);
     expect(warnings.some((w) => w.includes("not trusted"))).toBe(true);
 
-    // Malformed optional files degrade gracefully while emitting diagnostic warning
+    // Malformed plugin-overrides.json degrades gracefully while emitting diagnostic warning
     const parseWarnings: string[] = [];
-    writeText(path.join(cwd, ".omp", "enhance.yaml"), "::: invalid yaml ::: [");
+    writeText(path.join(cwd, ".omp", "plugin-overrides.json"), "{ invalid json");
     expect(loadEnhanceSettings({
       cwd, pluginLockPath: lockPath, onWarning: (w) => parseWarnings.push(w),
     }).defaultRole).toBeNull();
-    expect(parseWarnings.some((w) => w.includes("enhance.yaml"))).toBe(true);
+    expect(parseWarnings.some((w) => w.includes("plugin-overrides.json"))).toBe(true);
   });
 });
 
@@ -575,10 +589,13 @@ describe("Role Studio strict UI, glob parsing, coordinator/specialist grouping, 
     expect(savedAlgo.thinking).toBe("high");
     expect(savedAlgo.exit.requiredArtifacts).toEqual(["algo_work/REPORT.md", "algo_work/runs/**/metrics.json"]);
 
-    const clonedAlgo = cloneRoleSpec({ sourceRole: savedAlgo, newId: "algo-ts", targetDir: globalDir });
+    const builtinRoles = discoverRoles({ cwd, globalRolesDir: path.join(root, "empty-global"), builtinRolesDir });
+    const clonedAlgo = cloneRoleSpec({ sourceRole: builtinRoles.get("algo")!, newId: "algo-ts", targetDir: globalDir });
     expect(clonedAlgo.role.exit.requiredArtifacts).toEqual(["algo_work/REPORT.md", "algo_work/runs/**/metrics.json"]);
-    const clonedQa = cloneRoleSpec({ sourceRole: savedQa, newId: "qa-strict", targetDir: globalDir });
+    expect(clonedAlgo.role.exit.requireAlgoDeliverables).toBe(true);
+    const clonedQa = cloneRoleSpec({ sourceRole: builtinRoles.get("qa")!, newId: "qa-strict", targetDir: globalDir });
     expect(clonedQa.role.exit.requiredTools).toEqual(["bash"]);
+    expect(clonedQa.role.exit.requireTestExecution).toBe(true);
   });
 });
 

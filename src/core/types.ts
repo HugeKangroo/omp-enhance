@@ -44,6 +44,8 @@ export interface RoleExitSpec {
   requireToolEvidence: boolean;
   requiredTools?: string[];
   requiredArtifacts?: string[];
+  requireTestExecution?: boolean;
+  requireAlgoDeliverables?: boolean;
   criteria: string[];
 }
 
@@ -121,6 +123,14 @@ export interface UsageSummary {
   costUsd: number;
 }
 
+export interface VerificationEvidenceRecord {
+  command: string;
+  exitCode: number;
+  outputSnippet: string;
+  testedTreeFingerprint: string;
+  toolCallId: string;
+}
+
 export type HandoffVerdict = "ready" | "needs_input" | "rejected" | "blocked";
 
 export interface HandoffEnvelope {
@@ -135,6 +145,7 @@ export interface HandoffEnvelope {
   artifacts: ArtifactRecord[];
   deletedFiles?: string[];
   verifiedFacts: VerifiedFact[];
+  verificationEvidence?: VerificationEvidenceRecord[];
   openRisks: string[];
   questionsForUser?: string[];
   feedbackForUpstream: string | null;
@@ -149,6 +160,10 @@ export interface ObservedToolCall {
   touchedPaths: string[];
   timestamp: string;
   summary?: string;
+  command?: string;
+  exitCode?: number | null;
+  outputSnippet?: string;
+  isBackgroundLaunch?: boolean;
 }
 
 export interface RoomEntry {
@@ -235,6 +250,8 @@ export interface BackgroundJob {
   jobId: string;
   mandateId: string | null;
   hypothesisId: string | null;
+  idempotencyKey?: string | null;
+  reused?: boolean;
   command: string;
   cwd: string;
   pid: number;
@@ -250,9 +267,13 @@ export interface BackgroundJob {
 }
 
 export interface FlowUserSteer {
+  steerId?: string;
+  seq?: number;
   text: string;
   targetRole?: string | null;
   createdAt: string;
+  consumedAt?: string | null;
+  consumedByStage?: string | null;
 }
 
 export type FlowRoomStatus =
@@ -281,6 +302,8 @@ export interface PersistedFlowCheckpoint {
   updatedAt: string;
   ownerPid?: number | null;
   ownerStartToken?: string | null;
+  leaseToken?: string | null;
+  stateVersion?: number;
   nextStageSeq?: number;
   lastRejectionSig?: string | null;
   userSteers?: FlowUserSteer[];

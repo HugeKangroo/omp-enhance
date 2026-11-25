@@ -33,7 +33,7 @@ algo_work/
     └── ...                       # 最优 Keep 实验件的可复现推理入口与模型/参数副本
 ```
 
-长耗时训练或超参搜索在 `algo` 阶段中可调用 `enhance_job`（`start` / `watch`：跨会话持久化、`@advisor` 巡检止损，且阶段中止时自动清理残留后台进程组）或 OMP 原生 `bash` 后台异步任务（`bg_*`，自动计入 `SupervisorPulse.activeAsyncJobs` 活跃进展），并使用 `enhance_mandate` 在认知黑板登记假设与已核验指标证据。
+常规短耗时验证与评估脚本优先使用 OMP 原生 `bash`（或同会话后台异步 `bg_*` 任务，自动计入 `SupervisorPulse.activeAsyncJobs`）；仅需跨会话/跨终端重启持久守护的长耗时训练或超参搜索调用 `enhance_job`（传入 `idempotencyKey = exp_id`：进程通过 `stdin` `"GO"` 四阶段握手确保真实 PID 落库后才放行执行，且中断重跑时自动复用在途或已完结的同键作业 `reused: true`，杜绝重复拉起昂贵训练），并使用 `enhance_mandate` 在认知黑板登记假设与已核验指标证据。
 
 ---
 
@@ -68,11 +68,13 @@ single_change: "损失函数由 L2 替换为 Huber(delta=1.5)，其余特征、�
 seed: 42
 ```
 
-### 3.2 `runs/exp_NNN_<slug>/metrics.json`（由 `benchmark/eval.py` 统一生成）
+### 3.2 `runs/exp_NNN_<slug>/metrics.json`（由 `benchmark/eval.py` 统一生成，`ready` 准出强制校验血统与本轮生成）
 ```json
 {
-  "exp_id": "exp_002_huber_loss",
+  "experimentId": "exp_002_huber_loss",
   "split": "val",
+  "evaluatorVersion": "eval-v1.0",
+  "baselineSource": "algo_work/runs/exp_000_baseline/metrics.json",
   "primary_metric": { "name": "MAE", "value": 0.0412, "higher_is_better": false },
   "guardrails": {
     "p95_abs_err": 0.118,
@@ -85,6 +87,7 @@ seed: 42
   }
 }
 ```
+> **准出校验规则（`require_algo_deliverables: true`）**：声明 `verdict: "ready"` 时，`algo_work/REPORT.md` 必须非空（`>= 40` 个非空白字符），且匹配的 `metrics.json` 必须为合法 JSON 对象、包含实验血统字段（`experimentId`/`runId`、`split`/`datasetSplit`、`evaluatorVersion`/`scorerVersion`、`baseline`/`baselineSource` 与数值指标）并在本轮生成或更新（若合法复用历史基线对照，须显式标注 `"reusedBaseline": true` 与可核实的 `"baselineSource"`，同时附带本轮新跑出的候选实验 `metrics.json`）。
 
 ### 3.3 `algo_work/ledger.jsonl`（每轮跑完追加 1 行）
 ```json

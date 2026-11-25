@@ -6,9 +6,18 @@ import { captureProcessStartToken, isProcessAliveWithToken, type EnhanceStore } 
 import type { BackgroundJob } from "../core/types.ts";
 
 export interface StartBackgroundJobInput {
-  store: EnhanceStore; cwd: string; command: string;
-  mandateId?: string | null; hypothesisId?: string | null;
-  shellBin?: string; spawnImpl?: typeof spawn;
+  store: EnhanceStore;
+  cwd: string;
+  command: string;
+  mandateId?: string | null;
+  hypothesisId?: string | null;
+  idempotencyKey?: string | null;
+  shellBin?: string;
+  spawnImpl?: typeof spawn;
+  onBeforeInitialSave?: () => void;
+  onBeforePidSave?: () => void;
+  onBeforeRelease?: () => void;
+  onAfterRelease?: () => void;
 }
 
 export interface CancelJobOptions { graceMs?: number }
@@ -23,6 +32,9 @@ const WRAPPER_SCRIPT = [
   "trap '__omp_write_exit 143; exit 143' TERM",
   "trap '__omp_write_exit 130; exit 130' INT",
   "trap '__omp_write_exit 129; exit 129' HUP",
+  "IFS= read -r __omp_go || exit 125",
+  '[ "$__omp_go" = "GO" ] || exit 125',
+  "exec </dev/null",
   'sh -c "$OMP_ENHANCE_JOB_CMD"',
   '__omp_ec=$?; __omp_write_exit "$__omp_ec"; exit "$__omp_ec"',
 ].join("\n");
@@ -43,22 +55,50 @@ function isProcessGroupAlive(pgid: number): boolean {
   catch (err) { return (err as NodeJS.ErrnoException).code === "EPERM"; }
 }
 
+function bestEffortTerminatePid(pid: number): void {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  try { process.kill(-pid, "SIGTERM"); } catch {
+    try { process.kill(pid, "SIGTERM"); } catch {}
+  }
+}
+
+function appendJobDiag(jobsDir: string, logPath: string, tag: string, error: unknown): void {
+  const detail = error instanceof Error ? error.message : String(error);
+  try {
+    mkdirSync(jobsDir, { recursive: true, mode: 0o700 });
+    writeFileSync(logPath, `[${tag}] ${detail}\n`, { flag: "a" });
+  } catch {}
+}
+
 export function startBackgroundJob(input: StartBackgroundJobInput): BackgroundJob {
+  const mandateId = input.mandateId?.trim() || null;
+  const hypothesisId = input.hypothesisId?.trim() || null;
+  const idempotencyKey = input.idempotencyKey?.trim() || null;
+
+  if (idempotencyKey) {
+    try { reconcileJobs(input.store); } catch {}
+    const existing = input.store.findJobByIdempotencyKey(idempotencyKey, mandateId);
+    if (existing && (existing.status === "running" || existing.status === "completed")) {
+      return { ...existing, reused: true };
+    }
+  }
+
   const jobsDir = path.join(input.cwd, ".omp-enhance", "jobs");
   const jobId = randomUUID();
   const logPath = path.join(jobsDir, `${jobId}.log`), exitFilePath = path.join(jobsDir, `${jobId}.exit`);
   const startedAt = new Date().toISOString();
-  const mandateId = input.mandateId?.trim() || null;
-  const hypothesisId = input.hypothesisId?.trim() || null;
 
-  // Register intent in SQLite BEFORE writing files or spawning any OS process (enforces FK & store health upfront).
+  // 1) Pre-spawn DB registration: validates FK & DB write health before creating files or spawning a process.
   const initialJob: BackgroundJob = {
-    jobId, mandateId, hypothesisId, command: input.command, cwd: input.cwd,
-    pid: 0, pgid: 0, ownerPid: process.pid, processStartToken: null,
+    jobId, mandateId, hypothesisId, ...(idempotencyKey ? { idempotencyKey } : {}),
+    command: input.command, cwd: input.cwd, pid: 0, pgid: 0, ownerPid: process.pid, processStartToken: null,
     logPath, exitFilePath, status: "running", exitCode: null, startedAt, endedAt: null,
   };
+  input.onBeforeInitialSave?.();
   input.store.saveJob(initialJob);
 
+  // 2) Spawn gated wrapper child (blocked on stdin `read __omp_go` before running user command).
+  let child: ReturnType<typeof spawn> | null = null;
   let logFd: number | null = null;
   try {
     mkdirSync(jobsDir, { recursive: true, mode: 0o700 });
@@ -69,36 +109,70 @@ export function startBackgroundJob(input: StartBackgroundJobInput): BackgroundJo
     delete childEnv.OMP_ENHANCE_CMD_OUT;
 
     const spawnFn = input.spawnImpl ?? spawn;
-    const child = spawnFn(input.shellBin ?? "sh", ["-c", WRAPPER_SCRIPT], {
-      cwd: input.cwd, env: childEnv, detached: true, stdio: ["ignore", logFd, logFd],
+    child = spawnFn(input.shellBin ?? "sh", ["-c", WRAPPER_SCRIPT], {
+      cwd: input.cwd, env: childEnv, detached: true, stdio: ["pipe", logFd, logFd],
     });
     child.on("error", () => {});
-    if (typeof child.pid !== "number" || child.pid <= 0) {
+    child.stdin?.on("error", () => {});
+    if (typeof child.pid !== "number" || child.pid <= 0 || !child.stdin) {
       throw new Error("Failed to spawn background job process.");
     }
-    const processStartToken = captureProcessStartToken(child.pid);
-    child.unref();
-
-    const runningJob: BackgroundJob = {
-      ...initialJob, pid: child.pid, pgid: child.pid, processStartToken,
-    };
-    input.store.saveJob(runningJob);
-    return runningJob;
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    try {
-      mkdirSync(jobsDir, { recursive: true, mode: 0o700 });
-      writeFileSync(logPath, `[spawn_error] ${detail}\n`, { flag: "a" });
-    } catch {}
-    try {
-      input.store.saveJob({ ...initialJob, status: "failed", exitCode: -1, endedAt: new Date().toISOString() });
-    } catch {}
+    try { child?.stdin?.destroy(); } catch {}
+    if (typeof child?.pid === "number" && child.pid > 0) bestEffortTerminatePid(child.pid);
+    try { child?.unref(); } catch {}
+    appendJobDiag(jobsDir, logPath, "spawn_error", error);
+    try { input.store.saveJob({ ...initialJob, status: "failed", exitCode: -1, endedAt: new Date().toISOString() }); } catch {}
     throw error;
   } finally {
     if (logFd !== null) {
       try { closeSync(logFd); } catch {}
     }
   }
+
+  const pid = child.pid!;
+  const processStartToken = captureProcessStartToken(pid);
+  const runningJob: BackgroundJob = { ...initialJob, pid, pgid: pid, processStartToken };
+
+  // 3) Persist real PID + start-time token BEFORE releasing child stdin gate.
+  try {
+    input.onBeforePidSave?.();
+    input.store.saveJob(runningJob);
+  } catch (error) {
+    try { child.stdin!.destroy(); } catch {}
+    bestEffortTerminatePid(pid);
+    try { child.unref(); } catch {}
+    appendJobDiag(jobsDir, logPath, "pid_persist_error", error);
+    try {
+      input.store.transitionJobStatus(jobId, ["running"], {
+        status: "failed", exitCode: 125, endedAt: new Date().toISOString(),
+      });
+    } catch {}
+    throw error;
+  }
+
+  // 4) Release child to execute user command ONLY AFTER PID & token are durably recorded in SQLite.
+  try {
+    input.onBeforeRelease?.();
+    if (child.stdin!.destroyed) throw new Error("Background job stdin closed before GO release.");
+    child.stdin!.end("GO\n");
+    (child.stdin as unknown as { unref?: () => void }).unref?.();
+  } catch (error) {
+    try { child.stdin?.destroy(); } catch {}
+    bestEffortTerminatePid(pid);
+    try { child.unref(); } catch {}
+    appendJobDiag(jobsDir, logPath, "release_error", error);
+    try {
+      input.store.transitionJobStatus(jobId, ["running"], {
+        status: "failed", exitCode: 125, endedAt: new Date().toISOString(),
+      });
+    } catch {}
+    throw error;
+  }
+
+  child.unref();
+  input.onAfterRelease?.();
+  return runningJob;
 }
 
 function reconcileRunningJobRecord(store: EnhanceStore, job: BackgroundJob): BackgroundJob {
@@ -157,9 +231,7 @@ export function cancelJob(store: EnhanceStore, jobId: string, options?: CancelJo
 }
 
 export function cancelJobsByIds(
-  store: EnhanceStore,
-  jobIds: Iterable<string>,
-  options?: CancelJobOptions,
+  store: EnhanceStore, jobIds: Iterable<string>, options?: CancelJobOptions,
 ): BackgroundJob[] {
   const cancelled: BackgroundJob[] = [];
   const seen = new Set<string>();
