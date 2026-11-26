@@ -272,6 +272,7 @@ export function cloneRoleSpec(input: {
           : {}),
         criteria: [...input.sourceRole.exit.criteria],
       },
+      ...(input.sourceRole.workflow ? { workflow: structuredClone(input.sourceRole.workflow) } : {}),
     },
     input.targetDir,
     { globalRolesDir: input.globalRolesDir },

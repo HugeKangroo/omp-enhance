@@ -28,7 +28,12 @@ export function makeNodeRuntime(node: FlowNodeSpec, waveIndex: number, effective
 export function cloneState(state: FlowMachineState): FlowMachineState {
   const nodes: Record<string, FlowNodeRuntime> = {};
   for (const [id, rt] of Object.entries(state.nodes)) {
-    nodes[id] = { ...rt, triedModels: [...rt.triedModels], questionsForUser: [...rt.questionsForUser] };
+    nodes[id] = {
+      ...rt,
+      triedModels: [...rt.triedModels],
+      questionsForUser: [...rt.questionsForUser],
+      ...(rt.subState ? { subState: cloneState(rt.subState) } : {}),
+    };
   }
   return {
     ...state,
@@ -46,6 +51,17 @@ export function buildFlowGraphSnapshot(state: FlowMachineState): FlowGraphSnapsh
   const specById = new Map(state.spec.nodes.map((n) => [n.id, n]));
   const nodes: FlowGraphNodeView[] = state.nodeOrder.map((id) => {
     const spec = specById.get(id)!, rt = state.nodes[id]!;
+    let subProgress: FlowGraphNodeView["subProgress"];
+    if (rt.subState) {
+      const subSpecById = new Map(rt.subState.spec.nodes.map((n) => [n.id, n]));
+      const phases = rt.subState.nodeOrder.map((pid) => {
+        const ps = subSpecById.get(pid)!, prt = rt.subState!.nodes[pid]!;
+        return { id: pid, title: ps.title ?? pid, kind: ps.kind, status: prt.status };
+      });
+      const completed = phases.filter((p) => p.status === "succeeded" || p.status === "skipped").length;
+      const activePhaseId = phases.find((p) => p.status === "running" || p.status === "waiting_input")?.id;
+      subProgress = { completed, total: phases.length, ...(activePhaseId ? { activePhaseId } : {}), phases };
+    }
     return {
       nodeId: id, title: spec.title ?? spec.role ?? id, kind: spec.kind,
       ...(spec.role ? { role: spec.role } : {}), waveIndex: rt.waveIndex, dependsOn: [...spec.dependsOn],
@@ -53,7 +69,9 @@ export function buildFlowGraphSnapshot(state: FlowMachineState): FlowGraphSnapsh
       ...(spec.writableScope ? { writableScope: [...spec.writableScope] } : {}),
       sessionResidency: rt.sessionResidency, attempt: rt.attempt, repairRound: rt.repairRound,
       currentModel: rt.currentModel, triedModels: [...rt.triedModels], activeStageId: rt.activeStageId,
-      ...(rt.lastHandoff?.summary ? { summary: rt.lastHandoff.summary } : rt.lastError ? { summary: rt.lastError } : {}),
+      ...(rt.questionsForUser.length > 0 ? { questionsForUser: [...rt.questionsForUser] } : {}),
+      ...(subProgress ? { subProgress } : {}),
+      ...(rt.lastHandoff?.summary ? { summary: rt.lastHandoff.summary } : rt.lastReply ? { summary: rt.lastReply } : rt.lastError ? { summary: rt.lastError } : {}),
     };
   });
   return { preset: state.spec.preset ?? "custom", waves: state.waves.map((w) => [...w]), nodes, mergedRef: state.mergedRef };
@@ -84,12 +102,22 @@ export function emitTerminalCleanup(next: FlowMachineState, commands: FlowComman
       commands.push({ type: "DISPOSE_SESSION", nodeId: id });
     }
   }
-  const keepPreview = next.spec.nodes.some((n) => n.kind === "merge" && n.merge?.landingMode === "branch_preview") && next.status === "completed";
-  if (next.nodeOrder.some((id) => next.nodes[id]!.worktreePath !== null) && !keepPreview) {
+  if (next.nodeOrder.some((id) => next.nodes[id]!.worktreePath !== null)) {
     commands.push({ type: "CLEANUP_WORKTREES", flowId: next.flowId });
   }
   commands.push({ type: "APPEND_BOARD", entry: { kind: "done", speaker: "flow", target: "all", text: `[${next.status}] ${next.reason ?? next.spec.goal}` } });
   commands.push({ type: "WAKE_COORDINATOR", kind, summary: next.reason ?? next.spec.goal });
+}
+
+function findUpstreamPreviewMergeRef(state: FlowMachineState, nodeId: string): string | null {
+  const ancestors = computeAncestorMap(state.spec.nodes).get(nodeId);
+  if (!ancestors || ancestors.size === 0) return null;
+  const specById = new Map(state.spec.nodes.map((n) => [n.id, n]));
+  const hits = [...ancestors]
+    .map((id) => ({ id, spec: specById.get(id), rt: state.nodes[id] }))
+    .filter((c) => c.spec?.kind === "merge" && c.spec.merge?.landingMode === "branch_preview" && Boolean(c.rt?.commitRef))
+    .sort((a, b) => (b.rt!.waveIndex - a.rt!.waveIndex));
+  return hits[0]?.rt?.commitRef ?? null;
 }
 
 export function dispatchSingleNode(
@@ -122,17 +150,24 @@ export function dispatchSingleNode(
   rt.status = "running";
   if (spec.kind === "role") {
     const reuseSession = Boolean(next.spec.policies.enableSessionReuse && rt.sessionResidency === "warm" && spec.sessionMode !== "fresh");
+    const previewRef = !rt.worktreePath ? findUpstreamPreviewMergeRef(next, nodeId) : null;
     commands.push({
       type: "DISPATCH_ROLE_NODE", nodeId, stageId, attempt: rt.attempt, repairRound: rt.repairRound, reuseSession,
       ...(spec.sessionMode === "fork" && spec.forkFromNodeId ? { forkFromNodeId: spec.forkFromNodeId } : {}),
       ...(rt.worktreePath ? { worktreePath: rt.worktreePath } : {}),
+      ...(previewRef ? { targetCommitRef: previewRef } : {}),
       ...(extra?.modelOverride ? { modelOverride: extra.modelOverride } : {}),
       ...(rt.lastRepairFeedback ? { repairFeedback: rt.lastRepairFeedback } : {}),
       ...(extra?.replyText ? { replyText: extra.replyText } : {}),
     });
   } else if (spec.kind === "gate") {
-    const depWt = spec.dependsOn.map((d) => next.nodes[d]?.worktreePath).find(Boolean) ?? undefined;
-    commands.push({ type: "RUN_GATE_NODE", nodeId, stageId, attempt: rt.attempt, ...(depWt ? { worktreePath: depWt } : {}), config: spec.gate! });
+    const previewRef = findUpstreamPreviewMergeRef(next, nodeId);
+    const depWt = previewRef ? undefined : (spec.dependsOn.map((d) => next.nodes[d]?.worktreePath).find(Boolean) ?? undefined);
+    commands.push({
+      type: "RUN_GATE_NODE", nodeId, stageId, attempt: rt.attempt,
+      ...(previewRef ? { targetCommitRef: previewRef } : {}),
+      ...(depWt ? { worktreePath: depWt } : {}), config: spec.gate!,
+    });
   } else if (spec.kind === "merge") {
     const sourceRefs: Record<string, string> = {};
     for (const srcId of spec.merge!.sourceNodeIds) { const ref = next.nodes[srcId]?.commitRef; if (ref) sourceRefs[srcId] = ref; }
@@ -180,17 +215,31 @@ export function scheduleReadyNodes(next: FlowMachineState, commands: FlowCommand
   }
 }
 
-export function evaluateFlowSettlement(next: FlowMachineState, commands: FlowCommand[], nowIso: string): void {
+export function formatWaitingNodesReason(state: FlowMachineState, waitingNodes: readonly string[]): string {
+  if (waitingNodes.length === 1) {
+    const id = waitingNodes[0]!, first = state.nodes[id]!;
+    const qs = first.questionsForUser.length ? ` (${first.questionsForUser.join("; ")})` : "";
+    return `[${id}] ${first.lastHandoff?.summary ?? first.questionsForUser[0] ?? "需要用户确认"}${qs}`;
+  }
+  return waitingNodes.map((id) => {
+    const rt = state.nodes[id]!;
+    const q = rt.questionsForUser.length ? rt.questionsForUser.join("; ") : (rt.lastHandoff?.summary ?? "需要用户确认");
+    return `[${id}] ${q}`;
+  }).join(" | ");
+}
+
+export function evaluateFlowSettlement(
+  next: FlowMachineState, commands: FlowCommand[], nowIso: string, allowActiveOnTargetedResume = false,
+): void {
   if (next.status !== "running") return;
   const statuses = next.nodeOrder.map((id) => next.nodes[id]!.status);
   const active = statuses.some((s) => s === "running" || s === "ready" || s === "retrying");
   const waitingNodes = next.nodeOrder.filter((id) => next.nodes[id]!.status === "waiting_input");
-  if (waitingNodes.length > 0 && (next.spec.policies.pauseOnWaitingInput === "whole_flow" || !active)) {
+  const shouldPauseForWaiting = waitingNodes.length > 0 && (!active || (next.spec.policies.pauseOnWaitingInput === "whole_flow" && !allowActiveOnTargetedResume));
+  if (shouldPauseForWaiting) {
     next.status = "waiting_input";
-    const first = next.nodes[waitingNodes[0]!]!;
-    const qs = first.questionsForUser.length ? ` (${first.questionsForUser.join("; ")})` : "";
-    next.reason = `${first.lastHandoff?.summary ?? first.questionsForUser[0] ?? "需要用户确认"}${qs}`;
-    commands.push({ type: "WAKE_COORDINATOR", kind: "needs_input", summary: next.reason, nodeId: waitingNodes[0] });
+    next.reason = formatWaitingNodesReason(next, waitingNodes);
+    commands.push({ type: "WAKE_COORDINATOR", kind: "needs_input", summary: next.reason, ...(waitingNodes.length === 1 ? { nodeId: waitingNodes[0] } : {}) });
     return;
   }
   if (active) return;

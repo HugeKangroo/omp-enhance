@@ -6,6 +6,7 @@ import {
   inferStoreCwd,
   isProcessAliveWithToken,
   type LeaseRow,
+  mutateMachineStateForInterrupt,
   mutateSnapshotForInterrupt,
   ProjectBusyError,
   type ProjectFlowLease,
@@ -123,8 +124,8 @@ export function runAcquireScopedLeaseTx(
     ),
   );
   if (existing && !sameOwner) {
-    const flowRow = db.query("SELECT status, cwd, snapshot_json FROM flow_runs WHERE flow_id = ?")
-      .get(existing.flow_id) as { status: string; cwd: string | null; snapshot_json: string } | null;
+    const flowRow = db.query("SELECT status, cwd, snapshot_json, machine_state_json FROM flow_runs WHERE flow_id = ?")
+      .get(existing.flow_id) as { status: string; cwd: string | null; snapshot_json: string; machine_state_json: string | null } | null;
     const alreadySettled = Boolean(flowRow && flowRow.status !== "running");
     const holderActive = !alreadySettled && (
       existing.owner_pid === pid || isProcessAliveWithToken(existing.owner_pid, existing.owner_start_token)
@@ -133,8 +134,8 @@ export function runAcquireScopedLeaseTx(
       throw new ProjectBusyError({ cwd: inferStoreCwd(dbPath, flowRow?.cwd), activeFlowId: existing.flow_id, ownerPid: existing.owner_pid });
     }
     if (flowRow && flowRow.status === "running") {
-      db.query("UPDATE flow_runs SET status = 'interrupted', owner_pid = NULL, owner_start_token = NULL, lease_token = NULL, state_version = COALESCE(state_version, 0) + 1, snapshot_json = ?, updated_at = ? WHERE flow_id = ?")
-        .run(mutateSnapshotForInterrupt(flowRow.snapshot_json, ts), ts, existing.flow_id);
+      db.query("UPDATE flow_runs SET status = 'interrupted', owner_pid = NULL, owner_start_token = NULL, lease_token = NULL, state_version = COALESCE(state_version, 0) + 1, snapshot_json = ?, machine_state_json = ?, updated_at = ? WHERE flow_id = ?")
+        .run(mutateSnapshotForInterrupt(flowRow.snapshot_json, ts), mutateMachineStateForInterrupt(flowRow.machine_state_json, ts), ts, existing.flow_id);
     }
   }
   const effectiveLeaseToken = sameOwner

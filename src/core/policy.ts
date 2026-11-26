@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import type { ObservedToolCall, RoleSpec, SupervisorActiveTool } from "./types.ts";
-import { matchesGlobList, resolveSafeTargetRealpath, snapshotConfigIntegrity, snapshotWorkspace, type SnapshotEntry } from "./fs.ts";
+import { computeSnapshotFingerprint, matchesGlobList, resolveSafeTargetRealpath, snapshotConfigIntegrity, snapshotWorkspace, type SnapshotEntry } from "./fs.ts";
 
 export const COMPANION_TOOL_NAMES = ["enhance_mandate", "enhance_handoff", "enhance_flow", "enhance_job"] as const;
 export const READONLY_SUBAGENTS = ["scout", "reviewer", "security-reviewer"] as const;
@@ -411,15 +411,18 @@ export class TurnTracker {
   }
   recordToolExecutionEnd(
     cwd: string,
-    event: { toolCallId: string; toolName: string; args?: unknown; input?: unknown; result?: unknown; output?: unknown; details?: unknown; exitCode?: number | null; isError?: boolean },
+    event: { toolCallId: string; toolName: string; args?: unknown; input?: unknown; result?: unknown; output?: unknown; details?: unknown; exitCode?: number | null; isError?: boolean; stageId?: string },
   ): ObservedToolCall {
     this.inFlightTool = null;
     const effArgs = event.args ?? event.input ?? this.pendingInputs.get(event.toolCallId) ?? (this.lastStartInput?.toolName === event.toolName ? this.lastStartInput.input : undefined);
     this.pendingInputs.delete(event.toolCallId); this.lastStartInput = null;
+    const meta = extractToolOutcomeMeta(event.toolName, effArgs, event);
+    const captureTree = (event.toolName === "bash" || event.toolName === "enhance_job") && !(event.isError ?? false) && !meta.isBackgroundLaunch && (meta.exitCode === undefined || meta.exitCode === 0);
     const call: ObservedToolCall = {
       toolCallId: event.toolCallId, toolName: event.toolName, isError: event.isError ?? false,
-      touchedPaths: extractWriteTargetPaths(cwd, event.toolName, effArgs),
-      timestamp: new Date().toISOString(), summary: summarizeToolCall(event.toolName, effArgs), ...extractToolOutcomeMeta(event.toolName, effArgs, event),
+      touchedPaths: extractWriteTargetPaths(cwd, event.toolName, effArgs), timestamp: new Date().toISOString(),
+      summary: summarizeToolCall(event.toolName, effArgs), ...meta,
+      ...(event.stageId ? { stageId: event.stageId } : {}), ...(captureTree ? { testedTreeFingerprint: computeSnapshotFingerprint(snapshotWorkspace(cwd)) } : {}),
     };
     this.calls.push(call);
     return call;

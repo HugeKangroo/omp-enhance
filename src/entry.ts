@@ -10,6 +10,7 @@ import { registerEnhanceCommands } from "./omp/commands.ts";
 import { createWorkspaceHub } from "./omp/hub.ts";
 import { turnFailedOrAborted } from "./omp/session.ts";
 import { registerEnhanceTools } from "./omp/tools.ts";
+import { ForegroundWorkflowController } from "./omp/workflow-fg.ts";
 import {
   branchOverrideSignature,
   defaultRoleId,
@@ -28,6 +29,7 @@ export interface EnhanceOptions {
 
 export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void {
   const hub = createWorkspaceHub(pi, options);
+  const fgWorkflow = new ForegroundWorkflowController();
   registerRoomMessageRenderer(pi);
 
   const onSessionLifecycle = async (_ev: any, ctx: any): Promise<void> => {
@@ -70,18 +72,24 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
 
       ws.trackers.get(sid).beginTurn(ws.cwd, true);
       const mandate = ws.store.getActiveMandate({ sessionId: sid });
+      const fgPhase = fgWorkflow.getActivePhaseContext(sid, ws.cwd, role, mandate?.goal);
+      const effectiveRole = fgPhase?.effectiveRole ?? role;
       const effectiveModel =
-        role.model && role.model !== "inherit" ? resolveModelSpec(role.model, ctx, pi) : ctx?.model;
-      const block = renderConditioningBlock({
-        role,
+        effectiveRole.model && effectiveRole.model !== "inherit" ? resolveModelSpec(effectiveRole.model, ctx, pi) : ctx?.model;
+      const baseBlock = renderConditioningBlock({
+        role: effectiveRole,
         mandate,
         epistemicItems: mandate ? ws.store.listEpistemicItems(mandate.id) : [],
         upstreamHandoff: mandate ? ws.store.getLatestHandoff(mandate.id) : null,
         visionCapable: modelSupportsVision(effectiveModel),
-        ...(canRoleDispatch(role)
+        ...(canRoleDispatch(effectiveRole)
           ? { availableRoles: [...ws.roles.values()], activeWorkloads: hub.collectActiveWorkloads() }
           : {}),
       });
+      const block = fgPhase ? `${baseBlock}\n\n${fgPhase.promptNote}` : baseBlock;
+      if (fgPhase && ws.settings.showStatusBar) {
+        try { ctx?.ui?.setStatus?.("omp-enhance", `enhance:${role.id} [${fgPhase.badge}]`); } catch {}
+      }
       const existing = Array.isArray(event?.systemPrompt) ? event.systemPrompt : event?.systemPrompt ? [event.systemPrompt] : [];
       return { systemPrompt: [...existing, block] };
     } catch {
@@ -107,9 +115,12 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
       const ws = hub.getWorkspace(ctx);
       const role = ws.getActiveRole(ctx);
       if (!role) return undefined;
-      const tracker = ws.trackers.get(sessionKey(ctx));
+      const sid = sessionKey(ctx);
+      const fgPhase = fgWorkflow.getActivePhaseContext(sid, ws.cwd, role);
+      const effectiveRole = fgPhase?.effectiveRole ?? role;
+      const tracker = ws.trackers.get(sid);
       const toolName = event?.toolName ?? event?.name ?? "", input = event?.input ?? event?.args;
-      const decision = tracker.checkToolCallAllowed(ws.cwd, role, { toolName, input }, ws.roles);
+      const decision = tracker.checkToolCallAllowed(ws.cwd, effectiveRole, { toolName, input }, ws.roles);
       return decision.block ? decision : undefined;
     } catch { return undefined; }
   });
@@ -139,7 +150,7 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
     } catch {}
   });
 
-  registerEnhanceTools(pi, hub);
+  registerEnhanceTools(pi, hub, fgWorkflow);
   registerEnhanceCommands(pi, hub, {
     globalRolesDir: options.globalRolesDir ?? resolveDefaultGlobalRolesDir(),
     builtinRolesDir: options.builtinRolesDir,

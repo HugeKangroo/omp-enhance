@@ -1,4 +1,5 @@
 import { matchesGlobList, normalizeRelPath } from "./fs.ts";
+import type { RoleWorkflowPhaseSpec } from "./graph-types.ts";
 import { isRoleReadOnly } from "./policy.ts";
 import type { RoleSpec } from "./types.ts";
 
@@ -180,4 +181,65 @@ export function resolveEffectiveWritableScope(
     return writableScope.map((g) => normalizeRelPath(g.trim()).replace(/\/+$/, ""));
   }
   return role.permissions.writable;
+}
+
+export function applyPhasePermissions(
+  baseRole: RoleSpec,
+  phase: RoleWorkflowPhaseSpec,
+  cumulativeProtected: readonly string[] = [],
+  isFinalPhase = false,
+): { ok: true; role: RoleSpec; nextCumulativeProtected: string[] } | { ok: false; reason: string } {
+  const baseTools = baseRole.permissions.tools;
+  let nextTools = baseTools ? [...baseTools] : undefined;
+  if (phase.tools !== undefined) {
+    if (baseTools) {
+      const allowed = new Set(baseTools);
+      const illegal = phase.tools.find((t) => !allowed.has(t));
+      if (illegal) {
+        return { ok: false, reason: `Phase "${phase.id}" requests tool "${illegal}" outside base role "${baseRole.id}" permissions.` };
+      }
+    }
+    nextTools = [...phase.tools];
+  }
+
+  const nextLocks: string[] = [...cumulativeProtected];
+  for (const rawLock of phase.lockProtected ?? []) {
+    const err = validateScopePattern(rawLock);
+    if (err) return { ok: false, reason: `Phase "${phase.id}" lock_protected: ${err}` };
+    const norm = normalizeRelPath(rawLock.trim()).replace(/\/+$/, "");
+    if (!nextLocks.includes(norm)) nextLocks.push(norm);
+  }
+
+  let nextWritable = baseRole.permissions.writable ? [...baseRole.permissions.writable] : undefined;
+  if (phase.writable !== undefined) {
+    if (phase.writable.length === 0) {
+      nextWritable = [];
+    } else {
+      const narrowed = narrowRolePermissions(baseRole, phase.writable);
+      if (!narrowed.ok) return { ok: false, reason: `Phase "${phase.id}": ${narrowed.reason}` };
+      nextWritable = [...(narrowed.role.permissions.writable ?? [])];
+    }
+  }
+
+  const mergedProtected = [...new Set([...(baseRole.permissions.protected ?? []), ...nextLocks])];
+  const phaseArtifacts = phase.exitArtifacts?.length ? [...phase.exitArtifacts] : undefined;
+  const phaseRole: RoleSpec = {
+    ...baseRole,
+    workflow: undefined,
+    permissions: {
+      ...baseRole.permissions,
+      ...(nextTools !== undefined ? { tools: nextTools } : {}),
+      ...(nextWritable !== undefined ? { writable: nextWritable } : {}),
+      ...(mergedProtected.length > 0 ? { protected: mergedProtected } : {}),
+    },
+    exit: {
+      requireToolEvidence: baseRole.exit.requireToolEvidence,
+      ...(isFinalPhase && baseRole.exit.requiredTools ? { requiredTools: [...baseRole.exit.requiredTools] } : {}),
+      ...(phaseArtifacts ? { requiredArtifacts: phaseArtifacts } : isFinalPhase && baseRole.exit.requiredArtifacts ? { requiredArtifacts: [...baseRole.exit.requiredArtifacts] } : {}),
+      ...(isFinalPhase && baseRole.exit.requireTestExecution ? { requireTestExecution: true } : {}),
+      ...(isFinalPhase && baseRole.exit.requireAlgoDeliverables ? { requireAlgoDeliverables: true } : {}),
+      criteria: phase.brief ? [phase.brief, ...baseRole.exit.criteria] : [...baseRole.exit.criteria],
+    },
+  };
+  return { ok: true, role: phaseRole, nextCumulativeProtected: nextLocks };
 }

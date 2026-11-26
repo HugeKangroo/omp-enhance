@@ -22,6 +22,8 @@ export interface HubFlowSummary {
   cwd: string; flowId: string | null; status: FlowRoomStatus; resumable: boolean;
   roleChain: string[]; currentIndex: number; repairRound: number; goal: string;
   reason?: string; questionsForUser?: string[];
+  waitingNodes?: Array<{ nodeId: string; questions: string[] }>;
+  mergedRef?: string | null;
 }
 
 export interface PendingWakeup {
@@ -42,6 +44,7 @@ export interface WorkspaceHub {
   markAllSettledFlowsObserved(): void;
   setForegroundTurnActive(active: boolean): void;
   flushPendingWakeups(ctx?: any): void;
+  isSelfResumeBlockedDuringWakeup(flowId: string, ctx?: any): boolean;
   listWorkspaces(): ManagedWorkspace[];
   getMonitorTargets(primaryWs?: ManagedWorkspace): FlowMonitorTarget[];
   getAllFlowSummaries(): HubFlowSummary[];
@@ -96,18 +99,31 @@ export function computeSettlementKey(snap: Pick<FlowRoomSnapshot, "flowId" | "st
   return `${snap.flowId}:${snap.status}:${snap.stages.length}`;
 }
 
+function collectWaitingNodes(snap: FlowRoomSnapshot): Array<{ nodeId: string; questions: string[] }> {
+  const fromGraph = (snap.graphSnapshot?.nodes ?? [])
+    .filter((n) => n.status === "waiting_input")
+    .map((n) => ({ nodeId: n.nodeId, questions: n.questionsForUser?.length ? [...n.questionsForUser] : [n.summary ?? "需要用户确认"] }));
+  if (fromGraph.length > 0) return fromGraph;
+  const env = [...snap.stages].reverse().find((s) => s.envelope?.questionsForUser?.length)?.envelope;
+  return env?.questionsForUser?.length ? [{ nodeId: env.fromRole, questions: [...env.questionsForUser] }] : [];
+}
+
 function toFlowSummary(cwd: string, snap: FlowRoomSnapshot, resumable: boolean): HubFlowSummary {
-  const latestStageEnv = [...snap.stages].reverse().find((s) => s.envelope)?.envelope;
+  const waitingNodes = snap.status === "waiting_input" ? collectWaitingNodes(snap) : [];
+  const allQuestions = waitingNodes.flatMap((w) => w.questions.map((q) => (waitingNodes.length > 1 ? `[${w.nodeId}] ${q}` : q)));
   return {
     cwd, flowId: snap.flowId, status: snap.status, resumable,
     roleChain: snap.roleChain, currentIndex: snap.currentIndex ?? 0, repairRound: snap.repairRound ?? 0, goal: snap.goal,
     ...(snap.reason ? { reason: snap.reason } : {}),
-    ...(latestStageEnv?.questionsForUser?.length ? { questionsForUser: [...latestStageEnv.questionsForUser] } : {}),
+    ...(allQuestions.length > 0 ? { questionsForUser: allQuestions } : {}),
+    ...(waitingNodes.length > 0 ? { waitingNodes } : {}),
+    ...(snap.graphSnapshot?.mergedRef ? { mergedRef: snap.graphSnapshot.mergedRef } : {}),
   };
 }
 
 function formatFlowEventReport(settlement: BackgroundFlowSettlement): string {
   const { targetWs, flowId, mandate, roleChain, result, error } = settlement;
+  const snap = targetWs.room.getSnapshot();
   const status = error ? "failed" : (result?.status ?? "failed"), env = result?.finalEnvelope ?? null;
   const summary = error ? (error instanceof Error ? error.message : String(error)) : (env?.summary ?? result?.reason ?? status);
   const isRejectedAudit = status === "completed" && env?.verdict === "rejected";
@@ -115,16 +131,20 @@ function formatFlowEventReport(settlement: BackgroundFlowSettlement): string {
     `[Flow Event · ${status}${isRejectedAudit ? " (audit_rejected)" : ""}] flowId=${flowId} · cwd=${targetWs.cwd} · chain=${roleChain.join(" → ")}`,
     `Goal: ${mandate.goal}`, `Summary: ${summary}`,
   ];
+  const mergedRef = result?.mergedRef ?? snap.graphSnapshot?.mergedRef;
+  if (mergedRef) lines.push(`Delivery ref: ${mergedRef}`);
   if (isRejectedAudit && env?.feedbackForUpstream) lines.push(`Findings: ${env.feedbackForUpstream}`);
   else if (result?.reason && result.reason !== summary) lines.push(`Detail: ${result.reason}`);
   if (env?.artifacts.length) lines.push(`Artifacts: ${env.artifacts.map((a) => `${a.path} [${a.role}]`).join(", ")}`);
   if (env?.deletedFiles?.length) lines.push(`Deleted files: ${env.deletedFiles.join(", ")}`);
   if (env?.verifiedFacts.length) lines.push("Verified facts:", ...env.verifiedFacts.map((f) => `- ${f.claim} (evidence: ${f.evidenceRef})`));
   if (env?.openRisks.length) lines.push("Open risks:", ...env.openRisks.map((r) => `- ${r}`));
-  if (env?.questionsForUser?.length) {
+  const waitingNodes = status === "waiting_input" ? collectWaitingNodes(snap) : [];
+  if (waitingNodes.length > 0) {
     lines.push(
-      "Questions for user:", ...env.questionsForUser.map((q) => `- ${q}`),
-      `Action required: Relay these questions to the user in plain language and STOP to wait for their reply — do NOT guess or answer on the user's behalf. Only after the user replies, resume with enhance_flow(action="resume", flowId="${flowId}", cwd="${targetWs.cwd}", message="<user's answer>").`,
+      "Questions for user:",
+      ...waitingNodes.flatMap((w) => w.questions.map((q) => `- [${w.nodeId}] ${q}`)),
+      `Action required: Relay ALL questions above to the user in plain language and STOP to wait for their reply — do NOT guess or answer on the user's behalf. Resume each answered node individually with enhance_flow(action="resume", flowId="${flowId}", cwd="${targetWs.cwd}", nodeId="<nodeId>", message="<user's exact answer>").`,
     );
   }
   return lines.join("\n");
@@ -136,9 +156,21 @@ function assertExistingDir(targetCwd: string): void {
   if (!isDir) throw new Error(`Target project directory does not exist: ${targetCwd}`);
 }
 
+function countBranchUserMessages(ctx: any): number | null {
+  const fn = ctx?.sessionManager?.getBranch ?? ctx?.sessionManager?.getEntries;
+  if (typeof fn !== "function") return null;
+  try {
+    const entries: any[] = fn.call(ctx.sessionManager) ?? [];
+    let count = 0;
+    for (const e of entries) if (e?.type === "message" && e?.message?.role === "user") count += 1;
+    return count;
+  } catch { return null; }
+}
+
 export function createWorkspaceHub(pi: any, options: HubOptions = {}): WorkspaceHub {
   const workspaces = new Map<string, ManagedWorkspace>(), hydratedRoots = new Set<string>();
   const lastReportedKeys = new Map<string, string>(), pendingWakeups = new Map<string, PendingWakeup>();
+  const waitingWakeupUserCounts = new Map<string, number>();
   const hubProjectsPath = resolveHubProjectsFilePath(options), trustStorePath = resolveTrustedProjectsFilePath(options);
   let primaryCwd = path.resolve(pi?.cwd ?? process.cwd()), foregroundTurnActive = false;
   let wakeupTimer: ReturnType<typeof setTimeout> | null = null;
@@ -171,6 +203,12 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
     const key = computeSettlementKey(snap) ?? `${settlement.flowId}:${status}:${snap.stages.length}`;
     if (lastReportedKeys.get(settlement.flowId) === key) return;
     const report = formatFlowEventReport(settlement);
+    if (status === "waiting_input") {
+      const uc = countBranchUserMessages(settlement.ctx);
+      if (uc !== null) waitingWakeupUserCounts.set(settlement.flowId, uc);
+    } else {
+      waitingWakeupUserCounts.delete(settlement.flowId);
+    }
     if (settlement.ctx?.isIdle?.() === false) {
       pendingWakeups.set(settlement.flowId, { flowId: settlement.flowId, settlementKey: key, originWs: settlement.originWs, ctx: settlement.ctx, report });
       scheduleFallbackFlush();
@@ -318,6 +356,13 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
       if (items.length === 0) return;
       for (const item of items) lastReportedKeys.set(item.flowId, item.settlementKey);
       emitEventMessage(items.map((it) => it.report).join("\n\n---\n\n"), items[0]!.originWs, ctx ?? items[0]!.ctx);
+    },
+    isSelfResumeBlockedDuringWakeup(flowId: string, ctx?: any): boolean {
+      const recorded = waitingWakeupUserCounts.get(flowId);
+      if (recorded === undefined) return false;
+      const cur = countBranchUserMessages(ctx);
+      if (cur === null || cur > recorded) { waitingWakeupUserCounts.delete(flowId); return false; }
+      return true;
     },
     listWorkspaces: () => [...workspaces.values()],
     getMonitorTargets(primaryWs?: ManagedWorkspace): FlowMonitorTarget[] {

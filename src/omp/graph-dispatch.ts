@@ -97,6 +97,7 @@ export function buildAndValidateStartGraph(input: {
         workers: params.workers as FanOutShardInput[],
         ...(asStr(params.gateCommand) ? { gateCommand: asStr(params.gateCommand) } : {}),
         ...(asStr(params.reviewerRole) ? { reviewerRole: asStr(params.reviewerRole) } : {}),
+        ...(params.landingMode === "apply" || params.landingMode === "branch_preview" ? { landingMode: params.landingMode } : {}),
         policies: { ...rawPolicies, maxRepairRounds },
       });
     } else if (preset === "experiment_loop" && asStr(params.scorerCommand)) {
@@ -122,6 +123,7 @@ export function buildAndValidateStartGraph(input: {
       return r;
     });
     spec = compileLinearChain(roleSpecs, goal, { ...rawPolicies, maxRepairRounds });
+    if (roleSpecs.some((r) => Boolean(r.workflow?.phases?.length))) isGraphMode = true;
   }
 
   const validation = validateFlowGraph({ spec, roles: rolesMap, isGitRepo: git });

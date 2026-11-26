@@ -1,7 +1,8 @@
 import { canRoleUseCompanionTool } from "../core/policy.ts";
 import { ProjectBusyError } from "../core/store.ts";
-import type { HandoffEnvelope } from "../core/types.ts";
+import type { FlowMachineState, HandoffEnvelope } from "../core/types.ts";
 import { isCheckpointResumable, parseDirectedSteer, snapshotFromCheckpoint } from "../flow/state.ts";
+import { buildFlowToolParameters, type SchemaKitLike } from "./flow-schema.ts";
 import { buildAndValidateStartGraph, formatGraphWavesSummary, parseAndValidatePatch } from "./graph-dispatch.ts";
 import type { WorkspaceHub } from "./hub.ts";
 import type { ManagedWorkspace } from "./workspace.ts";
@@ -85,28 +86,15 @@ export function registerFlowTool(
     name: string; label: string; description: string; approval?: "read" | "write" | "exec"; parameters: unknown;
     execute: (params: Record<string, unknown>, ctx: any, signal?: AbortSignal) => Promise<unknown>;
   }) => void,
-  kit: {
-    str: () => unknown; num: () => unknown; bool: () => unknown;
-    arr: (item: unknown) => unknown; en: (values: readonly string[]) => unknown;
-    obj: (props: Record<string, unknown>, req: string[]) => unknown;
-  },
+  kit: SchemaKitLike,
   hub: WorkspaceHub,
 ): void {
   registerTool({
     name: "enhance_flow",
     label: "Enhance Flow",
     approval: "exec",
-    description: "Start, resume, list/inspect status, steer, or cancel Markov-isolated specialist Flows (linear roles or DAG nodes/presets) across one or multiple project directories (cwd).",
-    parameters: kit.obj({
-      action: kit.en(["start", "status", "list", "steer", "cancel", "resume", "patch"]),
-      cwd: kit.str(), flowId: kit.str(), roles: kit.arr(kit.str()), goal: kit.str(),
-      preset: kit.en(["linear", "fan_out_join", "contract_parallel_verify", "experiment_loop", "custom"]),
-      nodes: kit.arr(kit.obj({}, [])), policies: kit.obj({}, []), patch: kit.obj({}, []),
-      shards: kit.arr(kit.obj({}, [])), workers: kit.arr(kit.obj({}, [])), contract: kit.obj({}, []),
-      merge: kit.obj({}, []), gate: kit.obj({}, []), joinRole: kit.obj({}, []),
-      gateCommand: kit.str(), reviewerRole: kit.str(), scorerCommand: kit.str(), workerRole: kit.str(), workerBrief: kit.str(), metricsPath: kit.str(),
-      message: kit.str(), maxRepairRounds: kit.num(), initialHandoffId: kit.str(), wait: kit.bool(),
-    }, []),
+    description: "Start, resume, list/inspect status, steer, patch, or cancel Markov-isolated specialist Flows (linear roles or DAG nodes/presets) across one or multiple project directories (cwd).",
+    parameters: buildFlowToolParameters(kit),
     async execute(params, ctx, signal) {
       try {
         const originWs = hub.getWorkspace(ctx);
@@ -243,13 +231,40 @@ export function registerFlowTool(
           const cp = !targetWs.store.isClosed() ? targetWs.store.getFlowCheckpoint(targetFlowId) : null;
           if (reqFlowId && !cp && targetWs.room.getSnapshot().flowId !== reqFlowId) throw new Error(`Unknown flowId "${reqFlowId}".`);
           if (cp && !isCheckpointResumable(cp)) throw new Error(`Flow "${cp.flowId}" 当前状态为 ${cp.status}，无法断点续跑。`);
+          if ((cp?.status ?? targetWs.room.getSnapshot().status) === "waiting_input" && hub.isSelfResumeBlockedDuringWakeup(targetFlowId, ctx)) {
+            return toolResult({
+              started: false, resumed: false, awaitingUserReply: true, cwd: targetWs.cwd, flowId: targetFlowId, status: "waiting_input",
+              error: `Flow "${targetFlowId}" just paused awaiting user input. Relay the specialist's questions to the user in plain language and wait for an explicit user message before calling resume.`,
+            }, true);
+          }
 
           const msg = asString(params.message);
+          const reqNodeId = asString(params.nodeId);
+          let persistedMachine: FlowMachineState | null = null;
+          if (cp?.machineStateJson) { try { persistedMachine = JSON.parse(cp.machineStateJson) as FlowMachineState; } catch {} }
+          else if (targetWs.room.getSnapshot().flowId === targetFlowId) persistedMachine = targetWs.room.getPersistedMachineState();
+          if (persistedMachine?.status === "waiting_input") {
+            const waitingIds = persistedMachine.nodeOrder.filter((id) => persistedMachine!.nodes[id]?.status === "waiting_input");
+            const waitingNodes = waitingIds.map((id) => ({ nodeId: id, questions: [...(persistedMachine!.nodes[id]?.questionsForUser ?? [])] }));
+            if (reqNodeId && !waitingIds.includes(reqNodeId)) {
+              return toolResult({
+                started: false, resumed: false, cwd: targetWs.cwd, flowId: targetFlowId, nodeId: reqNodeId, waitingNodes,
+                error: `Node "${reqNodeId}" is not waiting for input in Flow "${targetFlowId}" (waiting: ${waitingIds.join(", ") || "none"}).`,
+              }, true);
+            }
+            if (!reqNodeId && waitingIds.length > 1) {
+              return toolResult({
+                started: false, resumed: false, requiresNodeId: true, cwd: targetWs.cwd, flowId: targetFlowId, waitingNodes,
+                error: `Flow "${targetFlowId}" has multiple waiting nodes (${waitingIds.join(", ")}); specify nodeId to bind the user's answer to a single node.`,
+              }, true);
+            }
+          }
           let savedReply = false;
           if (msg) {
             const { text: steerText, targetRole } = parseDirectedSteer(msg);
+            const effTargetRole = reqNodeId ?? targetRole ?? null;
             if (!targetWs.store.isClosed() && cp) {
-              targetWs.store.appendFlowSteer(targetFlowId, { text: steerText, targetRole: targetRole ?? null });
+              targetWs.store.appendFlowSteer(targetFlowId, { text: steerText, targetRole: effTargetRole });
               const refreshed = targetWs.store.getFlowCheckpoint(targetFlowId);
               if (refreshed) targetWs.room.syncFromCheckpoint(refreshed, ctx);
             } else {
@@ -269,7 +284,10 @@ export function registerFlowTool(
 
           try {
             const background = params.wait === true ? false : Boolean(ctx?.hasUI);
-            const res = await targetWs.resumeManagedFlow(ctx, background, background ? undefined : signal, originWs, targetFlowId);
+            const res = await targetWs.resumeManagedFlow(
+              ctx, background, background ? undefined : signal, originWs, targetFlowId,
+              { ...(reqNodeId ? { targetNodeId: reqNodeId } : {}), ...(msg ? { replyText: msg } : {}) },
+            );
             hub.syncGlobalUi(ctx, originWs);
             return toolResult({ ...(res as object), ...(targetWs.trustNotice ? { trustNotice: targetWs.trustNotice } : {}) });
           } catch (err) {
@@ -290,17 +308,30 @@ export function registerFlowTool(
           const targetWs = hub.resolveFlowWorkspace(originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx, (w) => w.room.hasActiveLeaseOwnership());
           const liveState = targetWs.room.getPersistedMachineState();
           if (!liveState || !targetWs.room.isRunning()) {
-            return toolResult({ patched: false, error: "No running DAG Flow found to patch in target workspace." }, true);
+            return toolResult({
+              patched: false, ...(reqFlowId ? { flowId: reqFlowId } : {}),
+              error: reqFlowId ? `Flow "${reqFlowId}" is not currently running and cannot be patched.` : "No running DAG Flow found to patch in target workspace.",
+            }, true);
           }
+          if (reqFlowId && liveState.flowId !== reqFlowId) {
+            return toolResult({
+              patched: false, flowId: reqFlowId, activeFlowId: liveState.flowId,
+              error: `Flow "${reqFlowId}" is not the currently running DAG Flow (active: "${liveState.flowId}") and cannot be patched.`,
+            }, true);
+          }
+          const targetFlowId = reqFlowId ?? liveState.flowId;
           const nodeStatuses = Object.fromEntries(Object.entries(liveState.nodes).map(([k, v]) => [k, v.status]));
           const { patch, validation } = parseAndValidatePatch({
             rawPatch: params.patch, currentSpec: liveState.spec, nodeStatuses, rolesMap: targetWs.roles, cwd: targetWs.cwd,
           });
           if (!validation.ok) {
-            return toolResult({ patched: false, invalidGraph: true, issues: validation.issues, error: validation.issues.map((i) => i.message).join(" | ") }, true);
+            return toolResult({ patched: false, flowId: targetFlowId, invalidGraph: true, issues: validation.issues, error: validation.issues.map((i) => i.message).join(" | ") }, true);
           }
-          const applied = targetWs.patchActiveFlow?.(patch, validation) ?? false;
-          return toolResult({ patched: applied, flowId: liveState.flowId, waves: validation.waves }, !applied);
+          const applied = targetWs.patchActiveFlow?.(targetFlowId, patch, validation) ?? false;
+          return toolResult({
+            patched: applied, flowId: targetFlowId,
+            ...(applied ? { waves: validation.waves } : { error: `Flow "${targetFlowId}" is no longer active and could not be patched.` }),
+          }, !applied);
         }
 
         if (action !== "start") throw new Error(`Unknown enhance_flow action "${action}".`);

@@ -5,7 +5,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type {
   ArtifactDigestKind, ArtifactRecord, BackgroundJob, EpistemicItem, EpistemicKind, EpistemicStatus,
-  FlowLeaseMode, FlowStageTrace, FlowUserSteer, HandoffEnvelope, JobStatus, Mandate, MandateStatus,
+  FlowLeaseMode, FlowMachineState, FlowStageTrace, FlowUserSteer, HandoffEnvelope, JobStatus, Mandate, MandateStatus,
   PersistedFlowCheckpoint, RoomEntry, VerificationEvidenceRecord,
 } from "./types.ts";
 
@@ -265,6 +265,24 @@ export function mergeSteersIntoSnapshotJson(snapshotJson: string, steers: readon
   return JSON.stringify({ ...snap, entries, userSteers: steers });
 }
 
+export function markMachineStateInterrupted(state: FlowMachineState, ts: string): FlowMachineState {
+  const nodes: FlowMachineState["nodes"] = {};
+  for (const [id, rt] of Object.entries(state.nodes)) {
+    const subState = rt.subState ? markMachineStateInterrupted(rt.subState, ts) : rt.subState;
+    nodes[id] = rt.status === "running" || rt.status === "retrying"
+      ? { ...rt, status: "ready", activeStageId: null, sessionResidency: "disposed", endedAt: ts, ...(subState !== undefined ? { subState } : {}) }
+      : (subState !== undefined ? { ...rt, subState } : rt);
+  }
+  return state.status === "running"
+    ? { ...state, status: "interrupted", endedAt: ts, reason: "上次进程中断，可在总秘书 (/coord) 中断点续跑", nodes }
+    : { ...state, nodes };
+}
+
+export function mutateMachineStateForInterrupt(machineStateJson: string | null | undefined, ts: string): string | null {
+  const parsed = safeParseObject<FlowMachineState>(machineStateJson);
+  return parsed?.nodes ? JSON.stringify(markMachineStateInterrupted(parsed, ts)) : (machineStateJson ?? null);
+}
+
 export function mutateSnapshotForInterrupt(snapshotJson: string, ts: string): string {
   const snap = safeParseObject<Record<string, unknown>>(snapshotJson) ?? {};
   const stages = (Array.isArray(snap.stages) ? [...(snap.stages as FlowStageTrace[])] : []).map((st) =>
@@ -273,7 +291,15 @@ export function mutateSnapshotForInterrupt(snapshotJson: string, ts: string): st
   const entries = (Array.isArray(snap.entries) ? [...(snap.entries as RoomEntry[])] : []).map((en) =>
     en.badge?.startsWith("●") ? { ...en, badge: "⏸ 中断", tone: "warning" as const, text: "进程中断，可在总秘书 (/coord) 中从本阶段断点续跑" } : en,
   );
-  return JSON.stringify({ ...snap, status: "interrupted", activeStageId: null, endedAt: ts, reason: "上次进程中断，可在总秘书 (/coord) 中断点续跑", stages, entries });
+  const rawGraph = snap.graphSnapshot && typeof snap.graphSnapshot === "object" ? (snap.graphSnapshot as Record<string, unknown>) : null;
+  const graphSnapshot = rawGraph && Array.isArray(rawGraph.nodes)
+    ? { ...rawGraph, nodes: rawGraph.nodes.map((n: any) => (n?.status === "running" || n?.status === "retrying" ? { ...n, status: "ready", activeStageId: null, sessionResidency: "disposed" } : n)) }
+    : rawGraph;
+  return JSON.stringify({
+    ...snap, status: "interrupted", activeStageId: null, endedAt: ts,
+    reason: "上次进程中断，可在总秘书 (/coord) 中断点续跑", stages, entries,
+    ...(graphSnapshot ? { graphSnapshot } : {}),
+  });
 }
 
 export function mutateSnapshotForCancel(snapshotJson: string, ts: string): string {
@@ -334,8 +360,8 @@ export function runAcquireProjectLeaseTx(
     ),
   );
   if (existing && !sameOwnerReacquire) {
-    const flowRow = db.query("SELECT status, cwd, snapshot_json FROM flow_runs WHERE flow_id = ?")
-      .get(existing.flow_id) as { status: string; cwd: string | null; snapshot_json: string } | null;
+    const flowRow = db.query("SELECT status, cwd, snapshot_json, machine_state_json FROM flow_runs WHERE flow_id = ?")
+      .get(existing.flow_id) as { status: string; cwd: string | null; snapshot_json: string; machine_state_json: string | null } | null;
     const alreadySettled = Boolean(flowRow && flowRow.status !== "running");
     const holderActive = !alreadySettled && (
       existing.owner_pid === pid || isProcessAliveWithToken(existing.owner_pid, existing.owner_start_token)
@@ -344,8 +370,8 @@ export function runAcquireProjectLeaseTx(
       throw new ProjectBusyError({ cwd: inferStoreCwd(dbPath, flowRow?.cwd), activeFlowId: existing.flow_id, ownerPid: existing.owner_pid });
     }
     if (flowRow && flowRow.status === "running") {
-      db.query("UPDATE flow_runs SET status = 'interrupted', owner_pid = NULL, owner_start_token = NULL, lease_token = NULL, state_version = COALESCE(state_version, 0) + 1, snapshot_json = ?, updated_at = ? WHERE flow_id = ?")
-        .run(mutateSnapshotForInterrupt(flowRow.snapshot_json, ts), ts, existing.flow_id);
+      db.query("UPDATE flow_runs SET status = 'interrupted', owner_pid = NULL, owner_start_token = NULL, lease_token = NULL, state_version = COALESCE(state_version, 0) + 1, snapshot_json = ?, machine_state_json = ?, updated_at = ? WHERE flow_id = ?")
+        .run(mutateSnapshotForInterrupt(flowRow.snapshot_json, ts), mutateMachineStateForInterrupt(flowRow.machine_state_json, ts), ts, existing.flow_id);
     }
   }
   const effectiveLeaseToken = sameOwnerReacquire

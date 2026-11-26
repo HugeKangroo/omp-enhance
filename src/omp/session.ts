@@ -182,7 +182,7 @@ export function createOmpRoleSessionRunner(
       const baselineConfigSnap = stepCtx.beforeConfigSnapshot ?? childTracker.getBaselineConfigSnapshot(stepCtx.cwd);
       const stageId = stepCtx.stageId ?? `${stepCtx.role.id}-${Date.now()}`;
       const pool = stepCtx.sessionPool instanceof FlowSessionPool ? stepCtx.sessionPool : null;
-      const nodeKeyId = stepCtx.nodeId ?? stepCtx.role.id;
+      const nodeKeyId = stepCtx.sessionSlotId ?? stepCtx.nodeId ?? stepCtx.role.id;
       const warmHandle = stepCtx.reuseSession && pool && stepCtx.flowId ? pool.getWarm(stepCtx.flowId, nodeKeyId) : null;
       let childSession: any = null, stalledInfo: { idleSec: number } | null = null;
       const watchdog = startStallWatchdog({
@@ -190,8 +190,8 @@ export function createOmpRoleSessionRunner(
         onStall: (idleSec) => { stalledInfo = { idleSec }; void triggerSessionAbort(true); },
       });
       const bindings: ActiveTurnBindings = {
-        stepCtx, childTracker, baselineSnap, baselineConfigSnap, stageId, stageStartedJobIds: new Set<string>(),
-        submittedEnvelope: null, boundaryViolations: [], touchActivity: () => watchdog.touch(),
+        stepCtx, childTracker, baselineSnap, baselineConfigSnap, stageId, turnStartMessageIndex: 0,
+        stageStartedJobIds: new Set<string>(), submittedEnvelope: null, boundaryViolations: [], touchActivity: () => watchdog.touch(),
       };
       const turnRef = warmHandle ? warmHandle.turnRef : { current: bindings };
       if (warmHandle) warmHandle.turnRef.current = bindings;
@@ -199,7 +199,8 @@ export function createOmpRoleSessionRunner(
       const collectObservedCalls = (): ObservedToolCall[] => {
         const cur = turnRef.current, calls = new Map<string, ObservedToolCall>();
         for (const call of cur.childTracker.getObservedCalls()) calls.set(call.toolCallId, call);
-        const messages: any[] = Array.isArray(childSession?.messages) ? childSession.messages : [];
+        const allMessages: any[] = Array.isArray(childSession?.messages) ? childSession.messages : [];
+        const messages = allMessages.slice(cur.turnStartMessageIndex);
         const argsByCallId = new Map<string, unknown>();
         for (const m of messages) {
           if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
@@ -211,7 +212,7 @@ export function createOmpRoleSessionRunner(
           const parsed = fallbackTracker.recordToolExecutionEnd(cur.stepCtx.cwd, {
             toolCallId: m.toolCallId, toolName: typeof m.toolName === "string" ? m.toolName : "unknown",
             args: m.args ?? m.input ?? argsByCallId.get(m.toolCallId), result: m, output: m.output, details: m.details,
-            exitCode: typeof m.exitCode === "number" ? m.exitCode : undefined, isError: m.isError === true,
+            exitCode: typeof m.exitCode === "number" ? m.exitCode : undefined, isError: m.isError === true, stageId: cur.stageId,
           });
           calls.set(m.toolCallId, { ...parsed, timestamp: typeof m.timestamp === "string" ? m.timestamp : parsed.timestamp });
         }
@@ -239,7 +240,7 @@ export function createOmpRoleSessionRunner(
               ? params.questionsForUser.filter((q: unknown): q is string => typeof q === "string" && q.trim().length > 0) : undefined;
             const envelope = createAndVerifyHandoff({
               store: cur.stepCtx.store, role: cur.stepCtx.role, cwd: cur.stepCtx.cwd, mandate: cur.stepCtx.mandate,
-              flowId: cur.stepCtx.flowId, parentHandoffId: cur.stepCtx.upstreamHandoff?.id ?? null,
+              flowId: cur.stepCtx.flowId, stageId: cur.stageId, parentHandoffId: cur.stepCtx.upstreamHandoff?.id ?? null,
               toTarget: effectiveTarget, verdict: params.verdict, summary: params.summary,
               artifactPaths: params.artifactPaths, baselineSnapshot: cur.baselineSnap,
               baselineConfigSnapshot: cur.baselineConfigSnap, enforceConfigIntegrity: true,
@@ -284,7 +285,7 @@ export function createOmpRoleSessionRunner(
           const call = cur.childTracker.recordToolExecutionEnd(cur.stepCtx.cwd, {
             toolCallId: ev.toolCallId ?? ev.id ?? "call", toolName: ev.toolName ?? ev.name ?? "unknown",
             args: ev.args, input: ev.input, result: ev.result, output: ev.output, details: ev.details,
-            exitCode: typeof ev.exitCode === "number" ? ev.exitCode : undefined, isError: Boolean(ev.isError ?? ev.result?.isError),
+            exitCode: typeof ev.exitCode === "number" ? ev.exitCode : undefined, isError: Boolean(ev.isError ?? ev.result?.isError), stageId: cur.stageId,
           });
           cur.stepCtx.observer?.onToolEnd?.(cur.stageId, call);
           void cur.stepCtx.observer?.drainPendingSteers?.({ roleId: cur.stepCtx.role.id, stageId: cur.stageId, phase: "mid_stage" });
@@ -302,6 +303,9 @@ export function createOmpRoleSessionRunner(
       if (warmHandle) {
         childSession = warmHandle.session;
         modelLabel = warmHandle.modelLabel;
+        if (typeof childSession.setActiveTools === "function") {
+          try { await childSession.setActiveTools(allowedTools); } catch {}
+        }
         if (overrideModel && typeof childSession.setModel === "function") {
           try { await childSession.setModel(overrideModel); modelLabel = formatResolvedModelLabel(overrideModel, stepCtx.modelOverride ?? modelLabel); warmHandle.modelLabel = modelLabel; } catch {}
         }
@@ -330,6 +334,7 @@ export function createOmpRoleSessionRunner(
           activeHandle = { key: `${stepCtx.flowId}::${nodeKeyId}`, flowId: stepCtx.flowId, nodeId: nodeKeyId, roleId: stepCtx.role.id, cwd: stepCtx.cwd, session: childSession, modelLabel, turnRef, disposed: false };
         }
       }
+      bindings.turnStartMessageIndex = Array.isArray(childSession?.messages) ? childSession.messages.length : 0;
 
       const unsubActivity = typeof childSession?.subscribe === "function" ? childSession.subscribe(() => watchdog.touch()) : null;
       const triggerSessionAbort = async (isStall = false): Promise<void> => {

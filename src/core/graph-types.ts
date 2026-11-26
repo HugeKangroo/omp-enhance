@@ -139,7 +139,8 @@ export interface GraphValidationIssue {
     | "invalid_repair_target"
     | "invalid_fork_source"
     | "invalid_merge_source"
-    | "worktree_requires_git";
+    | "worktree_requires_git"
+    | "missing_merge_delivery";
   nodeId?: string;
   otherNodeId?: string;
   message: string;
@@ -183,6 +184,51 @@ export interface FlowBoardEntry {
   consumedByNode?: string | null;
 }
 
+export interface RoleWorkflowExitGateSpec {
+  command: string;
+  timeoutSec?: number;
+  expectExitCode?: number;
+  parseJsonMetricsPath?: string;
+}
+
+export interface RoleWorkflowPhaseSpec {
+  id: string;
+  title?: string;
+  kind?: "role" | "gate" | "human";
+  dependsOn?: string[];
+  tools?: string[];
+  writable?: string[];
+  lockProtected?: string[];
+  exitArtifacts?: string[];
+  exitGate?: RoleWorkflowExitGateSpec;
+  prompt?: string;
+  brief?: string;
+  maxAttempts?: number;
+  fallbackModels?: string[];
+}
+
+export interface RoleWorkflowSpec {
+  session?: "reuse" | "fresh";
+  repairEntry?: string;
+  maxRepairRounds?: number;
+  phases: RoleWorkflowPhaseSpec[];
+}
+
+export interface RoleSubPhaseView {
+  id: string;
+  title: string;
+  kind: NodeKind;
+  status: NodeStatus;
+  lockedProtected?: string[];
+}
+
+export interface RoleSubProgressView {
+  completed: number;
+  total: number;
+  activePhaseId?: string;
+  phases: RoleSubPhaseView[];
+}
+
 export interface FlowNodeRuntime {
   nodeId: string;
   status: NodeStatus;
@@ -201,7 +247,9 @@ export interface FlowNodeRuntime {
   lastGateEvidence: VerificationEvidenceRecord | null;
   lastError: string | null;
   lastRepairFeedback: string | null;
+  lastReply?: string | null;
   questionsForUser: string[];
+  subState?: FlowMachineState | null;
   startedAt: string | null;
   endedAt: string | null;
 }
@@ -259,11 +307,12 @@ export type FlowCommand =
       reuseSession: boolean;
       forkFromNodeId?: string;
       worktreePath?: string;
+      targetCommitRef?: string;
       modelOverride?: string;
       repairFeedback?: string;
       replyText?: string;
     }
-  | { type: "RUN_GATE_NODE"; nodeId: string; stageId: string; attempt: number; worktreePath?: string; config: GateNodeConfig }
+  | { type: "RUN_GATE_NODE"; nodeId: string; stageId: string; attempt: number; worktreePath?: string; targetCommitRef?: string; config: GateNodeConfig }
   | { type: "RUN_MERGE_NODE"; nodeId: string; stageId: string; attempt: number; sourceNodeIds: string[]; sourceRefs: Record<string, string>; config: MergeNodeConfig }
   | { type: "RUN_HUMAN_NODE"; nodeId: string; stageId: string; config: HumanNodeConfig }
   | { type: "RUN_NATIVE_TASK_NODE"; nodeId: string; stageId: string; attempt: number; config: NativeTaskNodeConfig }
@@ -293,6 +342,8 @@ export interface FlowGraphNodeView {
   currentModel: string | null;
   triedModels: string[];
   activeStageId: string | null;
+  questionsForUser?: string[];
+  subProgress?: RoleSubProgressView;
   summary?: string;
 }
 

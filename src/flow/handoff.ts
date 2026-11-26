@@ -42,6 +42,7 @@ export interface CreateHandoffInput {
   defaultGoal?: string;
   sessionId?: string | null;
   flowId?: string | null;
+  stageId?: string;
   parentHandoffId?: string | null;
   toTarget?: string;
   artifactPaths?: readonly string[];
@@ -137,14 +138,25 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
 
   let verificationEvidence: VerificationEvidenceRecord[] | undefined;
   if (input.verdict === "ready" && !input.isConsultation && input.role.exit.requireTestExecution) {
-    verificationEvidence = verifyQaTestExecution(input.role.id, observedCalls, after, input.store);
+    verificationEvidence = verifyQaTestExecution(input.role.id, observedCalls, after, input.store, input.stageId);
   }
+
+  const existingMandate = input.mandate ?? input.store.getActiveMandate({
+    ...(input.flowId ? { flowId: input.flowId } : {}),
+    ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+  });
+  const mandateArtifacts = existingMandate ? input.store.listArtifacts(existingMandate.id) : [];
 
   const resolvedCwd = path.resolve(input.cwd);
   if (input.verdict === "ready" && !input.isConsultation && input.role.exit.requireAlgoDeliverables) {
+    const mandateMetricsSet = new Set(
+      mandateArtifacts
+        .filter((a) => (a.role === "metrics" || a.role === "changed") && after.get(a.path)?.sha256 === a.sha256)
+        .map((a) => a.path),
+    );
     verifyAlgoDeliverables({
       roleId: input.role.id, resolvedCwd, after, afterPaths,
-      hasBaselineSnapshot: Boolean(input.baselineSnapshot), turnChangedSet, explicitRelPaths,
+      hasBaselineSnapshot: Boolean(input.baselineSnapshot), turnChangedSet, mandateMetricsSet, explicitRelPaths,
     });
   }
 
@@ -169,11 +181,6 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
     .sort((left, right) => left.path.localeCompare(right.path));
   const deletedFiles = [...deletedSet].sort();
 
-  const existingMandate = input.mandate ?? input.store.getActiveMandate({
-    ...(input.flowId ? { flowId: input.flowId } : {}),
-    ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-  });
-
   const allowedEvidence = new Set<string>();
   const validCallIds: string[] = [];
   for (const call of observedCalls) {
@@ -183,7 +190,7 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
     }
   }
   const hasValidTool = validCallIds.length > 0;
-  for (const artifact of [...artifacts, ...(existingMandate ? input.store.listArtifacts(existingMandate.id) : [])]) {
+  for (const artifact of [...artifacts, ...mandateArtifacts]) {
     const live = after.get(artifact.path);
     if (live && live.sha256 === artifact.sha256) {
       allowedEvidence.add(artifact.sha256);

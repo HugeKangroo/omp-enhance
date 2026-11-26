@@ -35,7 +35,7 @@ export interface RoleStepContext {
   cwd: string; store: EnhanceStore; role: RoleSpec; mandate: Mandate;
   epistemicItems: readonly EpistemicItem[]; upstreamHandoff: HandoffEnvelope | null;
   userSteers?: readonly FlowUserSteer[]; toTarget: string; repairTargetRoleId?: string;
-  flowId?: string | null; nodeId?: string; conditioningPrompt: string; taskPrompt: string;
+  flowId?: string | null; nodeId?: string; sessionSlotId?: string; conditioningPrompt: string; taskPrompt: string;
   stageId?: string; round?: number; observer?: FlowObserver; supervisor?: RoleSupervisorConfig;
   signal?: AbortSignal;
   beforeSnapshot?: ReadonlyMap<string, SnapshotEntry>;
@@ -63,7 +63,7 @@ export interface RoleSessionRunner {
 export interface ExecuteRoleStepInput {
   cwd: string; store: EnhanceStore; role: RoleSpec; mandate: Mandate;
   upstreamHandoff: HandoffEnvelope | null; userSteers?: readonly FlowUserSteer[];
-  toTarget: string; repairTargetRoleId?: string; flowId?: string | null; nodeId?: string;
+  toTarget: string; repairTargetRoleId?: string; flowId?: string | null; nodeId?: string; sessionSlotId?: string;
   runner: RoleSessionRunner; stageId?: string; round?: number; modelLabel?: string;
   observer?: FlowObserver; supervisor?: RoleSupervisorConfig; signal?: AbortSignal;
   reuseSession?: boolean; keepSessionWarm?: boolean; forkFromNodeId?: string;
@@ -145,6 +145,7 @@ export async function executeRoleStep(input: ExecuteRoleStepInput): Promise<Exec
     ...(input.repairTargetRoleId ? { repairTargetRoleId: input.repairTargetRoleId } : {}),
     ...(input.flowId ? { flowId: input.flowId } : {}),
     ...(input.nodeId ? { nodeId: input.nodeId } : {}),
+    ...(input.sessionSlotId ? { sessionSlotId: input.sessionSlotId } : {}),
     conditioningPrompt,
     taskPrompt: taskPromptFor({
       role: input.role, mandate: input.mandate, upstreamHandoff: input.upstreamHandoff, userSteers,

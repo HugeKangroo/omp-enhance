@@ -1,7 +1,5 @@
-import {
-  captureProcessStartToken, isProcessAliveWithToken, LeaseLostError,
-  type EnhanceStore, type PersistedFlowCheckpoint,
-} from "../core/store.ts";
+import { captureProcessStartToken, isProcessAliveWithToken, LeaseLostError, type EnhanceStore, type PersistedFlowCheckpoint } from "../core/store.ts";
+import { markMachineStateInterrupted } from "../core/store-schema.ts";
 import type {
   FlowGraphSnapshot, FlowLeaseMode, FlowMachineState, FlowRoomStatus, FlowRunResult, FlowStageTrace,
   FlowUserSteer, HandoffEnvelope, ObservedToolCall, RoleSpec, RoomEntry, SupervisorDecision, UsageSummary,
@@ -14,15 +12,9 @@ import {
 
 export { isCheckpointResumable, parseDirectedSteer, snapshotFromCheckpoint };
 export type { FlowRoomStatus } from "../core/types.ts";
-
-export interface ActiveStageControls {
-  steer: (message: string) => Promise<void>;
-  abort: () => Promise<void>;
-}
-
+export interface ActiveStageControls { steer: (message: string) => Promise<void>; abort: () => Promise<void>; }
 export interface StageTurnSummaryLike {
-  envelope: HandoffEnvelope | null; observedCalls: ObservedToolCall[];
-  assistantText: string; usage: UsageSummary | null;
+  envelope: HandoffEnvelope | null; observedCalls: ObservedToolCall[]; assistantText: string; usage: UsageSummary | null;
   abortedBySupervisor?: SupervisorDecision | null; cancelledByUser?: boolean; hostError?: string | null;
 }
 
@@ -32,34 +24,22 @@ export interface FlowObserver {
   getUserSteers?: () => readonly FlowUserSteer[];
   drainPendingSteers?: (info?: { roleId?: string; stageId?: string; phase?: "pre_stage" | "mid_stage" }) => Promise<number>;
   bindControls?: (controls: ActiveStageControls | null, stageId?: string) => void;
-  onProgress?: (info: {
-    currentIndex: number; repairRound: number; lastHandoffId: string | null;
-    lastRejectionSig?: string | null; nextStageSeq?: number;
-  }) => void;
+  onProgress?: (info: { currentIndex: number; repairRound: number; lastHandoffId: string | null; lastRejectionSig?: string | null; nextStageSeq?: number }) => void;
   onStageStart?: (info: { stageId: string; role: RoleSpec; round: number; toTarget: string; modelLabel: string }) => void;
   onStageModelResolved?: (stageId: string, modelLabel: string) => void;
   onToolStart?: (stageId: string, summary: string) => void;
   onToolEnd?: (stageId: string, call: ObservedToolCall) => void;
   onSupervisorNote?: (stageId: string, note: string) => void;
-  onStageEnd?: (stageId: string, info: {
-    status: "ready" | "needs_input" | "rejected" | "blocked" | "violation" | "host_error" | "missing_handoff" | "aborted";
-    outcome: StageTurnSummaryLike | null; reason?: string; hostError?: string | null;
-  }) => void;
+  onStageEnd?: (stageId: string, info: { status: "ready" | "needs_input" | "rejected" | "blocked" | "violation" | "host_error" | "missing_handoff" | "aborted"; outcome: StageTurnSummaryLike | null; reason?: string; hostError?: string | null }) => void;
 }
-
 export interface FlowRoomSnapshot {
-  flowId: string | null; mandateId?: string; goal: string; cwd?: string; roleChain: string[];
-  status: FlowRoomStatus; reason?: string; currentIndex?: number; repairRound?: number;
-  startedAt: string | null; endedAt: string | null; activeStageId: string | null;
-  entries: RoomEntry[]; stages: FlowStageTrace[]; userSteers?: FlowUserSteer[];
-  graphSnapshot?: FlowGraphSnapshot | null;
+  flowId: string | null; mandateId?: string; goal: string; cwd?: string; roleChain: string[]; status: FlowRoomStatus; reason?: string;
+  currentIndex?: number; repairRound?: number; startedAt: string | null; endedAt: string | null; activeStageId: string | null;
+  entries: RoomEntry[]; stages: FlowStageTrace[]; userSteers?: FlowUserSteer[]; graphSnapshot?: FlowGraphSnapshot | null;
 }
-
 export interface FlowRoomUiAdapter {
-  mountWidget?: (room: FlowRoomManager, ctx?: any) => void;
-  clearWidget?: (ctx?: any) => void;
-  sendSummaryCard?: (snapshot: FlowRoomSnapshot, summary: string, ctx?: any) => void;
-  requestRender?: () => void;
+  mountWidget?: (room: FlowRoomManager, ctx?: any) => void; clearWidget?: (ctx?: any) => void;
+  sendSummaryCard?: (snapshot: FlowRoomSnapshot, summary: string, ctx?: any) => void; requestRender?: () => void;
 }
 
 export class FlowRoomManager {
@@ -197,7 +177,19 @@ export class FlowRoomManager {
     for (const en of this.entries) if (en.badge?.startsWith("●")) {
       en.badge = "⏸ 中断"; en.tone = "warning"; en.text = "进程中断，可在总秘书 (/coord) 中从本阶段断点续跑";
     }
+    this.recoverInterruptedMachineState(this.endedAt);
     this.persist({ allowUnfencedRecovery: true });
+  }
+
+  private recoverInterruptedMachineState(ts: string): void {
+    if (!this.machineStateJson) return;
+    try {
+      const parsed = JSON.parse(this.machineStateJson) as FlowMachineState;
+      if (parsed.status === "running") {
+        const rec = markMachineStateInterrupted(parsed, ts);
+        this.machineStateJson = JSON.stringify(rec); this.graphSnapshot = buildFlowGraphSnapshot(rec);
+      }
+    } catch {}
   }
 
   getSnapshot(): FlowRoomSnapshot {
@@ -270,8 +262,11 @@ export class FlowRoomManager {
     }
     if (!cp && !this.isResumable()) throw new Error("当前没有可断点续跑的中断/失败 Flow。");
     const leaseFlowId = cp?.flowId ?? effectiveId!;
+    const resumeLeaseMode = cp?.leaseMode ?? this.leaseMode;
     if (this.store && !this.store.isClosed()) {
-      const acq = this.store.acquireProjectFlowLease(leaseFlowId, process.pid, this.selfStartToken);
+      const acq = resumeLeaseMode === "write_main"
+        ? this.store.acquireProjectFlowLease(leaseFlowId, process.pid, this.selfStartToken)
+        : this.store.acquireScopedFlowLease(leaseFlowId, resumeLeaseMode, process.pid, this.selfStartToken);
       cp = this.store.getFlowCheckpoint(leaseFlowId) ?? cp;
       if (cp) this.applyCheckpointState(cp);
       this.leaseToken = acq.leaseToken; this.stateVersion = acq.stateVersion;
@@ -281,8 +276,9 @@ export class FlowRoomManager {
     this.endedAt = null; this.reason = undefined; this.controlStack = [];
     this.flowAbortController = new AbortController(); this.activeStageId = null; this.seq += 1;
     const now = new Date().toISOString();
+    this.recoverInterruptedMachineState(now);
     for (const st of this.stages) if (st.status === "running") { st.status = "aborted"; st.endedAt = now; st.activeTool = null; }
-    const roleId = this.roleChain[this.currentIndex]!;
+    const roleId = this.roleChain[this.currentIndex] ?? this.roleChain[0]!;
     this.entries.push({ id: `user-${this.seq}-resume`, side: "right", speaker: "你", badge: "续跑", tone: "success", text: `从阶段 ${this.currentIndex + 1}/${this.roleChain.length} (${roleId}) 断点继续`, timestamp: now });
     this.persist(); this.startSteerPoll(); this.ui?.mountWidget?.(this, ctx); this.notify();
     return {

@@ -381,6 +381,7 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
 
     await h.emit("before_agent_start", { systemPrompt: ["Base"] }, ctx);
     writeText(path.join(cwd, "src", "bugfix.ts"), "export const fixed = true;\n");
+    writeText(path.join(cwd, "algo_work", "benchmark", "data_profile.json"), JSON.stringify({ rows: 10, missing: 0 }) + "\n");
     writeText(
       path.join(cwd, "algo_work", "REPORT.md"),
       "# F5 Retry Benchmark Report\nVerified retry preserved workspace baseline and improved validation score to 0.99.\n",
@@ -411,12 +412,21 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
       messages: [{ role: "assistant", stopReason: "stop" }],
     }, ctx);
 
+    // Turn 2: algo is now at human gate `align_metric`; explicitly confirm it to enter `baseline`
     await h.emit("before_agent_start", { systemPrompt: ["Base"] }, ctx);
-    const turn2Res = await h.tools.get("enhance_handoff")!.execute("ho-2", {
-      verdict: "ready", summary: "Unverified claim on Turn 2",
+    const confirmGateRes = await h.tools.get("enhance_handoff")!.execute("ho-confirm", {
+      verdict: "ready", summary: "User confirmed metric preference: prioritize recall",
     }, null, null, ctx);
-    expect(turn2Res.isError).toBe(true);
-    expect(turn2Res.content[0].text).toContain("requires");
+    expect(confirmGateRes.isError).toBeUndefined();
+    await h.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+
+    // Turn 3 (baseline phase, require_tool_evidence=true): unverified claim without tool execution must fail
+    await h.emit("before_agent_start", { systemPrompt: ["Base"] }, ctx);
+    const turn3Res = await h.tools.get("enhance_handoff")!.execute("ho-2", {
+      verdict: "ready", summary: "Unverified claim on Turn 3",
+    }, null, null, ctx);
+    expect(turn3Res.isError).toBe(true);
+    expect(turn3Res.content[0].text).toContain("requires");
 
     await h.emit("session_shutdown", {}, ctx);
   });

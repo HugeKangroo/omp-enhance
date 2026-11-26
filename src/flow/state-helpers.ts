@@ -14,7 +14,8 @@ export function parseDirectedSteer(rawMessage: string): { text: string; targetRo
 
 export function isCheckpointResumable(cp: PersistedFlowCheckpoint | null | undefined): boolean {
   return Boolean(
-    cp?.flowId && cp.mandateId && cp.roleChain.length > 0 && cp.currentIndex < cp.roleChain.length &&
+    cp?.flowId && cp.mandateId && cp.roleChain.length > 0 &&
+    (Boolean(cp.machineStateJson) || cp.currentIndex < cp.roleChain.length) &&
     (cp.status === "waiting_input" || cp.status === "interrupted" || cp.status === "failed" || cp.status === "cancelled"),
   );
 }

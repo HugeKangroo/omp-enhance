@@ -23,3 +23,30 @@ exit:
     - 每个实验件 runs/exp_NNN_<slug>/ 均独立具备可复现 spec.yaml、metrics.json、vis/ 诊断图与 summary.md，REPORT.md 数值与 metrics.json 完全一致
     - 关键图表均已按 RuntimeVision 准则完成真实看图取证，且在需人类拍板的必停门禁处规范使用 verdict="needs_input" + questionsForUser 对齐
     - algo_work/REPORT.md 四道门禁章节与 algo_work/best/README.md 通俗交付说明齐全，已如实披露分组表现、真值上限与剩余场景限制
+
+workflow:
+  session: reuse
+  repair_entry: iterate
+  max_repair_rounds: 3
+  phases:
+    - id: audit
+      title: 门禁1 · 数据体检与防泄漏审计
+      exit_artifacts: ["algo_work/benchmark/data_profile.json"]
+      brief: "完成数据质量与分布审计、看图核查真实样本与标注，产出 algo_work/benchmark/data_profile.json 并填完 REPORT.md 第 1 节。"
+    - id: align_metric
+      title: 门禁1b · 对齐评估指标与业务红线
+      kind: human
+      prompt: "数据体检已完成。请用大白话确认：当前业务更怕漏检还是误报？更关注整体均值还是 P95/P99 极端大错？是否有延迟/显存硬红线？"
+    - id: baseline
+      title: 门禁2 · exp_000 基线立靶
+      exit_artifacts: ["algo_work/benchmark/splits.json", "algo_work/benchmark/eval.py", "algo_work/runs/exp_000_baseline/metrics.json"]
+      brief: "按对齐指标固化防同源泄漏 splits.json 与唯一打分脚本 benchmark/eval.py，跑通 exp_000 基线并完成 Top-K 错例看图归因。"
+    - id: iterate
+      title: 门禁3 · 假设驱动单变量迭代
+      lock_protected: ["algo_work/benchmark/eval.py", "algo_work/benchmark/splits.json"]
+      brief: "严禁改动已物理锁死的 benchmark/eval.py 与 splits.json；围绕主导错例桶开展单变量假设实验并实时记录 ledger.jsonl。"
+    - id: deliver
+      title: 门禁4 · 独立评估复核与 best/ 交付
+      lock_protected: ["algo_work/benchmark/eval.py", "algo_work/benchmark/splits.json"]
+      exit_artifacts: ["algo_work/best/README.md", "algo_work/REPORT.md"]
+      brief: "收敛最优 Keep 实验至 algo_work/best/，完成独立评估与首尾对比图复核，补齐 REPORT.md 与 best/README.md。"

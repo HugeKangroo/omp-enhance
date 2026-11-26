@@ -12,6 +12,7 @@ import {
   dispatchSingleNode,
   emitTerminalCleanup,
   evaluateFlowSettlement,
+  formatWaitingNodesReason,
   getNodeSpec,
   handleRejection,
   handleResilienceRecovery,
@@ -79,26 +80,43 @@ export function transitionFlow(
       if (next.status !== "waiting_input" && next.status !== "interrupted" && next.status !== "failed" && next.status !== "cancelled") {
         return { state: next, commands };
       }
+      const waitingNodes = next.nodeOrder.filter((id) => next.nodes[id]!.status === "waiting_input");
+      if (next.status === "waiting_input" && !event.targetNodeId && waitingNodes.length > 1) {
+        next.reason = formatWaitingNodesReason(next, waitingNodes);
+        return finish();
+      }
+      if (event.targetNodeId && !next.nodes[event.targetNodeId]) {
+        return { state: next, commands };
+      }
+      const prevStatus = next.status;
       next.status = "running"; next.endedAt = null; next.reason = undefined;
       const replyByNode = new Map<string, string>();
-      const targets = event.targetNodeId && next.nodes[event.targetNodeId]
+      const trimmedReply = event.replyText?.trim();
+      const targets = event.targetNodeId
         ? [event.targetNodeId]
-        : next.nodeOrder.filter((id) => {
-            const st = next.nodes[id]!.status;
-            return st === "waiting_input" || st === "running" || st === "failed" || st === "retrying" || st === "cancelled";
-          });
+        : prevStatus === "waiting_input"
+          ? waitingNodes
+          : next.nodeOrder.filter((id) => {
+              const st = next.nodes[id]!.status;
+              return st === "ready" || st === "running" || st === "failed" || st === "retrying" || st === "cancelled";
+            });
       for (const id of targets) {
         const rt = next.nodes[id]!, spec = getNodeSpec(next, id)!;
         if (spec.kind === "human" && rt.status === "waiting_input") {
-          rt.status = "succeeded"; rt.endedAt = nowIso; rt.questionsForUser = [];
-          commands.push({ type: "APPEND_BOARD", entry: { nodeId: id, kind: "user_steer", speaker: "user", target: id, text: event.replyText ?? "已确认放行" } });
+          const recordedReply = trimmedReply || "已确认放行";
+          rt.status = "succeeded"; rt.endedAt = nowIso; rt.questionsForUser = []; rt.lastReply = recordedReply;
+          commands.push({ type: "APPEND_BOARD", entry: { nodeId: id, kind: "user_steer", speaker: "user", target: id, text: recordedReply } });
         } else {
           rt.status = "ready"; rt.activeStageId = null; rt.lastError = null; rt.questionsForUser = [];
-          if (event.replyText) replyByNode.set(id, event.replyText);
+          if (trimmedReply) {
+            rt.lastReply = trimmedReply;
+            replyByNode.set(id, trimmedReply);
+            commands.push({ type: "APPEND_BOARD", entry: { nodeId: id, kind: "user_steer", speaker: "user", target: id, text: trimmedReply } });
+          }
         }
       }
       scheduleReadyNodes(next, commands, nowIso, replyByNode);
-      evaluateFlowSettlement(next, commands, nowIso);
+      evaluateFlowSettlement(next, commands, nowIso, Boolean(event.targetNodeId));
       return finish();
     }
     case "FLOW_CANCEL": {
@@ -233,6 +251,7 @@ export function transitionFlow(
         rt.status = "succeeded"; rt.endedAt = nowIso; rt.commitRef = event.mergedRef ?? null; next.mergedRef = event.mergedRef ?? null;
         scheduleReadyNodes(next, commands, nowIso); evaluateFlowSettlement(next, commands, nowIso);
       } else {
+        if (event.mergedRef) { rt.commitRef = event.mergedRef; next.mergedRef = event.mergedRef; }
         const conflictList = (event.conflicts ?? []).join(", ");
         const msg = `Merge conflicts in ${event.nodeId}: ${conflictList || event.summary}`;
         if ((spec.merge?.conflictPolicy ?? "spawn_resolver") === "fail") {

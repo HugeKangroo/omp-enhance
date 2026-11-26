@@ -33,7 +33,8 @@ export function renderWaveOverviewBar(
       const n = byId.get(id);
       if (!n) return id;
       const wt = n.workspace === "worktree" ? ":wt" : "";
-      return `${nodeStatusGlyph(n.status)} ${n.nodeId}${wt}`;
+      const sub = n.subProgress ? `(${n.subProgress.completed}/${n.subProgress.total}${n.subProgress.activePhaseId ? `:${n.subProgress.activePhaseId}` : ""})` : "";
+      return `${nodeStatusGlyph(n.status)} ${n.nodeId}${wt}${sub}`;
     });
     return `W${idx}[${items.join(" | ")}]`;
   });
@@ -45,7 +46,8 @@ export function renderWaveOverviewBar(
           const n = byId.get(id);
           if (!n) return id;
           const wt = n.workspace === "worktree" ? ":wt" : "";
-          return fg(nodeStatusTone(n.status), `${nodeStatusGlyph(n.status)} ${n.nodeId}${wt}`);
+          const sub = n.subProgress ? `(${n.subProgress.completed}/${n.subProgress.total}${n.subProgress.activePhaseId ? `:${n.subProgress.activePhaseId}` : ""})` : "";
+          return fg(nodeStatusTone(n.status), `${nodeStatusGlyph(n.status)} ${n.nodeId}${wt}${sub}`);
         });
         return `${fg("muted", `W${idx}[`)}${items.join(fg("border", " | "))}${fg("muted", "]")}`;
       })
@@ -89,6 +91,13 @@ export function renderGraphNodeInspectorSection(graph: FlowGraphSnapshot, rightW
     out.push(` ${glyph} W${n.waveIndex} ${n.nodeId} (${kindLabel})${tagStr}`);
     if (n.writableScope?.length) {
       out.push(...wrapPlainText(`   scope: ${n.writableScope.join(", ")}`, Math.max(16, rightW - 2), 2));
+    }
+    if (n.subProgress && n.subProgress.phases.length > 0) {
+      const pList = n.subProgress.phases;
+      pList.forEach((ph, idx) => {
+        const branch = idx === pList.length - 1 ? "└─" : "├─";
+        out.push(`   ${branch} ${nodeStatusGlyph(ph.status)} ${ph.id} (${ph.kind})`);
+      });
     }
   }
   if (graph.mergedRef) out.push(` 合流引用: ${graph.mergedRef}`);

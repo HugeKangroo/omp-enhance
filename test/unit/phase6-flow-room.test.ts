@@ -801,7 +801,7 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
           return {
             session: {
               messages: [{ role: "assistant", usage: { input: 30, output: 15, cost: { total: 0.0005 } } }],
-              async prompt() {
+              async prompt(promptText: string) {
                 if (isVision) {
                   emitEnd("vis-read-1", "read", { path: "artifacts/vis/badcases.png" });
                   await handoffTool.execute("vh-1", {
@@ -811,35 +811,57 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
                   });
                   return;
                 }
-                writeText(path.join(cwd, "artifacts", "vis", "badcases.png"), "PNG_BYTES");
-                emitEnd("algo-plot-1", "bash", { command: "python plot_badcases.py" });
-                const consultRes = await handoffTool.execute("ah-consult", {
-                  verdict: "ready",
-                  toTarget: "vision",
-                  delegateNow: true,
-                  artifactPaths: ["artifacts/vis/badcases.png"],
-                  summary: "请核查 artifacts/vis/badcases.png 中的 Top-12 误差样本规律",
-                });
-                const parsedConsult = JSON.parse(consultRes.content[0].text);
-                expect(parsedConsult.delegated.ok).toBe(true);
-                expect(parsedConsult.delegated.envelope.summary).toContain("样本 #3/#7 真值框偏移");
-
+                if (promptText.includes("Phase 1/5: audit")) {
+                  writeText(path.join(cwd, "artifacts", "vis", "badcases.png"), "PNG_BYTES");
+                  writeText(path.join(cwd, "algo_work", "benchmark", "data_profile.json"), JSON.stringify({ rows: 100 }) + "\n");
+                  emitEnd("algo-plot-1", "bash", { command: "python plot_badcases.py" });
+                  const consultRes = await handoffTool.execute("ah-consult", {
+                    verdict: "ready",
+                    toTarget: "vision",
+                    delegateNow: true,
+                    artifactPaths: ["artifacts/vis/badcases.png"],
+                    summary: "请核查 artifacts/vis/badcases.png 中的 Top-12 误差样本规律",
+                  });
+                  const parsedConsult = JSON.parse(consultRes.content[0].text);
+                  expect(parsedConsult.delegated.ok).toBe(true);
+                  expect(parsedConsult.delegated.envelope.summary).toContain("样本 #3/#7 真值框偏移");
+                  await handoffTool.execute("ah-audit", {
+                    verdict: "ready",
+                    summary: "完成数据体检并经视觉诊断发现 #3/#7 真值框偏移",
+                    artifactPaths: ["artifacts/vis/badcases.png", "algo_work/benchmark/data_profile.json"],
+                  });
+                  return;
+                }
+                if (promptText.includes("Phase 3/5: baseline")) {
+                  writeText(path.join(cwd, "algo_work", "benchmark", "splits.json"), '{"train":[1],"val":[2]}\n');
+                  writeText(path.join(cwd, "algo_work", "benchmark", "eval.py"), "print('eval')\n");
+                  writeText(
+                    path.join(cwd, "algo_work", "runs", "exp_000_baseline", "metrics.json"),
+                    JSON.stringify({ experimentId: "exp_000_baseline", split: "holdout_v1", evaluatorVersion: "eval_v1.py", baseline: "self", mae: 0.1 }) + "\n",
+                  );
+                  emitEnd("algo-base-1", "bash", { command: "python eval_v1.py" });
+                  await handoffTool.execute("ah-base", { verdict: "ready", summary: "基线 exp_000 完成" });
+                  return;
+                }
+                if (promptText.includes("Phase 4/5: iterate")) {
+                  writeText(
+                    path.join(cwd, "algo_work", "runs", "r1", "metrics.json"),
+                    JSON.stringify({ experimentId: "r1", split: "holdout_v1", evaluatorVersion: "eval_v1.py", baseline: "exp_000_baseline", mae: 0.068 }) + "\n",
+                  );
+                  emitEnd("algo-opt-2", "bash", { command: "python eval_v1.py" });
+                  await handoffTool.execute("ah-iter", { verdict: "ready", summary: "单变量迭代 MAE 降 32%" });
+                  return;
+                }
+                writeText(path.join(cwd, "algo_work", "best", "README.md"), "# Best Sensor Regression Model\n");
                 writeText(
                   path.join(cwd, "algo_work", "REPORT.md"),
                   "# Algo Sensor Regression Report\nVisual badcase inspection removed dirty labels #3/#7 and reduced holdout MAE by 32%.\n",
                 );
-                writeText(
-                  path.join(cwd, "algo_work", "runs", "r1", "metrics.json"),
-                  JSON.stringify({
-                    experimentId: "r1", split: "holdout_v1", evaluatorVersion: "eval_v1.py",
-                    baseline: "exp_000", mae: 0.068,
-                  }) + "\n",
-                );
-                emitEnd("algo-opt-2", "bash", { command: "python eval_v1.py" });
+                emitEnd("algo-deliv-3", "bash", { command: "python eval_v1.py" });
                 await handoffTool.execute("ah-final", {
                   verdict: "ready",
                   summary: "依据视觉诊断修正边缘滞后与剔除脏标后，MAE 较基线降低 32%",
-                  artifactPaths: ["artifacts/vis/badcases.png", "algo_work/REPORT.md", "algo_work/runs/r1/metrics.json"],
+                  artifactPaths: ["artifacts/vis/badcases.png", "algo_work/REPORT.md", "algo_work/runs/r1/metrics.json", "algo_work/best/README.md"],
                 });
               },
               getLastAssistantText: () => "done",
@@ -864,8 +886,18 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
       ui: { setWidget() {}, setStatus() {}, notify() {} },
     };
 
-    const res = JSON.parse((await tools.get("enhance_flow")!.execute("f1", {
+    // Unified roles:["algo"] runs algo.yaml 5-phase workflow: audit (+ @vision consult) -> pauses at align_metric human gate!
+    const paused = JSON.parse((await tools.get("enhance_flow")!.execute("f1", {
       roles: ["algo"], goal: "优化传感器真值回归算法", wait: true,
+    }, null, null, ctx)).content[0].text);
+    expect(paused.status).toBe("waiting_input");
+    expect(paused.reason).toContain("数据体检已完成");
+
+    const statusBeforeResume = JSON.parse((await tools.get("enhance_flow")!.execute("st1", {
+      action: "status",
+    }, null, null, ctx)).content[0].text);
+    const res = JSON.parse((await tools.get("enhance_flow")!.execute("f1-res", {
+      action: "resume", flowId: statusBeforeResume.flowId, message: "更关注 P95 误差，无显存红线", wait: true,
     }, null, null, ctx)).content[0].text);
 
     expect(res.status).toBe("completed");
@@ -874,12 +906,9 @@ describe("Dual-Flow routing modes, live widget, mid-flight steer, and @role inpu
       { provider: "deepseek", id: "deepseek-r1" },
       { provider: "openrouter", id: "qwen/qwen3.8-flash" },
     ]);
-    const snap = sentMessages[0]!.details as FlowRoomSnapshot;
-    expect(snap.entries.map((e) => `${e.side}:${e.speaker}:${e.badge}`)).toEqual([
-      "right:你:目标",
-      "left:vision:✓ ready",
-      "left:algo:✓ ready",
-    ]);
+    const snap = sentMessages.at(-1)!.details as FlowRoomSnapshot;
+    expect(snap.entries.some((e) => e.side === "left" && e.speaker === "vision" && e.badge === "✓ ready")).toBe(true);
+    expect(snap.entries.some((e) => e.side === "left" && e.speaker === "algo__deliver" && e.badge === "✓ ready")).toBe(true);
   });
 
   test("injects adaptive RuntimeVision hints (suppressing vision self-delegation) and algo_work/ 4-gate rules", async () => {

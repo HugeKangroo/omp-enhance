@@ -33,28 +33,70 @@ const SEGMENT_TEST_RUNNER_RE = new RegExp(
   "i",
 );
 
+const TEST_OUTPUT_FAILURE_RE = /(?:^|\n)\s*(?:\(fail\)\s|FAIL(?:ED)?\b[:\s])|\b[1-9]\d*\s+fail(?:ed|ures?)?\b/i;
+const SHELL_PIPEFAIL_RE = /\bset\s+(?:-[A-Za-z]*o\s+pipefail|-o\s+pipefail)\b/;
+const SHELL_ERREXIT_RE = /\bset\s+(?:-[A-Za-z]*e[A-Za-z]*\b|-o\s+errexit\b)/;
+
+function isTestRunnerSegment(rawSeg: string): boolean {
+  const seg = rawSeg
+    .trim()
+    .replace(/^[()]+|[()]+$/g, "")
+    .trim()
+    .replace(SEGMENT_ENV_PREFIX_RE, "")
+    .replace(SEGMENT_WRAPPER_PREFIX_RE, "")
+    .trim();
+  return Boolean(seg && !NON_TEST_TRIVIAL_CMD_RE.test(seg) && SEGMENT_TEST_RUNNER_RE.test(seg));
+}
+
+function splitShellStatements(rawCommand: string): Array<{ stmt: string; nextOp: string | null }> {
+  const tokens = rawCommand.split(/(\&\&|\|\||;|\n)/);
+  const out: Array<{ stmt: string; nextOp: string | null }> = [];
+  for (let i = 0; i < tokens.length; i += 2) {
+    const stmt = (tokens[i] ?? "").trim();
+    const nextOp = tokens[i + 1] ?? null;
+    if (stmt) out.push({ stmt, nextOp });
+  }
+  return out;
+}
+
 export function isRecognizedTestCommand(rawCommand: string): boolean {
   const trimmed = rawCommand.trim();
   if (!trimmed) return false;
-  for (const rawSeg of trimmed.split(/(?:&&|\|\||;|\n|\|)/)) {
-    const seg = rawSeg
-      .trim()
-      .replace(/^[()]+|[()]+$/g, "")
-      .trim()
-      .replace(SEGMENT_ENV_PREFIX_RE, "")
-      .replace(SEGMENT_WRAPPER_PREFIX_RE, "")
-      .trim();
-    if (!seg || NON_TEST_TRIVIAL_CMD_RE.test(seg)) continue;
-    if (SEGMENT_TEST_RUNNER_RE.test(seg)) return true;
+  const hasPipefail = SHELL_PIPEFAIL_RE.test(trimmed);
+  const hasErrexit = SHELL_ERREXIT_RE.test(trimmed);
+  const statements = splitShellStatements(trimmed);
+  for (let i = 0; i < statements.length; i++) {
+    const { stmt, nextOp } = statements[i]!;
+    const pipeStages = stmt.split("|");
+    const testStageIdx = pipeStages.findIndex((s) => isTestRunnerSegment(s));
+    if (testStageIdx < 0) continue;
+    // Left side of an unguarded pipe masks the test runner's exit code (e.g. `bun test | tee log`)
+    if (testStageIdx < pipeStages.length - 1 && !hasPipefail) continue;
+    // `|| ...` masks test failure; `; <later>` without `set -e` replaces exit code with the trailing command
+    if (nextOp === "||") continue;
+    if ((nextOp === ";" || nextOp === "\n") && i < statements.length - 1 && !hasErrexit) continue;
+    return true;
   }
   return false;
 }
 
-function resolveTestCallCommand(call: ObservedToolCall, store: EnhanceStore): string | null {
-  if (call.isError || call.isBackgroundLaunch || (typeof call.exitCode === "number" && call.exitCode !== 0)) return null;
+export function hasTestFailureOutput(output?: string | null): boolean {
+  return Boolean(output && TEST_OUTPUT_FAILURE_RE.test(output));
+}
+
+function resolveTestCallCommand(call: ObservedToolCall, store: EnhanceStore): { command: string | null; unverifiable: boolean } {
+  if (call.isError || call.isBackgroundLaunch || (typeof call.exitCode === "number" && call.exitCode !== 0)) {
+    return { command: null, unverifiable: false };
+  }
   if (call.toolName === "bash") {
     const cmd = call.command?.trim() ?? "";
-    return cmd && isRecognizedTestCommand(cmd) ? cmd : null;
+    if (!cmd) return { command: null, unverifiable: false };
+    if (!isRecognizedTestCommand(cmd)) {
+      const mentionsRunner = cmd.split(/(?:&&|\|\||;|\n|\|)/).some((s) => isTestRunnerSegment(s));
+      return { command: null, unverifiable: mentionsRunner };
+    }
+    if (hasTestFailureOutput(call.outputSnippet)) return { command: null, unverifiable: true };
+    return { command: cmd, unverifiable: false };
   }
   if (call.toolName === "enhance_job") {
     let cmd = call.command?.trim() ?? "";
@@ -77,9 +119,15 @@ function resolveTestCallCommand(call: ObservedToolCall, store: EnhanceStore): st
         }
       } catch {}
     }
-    return statusOk && cmd && isRecognizedTestCommand(cmd) ? cmd : null;
+    if (!statusOk || !cmd) return { command: null, unverifiable: false };
+    if (!isRecognizedTestCommand(cmd)) {
+      const mentionsRunner = cmd.split(/(?:&&|\|\||;|\n|\|)/).some((s) => isTestRunnerSegment(s));
+      return { command: null, unverifiable: mentionsRunner };
+    }
+    if (hasTestFailureOutput(call.outputSnippet)) return { command: null, unverifiable: true };
+    return { command: cmd, unverifiable: false };
   }
-  return null;
+  return { command: null, unverifiable: false };
 }
 
 export function verifyQaTestExecution(
@@ -87,36 +135,55 @@ export function verifyQaTestExecution(
   observedCalls: readonly ObservedToolCall[],
   after: ReadonlyMap<string, SnapshotEntry>,
   store: EnhanceStore,
+  stageId?: string,
 ): VerificationEvidenceRecord[] {
+  const currentTreeFp = computeSnapshotFingerprint(after);
   let lastMutationIdx = -1;
   observedCalls.forEach((c, i) => {
     if (!c.isError && (WRITE_TOOLS[c.toolName] || c.touchedPaths.length > 0)) lastMutationIdx = i;
   });
-  let sawPreMutationTest = false;
+  let sawPreMutationTest = false, sawStaleTest = false, sawUnverifiableTest = false;
   const postMutationVerified: Array<{ call: ObservedToolCall; command: string }> = [];
   observedCalls.forEach((c, i) => {
-    const cmd = resolveTestCallCommand(c, store);
-    if (!cmd) return;
-    if (i > lastMutationIdx) postMutationVerified.push({ call: c, command: cmd });
-    else sawPreMutationTest = true;
+    const resolved = resolveTestCallCommand(c, store);
+    if (!resolved.command) {
+      if (resolved.unverifiable) sawUnverifiableTest = true;
+      return;
+    }
+    if (i <= lastMutationIdx) { sawPreMutationTest = true; return; }
+    if ((stageId && c.stageId && c.stageId !== stageId) || (c.testedTreeFingerprint && c.testedTreeFingerprint !== currentTreeFp)) {
+      sawStaleTest = true;
+      return;
+    }
+    postMutationVerified.push({ call: c, command: resolved.command });
   });
   if (postMutationVerified.length === 0) {
+    if (sawUnverifiableTest) {
+      throw new Error(
+        `Role "${roleId}" cannot submit verdict="ready": test command exit status was masked or unverifiable (avoid piping tests into tee/tail without "set -o pipefail", avoid "|| true" or trailing commands, and ensure zero failing tests).`,
+      );
+    }
     if (sawPreMutationTest) {
       throw new Error(
         `Role "${roleId}" modified files after the last test execution; re-run tests against the final workspace state before submitting verdict="ready".`,
+      );
+    }
+    if (sawStaleTest) {
+      throw new Error(
+        `Role "${roleId}" workspace changed after the last verified test execution (or only prior-stage tests were observed); re-run tests against the current workspace state before submitting verdict="ready".`,
       );
     }
     throw new Error(
       `Role "${roleId}" cannot submit verdict="ready" without a completed zero-exit test command in this turn (e.g. bun test, pytest, npm test, vitest, go test, cargo test; background launches and non-test shell commands like pwd/ls do not qualify).`,
     );
   }
-  const testedTreeFingerprint = computeSnapshotFingerprint(after);
   return postMutationVerified.map(({ call, command }) => ({
     command,
     exitCode: typeof call.exitCode === "number" ? call.exitCode : 0,
     outputSnippet: call.outputSnippet ?? call.summary ?? "",
-    testedTreeFingerprint,
+    testedTreeFingerprint: call.testedTreeFingerprint ?? currentTreeFp,
     toolCallId: call.toolCallId,
+    ...(call.stageId ?? stageId ? { stageId: call.stageId ?? stageId } : {}),
   }));
 }
 
@@ -209,6 +276,7 @@ export function verifyAlgoDeliverables(input: {
   afterPaths: readonly string[];
   hasBaselineSnapshot: boolean;
   turnChangedSet: ReadonlySet<string>;
+  mandateMetricsSet?: ReadonlySet<string>;
   explicitRelPaths: ReadonlySet<string>;
 }): void {
   const reportRel = "algo_work/REPORT.md";
@@ -227,7 +295,7 @@ export function verifyAlgoDeliverables(input: {
     throw new Error(`Role "${input.roleId}" cannot submit verdict="ready" without "algo_work/runs/**/metrics.json".`);
   }
   const currentTurnMetrics = input.hasBaselineSnapshot
-    ? allMetricsPaths.filter((p) => input.turnChangedSet.has(p))
+    ? allMetricsPaths.filter((p) => input.turnChangedSet.has(p) || Boolean(input.mandateMetricsSet?.has(p)))
     : allMetricsPaths;
   if (currentTurnMetrics.length === 0) {
     throw new Error(

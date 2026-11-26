@@ -10,6 +10,7 @@ export interface ActiveTurnBindings {
   baselineSnap: ReadonlyMap<string, SnapshotEntry> | null;
   baselineConfigSnap: ReadonlyMap<string, SnapshotEntry> | null;
   stageId: string;
+  turnStartMessageIndex: number;
   stageStartedJobIds: Set<string>;
   submittedEnvelope: HandoffEnvelope | null;
   boundaryViolations: string[];

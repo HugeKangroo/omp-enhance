@@ -18,15 +18,19 @@ import {
   executeRoleStep, type RoleSessionPoolLike, type RoleSessionRunner, type RoleSupervisorConfig,
 } from "./orchestrator.ts";
 import type { FlowObserver } from "./state.ts";
+import { buildOuterEventFromSubResult, compileRoleWorkflow, prepareOuterRepairReentry } from "./workflow.ts";
 
 export interface WorktreeManagerLike {
   isGitRepo(cwd: string): boolean;
   prepareNodeWorktree(input: { cwd: string; flowId: string; nodeId: string }): Promise<{ worktreePath: string; baseRef: string }>;
   commitNodeWorktree(input: { worktreePath: string; flowId: string; nodeId: string; summary: string }): Promise<string | null>;
   mergeWorktrees(input: {
-    cwd: string; flowId: string; nodeId: string; sourceRefs: Record<string, string>;
-    landingMode: "apply" | "branch_preview";
-  }): Promise<{ ok: boolean; mergedRef?: string | null; summary: string; conflicts?: string[] }>;
+    cwd: string; flowId: string; nodeId: string; sourceRefs: Record<string, string>; landingMode: "apply" | "branch_preview";
+  }): Promise<{ ok: boolean; mergedRef?: string | null; mergedCommitSha?: string | null; summary: string; conflicts?: string[] }>;
+  withCommitWorktree?<T>(
+    input: { cwd: string; flowId: string; nodeId: string; commitRef: string },
+    fn: (ctx: { worktreePath: string; commitSha: string }) => Promise<T>,
+  ): Promise<T>;
   cleanupFlowWorktrees(cwd: string, flowId: string): Promise<void>;
 }
 
@@ -56,6 +60,9 @@ export interface ExecuteFlowGraphInput {
   sessionPool?: RoleSessionPoolLike;
   worktreeManager?: WorktreeManagerLike;
   nativeTaskRunner?: NativeTaskRunnerLike;
+  nestingDepth?: 0 | 1;
+  sharedSessionSlotId?: string;
+  boardNodePrefix?: string;
   onStateChange?: (state: FlowMachineState) => void;
   registerLivePatchHandler?: (handler: ((patch: import("../core/graph-types.ts").FlowGraphPatch, validated: GraphValidationResult) => boolean) | null) => void;
 }
@@ -71,37 +78,23 @@ function treeFingerprint(cwd: string): string {
 
 async function runDeterministicGate(input: {
   cwd: string; flowId: string; mandate: Mandate; store: EnhanceStore; nodeId: string; stageId: string;
-  config: GateNodeConfig; signal?: AbortSignal;
+  config: GateNodeConfig; testedCommitSha?: string; signal?: AbortSignal;
 }): Promise<{ passed: boolean; evidence: VerificationEvidenceRecord; handoff: HandoffEnvelope; feedback?: string }> {
   const effCwd = input.config.cwd ? path.resolve(input.cwd, input.config.cwd) : input.cwd;
   const timeoutMs = Math.max(1_000, (input.config.timeoutSec ?? 180) * 1000);
   const expectExit = input.config.expectExitCode ?? 0;
-
-  const proc = Bun.spawn(["bash", "-lc", input.config.command], {
-    cwd: effCwd,
-    stdout: "pipe",
-    stderr: "pipe",
-    env: { ...process.env, OMP_ENHANCE_SUBPROCESS: "1" },
-  });
+  const proc = Bun.spawn(["bash", "-lc", input.config.command], { cwd: effCwd, stdout: "pipe", stderr: "pipe", env: { ...process.env, OMP_ENHANCE_SUBPROCESS: "1" } });
   let timedOut = false;
   const timer = setTimeout(() => { timedOut = true; try { proc.kill("SIGTERM"); } catch {} }, timeoutMs);
   const onAbort = () => { try { proc.kill("SIGTERM"); } catch {} };
   input.signal?.addEventListener("abort", onAbort, { once: true });
-
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]).finally(() => {
-    clearTimeout(timer);
-    input.signal?.removeEventListener("abort", onAbort);
-  });
+  const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited])
+    .finally(() => { clearTimeout(timer); input.signal?.removeEventListener("abort", onAbort); });
 
   const combined = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n").trim();
   const snippet = combined.length > 600 ? `…${combined.slice(-599)}` : (combined || "(no output)");
   const fp = treeFingerprint(effCwd);
-  let metricsNote = "";
-  let metricsOk = true;
+  let metricsNote = "", metricsOk = true;
   if (input.config.parseJsonMetricsPath) {
     const mp = path.resolve(effCwd, input.config.parseJsonMetricsPath);
     if (!existsSync(mp)) { metricsOk = false; metricsNote = `Missing metrics file ${input.config.parseJsonMetricsPath}`; }
@@ -112,29 +105,21 @@ async function runDeterministicGate(input: {
   }
   const passed = !timedOut && exitCode === expectExit && metricsOk;
   const evidence: VerificationEvidenceRecord = {
-    command: input.config.command,
-    exitCode: timedOut ? -1 : exitCode,
+    command: input.config.command, exitCode: timedOut ? -1 : exitCode,
     outputSnippet: metricsNote ? `${metricsNote} | ${snippet}` : snippet,
-    testedTreeFingerprint: fp,
-    toolCallId: `gate-${input.stageId}`,
+    testedTreeFingerprint: fp, toolCallId: `gate-${input.stageId}`, stageId: input.stageId,
+    ...(input.testedCommitSha ? { testedCommitSha: input.testedCommitSha } : {}),
   };
-  const feedback = passed ? undefined : (timedOut ? `Gate "${input.config.command}" timed out after ${Math.round(timeoutMs / 1000)}s.` : `Gate "${input.config.command}" failed (exit ${exitCode}): ${evidence.outputSnippet}`);
+  const shaNote = input.testedCommitSha ? `, commit ${input.testedCommitSha.slice(0, 12)}` : "";
+  const feedback = passed ? undefined : (timedOut ? `Gate "${input.config.command}" timed out after ${Math.round(timeoutMs / 1000)}s.` : `Gate "${input.config.command}" failed (exit ${exitCode}${shaNote}): ${evidence.outputSnippet}`);
   const handoff: HandoffEnvelope = {
-    id: `ho-gate-${randomUUID()}`,
-    mandateId: input.mandate.id,
-    mandateRev: input.mandate.rev,
-    parentHandoffId: null,
-    fromRole: input.nodeId,
-    toTarget: passed ? "user" : (input.config.repairTargetNodeId ?? "user"),
+    id: `ho-gate-${randomUUID()}`, mandateId: input.mandate.id, mandateRev: input.mandate.rev,
+    parentHandoffId: null, fromRole: input.nodeId, toTarget: passed ? "user" : (input.config.repairTargetNodeId ?? "user"),
     verdict: passed ? "ready" : "rejected",
-    summary: passed ? `Gate passed: ${input.config.command} (exit ${exitCode}, tree ${fp})` : feedback!,
-    artifacts: [],
-    verifiedFacts: [{ claim: `Executed gate "${input.config.command}" with exit=${exitCode}`, evidenceRef: `gate-${input.stageId}` }],
-    verificationEvidence: [evidence],
-    openRisks: [],
-    feedbackForUpstream: passed ? null : feedback!,
-    observedUsage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
-    createdAt: nowIso(),
+    summary: passed ? `Gate passed: ${input.config.command} (exit ${exitCode}, tree ${fp}${shaNote})` : feedback!,
+    artifacts: [], verifiedFacts: [{ claim: `Executed gate "${input.config.command}" with exit=${exitCode}${shaNote}`, evidenceRef: `gate-${input.stageId}` }],
+    verificationEvidence: [evidence], openRisks: [], feedbackForUpstream: passed ? null : feedback!,
+    observedUsage: { inputTokens: 0, outputTokens: 0, costUsd: 0 }, createdAt: nowIso(),
   };
   if (!input.store.isClosed()) input.store.saveHandoff(handoff);
   return { passed, evidence, handoff, ...(feedback ? { feedback } : {}) };
@@ -194,36 +179,67 @@ export async function executeFlowGraph(
   ): Promise<void> => {
     const spec = state.spec.nodes.find((n) => n.id === cmd.nodeId)!;
     const baseRole = input.roles.get(spec.role!)!;
+    const effCwd = cmd.worktreePath ?? input.cwd;
+    const upstreamHandoff = resolveUpstreamHandoff(state, spec, input.initialHandoff ?? null);
+
+    // 2-Level Isomorphic Route A: delegate roles declaring `workflow:` to nested Depth-1 FlowMachine (max depth strictly 2)
+    if ((input.nestingDepth ?? 0) === 0 && baseRole.workflow && baseRole.workflow.phases.length > 0) {
+      const compiled = compileRoleWorkflow({ role: baseRole, outerGoal: input.mandate.goal, outerWritableScope: spec.writableScope });
+      const existingSub = state.nodes[cmd.nodeId]?.subState ?? null;
+      const subInitial = existingSub && cmd.repairFeedback ? prepareOuterRepairReentry(existingSub, baseRole.workflow, cmd.repairFeedback) : existingSub;
+      const subRes = await executeFlowGraph({
+        cwd: effCwd, store: input.store, flowId: input.flowId, mandate: input.mandate,
+        spec: compiled.spec, validation: compiled.validation, initialState: subInitial,
+        ...(cmd.replyText ? { resumeReplyText: cmd.replyText } : {}),
+        roles: compiled.phaseRoles, runner: input.runner, initialHandoff: upstreamHandoff,
+        userSteers: input.userSteers, observer: input.observer, supervisor: input.supervisor,
+        signal: nodeSignal, sessionPool: input.sessionPool, nestingDepth: 1,
+        sharedSessionSlotId: cmd.nodeId, boardNodePrefix: cmd.nodeId,
+        onStateChange: (innerSt) => { state.nodes[cmd.nodeId]!.subState = innerSt; input.onStateChange?.(state); },
+      });
+      state.nodes[cmd.nodeId]!.subState = subRes.finalState;
+      steps.push(...subRes.steps);
+      let commitRef: string | null = null;
+      if (subRes.status === "completed" && cmd.worktreePath && input.worktreeManager) {
+        commitRef = await input.worktreeManager.commitNodeWorktree({ worktreePath: cmd.worktreePath, flowId: input.flowId, nodeId: cmd.nodeId, summary: subRes.finalEnvelope?.summary ?? baseRole.id });
+      }
+      pushEvent(buildOuterEventFromSubResult({
+        nodeId: cmd.nodeId, baseRole, mandate: input.mandate, upstreamHandoff, subRes,
+        sessionWarm: Boolean(input.sessionPool?.hasWarm(input.flowId, cmd.nodeId)), commitRef,
+      }));
+      return;
+    }
+
     const narrowed = narrowRolePermissions(baseRole, spec.writableScope);
     if (!narrowed.ok) {
       pushEvent({ type: "NODE_VIOLATION", nodeId: cmd.nodeId, violations: spec.writableScope ?? [], reason: narrowed.reason });
       return;
     }
     const effRole = narrowed.role;
-    const effCwd = cmd.worktreePath ?? input.cwd;
-    const upstreamHandoff = resolveUpstreamHandoff(state, spec, input.initialHandoff ?? null);
     const boardContext = renderBoardContextForNode({ store: input.store, flowId: input.flowId, nodeSpec: spec });
     const nodeBrief = spec.brief ? formatNodeBrief(spec.brief, input.mandate.goal) : undefined;
     const toTarget = state.spec.nodes.find((n) => n.dependsOn.includes(spec.id))?.id ?? "user";
     const keepWarm = Boolean(state.spec.policies.enableSessionReuse && spec.sessionMode !== "fresh");
+    const reuseSharedWarm = Boolean(
+      cmd.reuseSession || (input.sharedSessionSlotId && keepWarm && input.sessionPool?.hasWarm(input.flowId, input.sharedSessionSlotId)),
+    );
 
-    const res = await executeRoleStep({
-      cwd: effCwd, store: input.store, role: effRole, mandate: input.mandate,
-      upstreamHandoff, userSteers: input.userSteers, toTarget,
-      repairTargetRoleId: spec.repairTargetNodeId ?? "user",
-      flowId: input.flowId, nodeId: cmd.nodeId, runner: input.runner,
-      stageId: cmd.stageId, round: cmd.repairRound,
-      observer: input.observer, supervisor: input.supervisor, signal: nodeSignal,
-      reuseSession: cmd.reuseSession, keepSessionWarm: keepWarm,
+    const runStepInCwd = async (stepCwd: string) => executeRoleStep({
+      cwd: stepCwd, store: input.store, role: effRole, mandate: input.mandate, upstreamHandoff, userSteers: input.userSteers, toTarget,
+      repairTargetRoleId: spec.repairTargetNodeId ?? "user", flowId: input.flowId, nodeId: cmd.nodeId,
+      ...(input.sharedSessionSlotId ? { sessionSlotId: input.sharedSessionSlotId } : {}),
+      runner: input.runner, stageId: cmd.stageId, round: cmd.repairRound, observer: input.observer, supervisor: input.supervisor,
+      signal: nodeSignal, reuseSession: reuseSharedWarm, keepSessionWarm: keepWarm,
       ...(cmd.forkFromNodeId ? { forkFromNodeId: cmd.forkFromNodeId } : {}),
       ...(cmd.modelOverride ? { modelOverride: cmd.modelOverride } : {}),
       ...(cmd.repairFeedback ? { repairFeedback: cmd.repairFeedback } : {}),
-      ...(cmd.replyText ? { replyText: cmd.replyText } : {}),
-      ...(nodeBrief ? { nodeBrief } : {}),
-      ...(boardContext ? { boardContext } : {}),
-      ...(spec.stallTimeoutSec ? { stallTimeoutMs: spec.stallTimeoutSec * 1000 } : {}),
+      ...(cmd.replyText ? { replyText: cmd.replyText } : {}), ...(nodeBrief ? { nodeBrief } : {}),
+      ...(boardContext ? { boardContext } : {}), ...(spec.stallTimeoutSec ? { stallTimeoutMs: spec.stallTimeoutSec * 1000 } : {}),
       ...(input.sessionPool ? { sessionPool: input.sessionPool } : {}),
     });
+    const res = cmd.targetCommitRef && !cmd.worktreePath && input.worktreeManager?.withCommitWorktree
+      ? await input.worktreeManager.withCommitWorktree({ cwd: input.cwd, flowId: input.flowId, nodeId: cmd.nodeId, commitRef: cmd.targetCommitRef }, ({ worktreePath }) => runStepInCwd(worktreePath))
+      : await runStepInCwd(effCwd);
     if (!res.ok) {
       if (res.status === "cancelled") { pushEvent({ type: "FLOW_CANCEL", reason: res.reason }); return; }
       if (res.status === "violation") { pushEvent({ type: "NODE_VIOLATION", nodeId: cmd.nodeId, violations: res.violations, reason: res.reason }); return; }
@@ -268,7 +284,10 @@ export async function executeFlowGraph(
     for (const cmd of commands) {
       switch (cmd.type) {
         case "APPEND_BOARD": {
-          const saved = appendBoardEntrySafe(input.store, input.flowId, cmd.entry);
+          const entry = input.boardNodePrefix && cmd.entry.nodeId
+            ? { ...cmd.entry, nodeId: `${input.boardNodePrefix}/${cmd.entry.nodeId}` }
+            : cmd.entry;
+          const saved = appendBoardEntrySafe(input.store, input.flowId, entry);
           if (saved?.seq) state.boardSeq = Math.max(state.boardSeq, saved.seq);
           break;
         }
@@ -304,10 +323,22 @@ export async function executeFlowGraph(
           break;
         case "RUN_GATE_NODE":
           launchAsync(cmd.nodeId, async (nodeSignal) => {
-            const g = await runDeterministicGate({
-              cwd: cmd.worktreePath ?? input.cwd, flowId: input.flowId, mandate: input.mandate, store: input.store,
-              nodeId: cmd.nodeId, stageId: cmd.stageId, config: cmd.config, signal: nodeSignal,
+            const evalGate = (gateCwd: string, testedCommitSha?: string) => runDeterministicGate({
+              cwd: gateCwd, flowId: input.flowId, mandate: input.mandate, store: input.store,
+              nodeId: cmd.nodeId, stageId: cmd.stageId, config: cmd.config, testedCommitSha, signal: nodeSignal,
             });
+            let g: Awaited<ReturnType<typeof runDeterministicGate>>;
+            if (cmd.targetCommitRef) {
+              if (!input.worktreeManager?.withCommitWorktree) {
+                throw new Error(`Worktree manager unavailable to evaluate candidate ref "${cmd.targetCommitRef}" for gate "${cmd.nodeId}".`);
+              }
+              g = await input.worktreeManager.withCommitWorktree(
+                { cwd: input.cwd, flowId: input.flowId, nodeId: cmd.nodeId, commitRef: cmd.targetCommitRef },
+                ({ worktreePath, commitSha }) => evalGate(worktreePath, commitSha),
+              );
+            } else {
+              g = await evalGate(cmd.worktreePath ?? input.cwd);
+            }
             steps.push({ stepIndex: state.nodeOrder.indexOf(cmd.nodeId), roleId: cmd.nodeId, round: state.nodes[cmd.nodeId]!.repairRound, envelope: g.handoff });
             pushEvent({ type: "GATE_COMPLETED", nodeId: cmd.nodeId, passed: g.passed, evidence: g.evidence, handoff: g.handoff, ...(g.feedback ? { feedback: g.feedback } : {}) });
           });
@@ -348,10 +379,10 @@ export async function executeFlowGraph(
           nodeAborts.get(cmd.nodeId)?.abort();
           break;
         case "DISPOSE_SESSION":
-          await input.sessionPool?.disposeNode(input.flowId, cmd.nodeId);
+          if ((input.nestingDepth ?? 0) === 0) await input.sessionPool?.disposeNode(input.flowId, cmd.nodeId);
           break;
         case "CLEANUP_WORKTREES":
-          await input.worktreeManager?.cleanupFlowWorktrees(input.cwd, cmd.flowId);
+          if ((input.nestingDepth ?? 0) === 0) await input.worktreeManager?.cleanupFlowWorktrees(input.cwd, cmd.flowId);
           break;
         case "RUN_HUMAN_NODE":
         case "DELIVER_STEER":
@@ -389,10 +420,10 @@ export async function executeFlowGraph(
     input.signal?.removeEventListener("abort", onExternalAbort);
     for (const ac of nodeAborts.values()) ac.abort();
     if (inFlight.size > 0) await Promise.allSettled([...inFlight.values()]);
-    if (isFlowTerminal(state.status)) await input.sessionPool?.disposeFlow(input.flowId);
+    if ((input.nestingDepth ?? 0) === 0 && isFlowTerminal(state.status)) await input.sessionPool?.disposeFlow(input.flowId);
   }
 
-  if (state.status === "completed") input.store.completeMandate(input.mandate.id);
+  if ((input.nestingDepth ?? 0) === 0 && state.status === "completed") input.store.completeMandate(input.mandate.id);
   const finalEnvelope = (state.lastHandoffId ? input.store.getHandoff(state.lastHandoffId) : null)
     ?? [...state.nodeOrder].reverse().map((id) => state.nodes[id]?.lastHandoff).find(Boolean)
     ?? input.initialHandoff
@@ -403,5 +434,9 @@ export async function executeFlowGraph(
     state.status === "aborted_by_supervisor" || state.status === "cancelled"
       ? state.status
       : "failed";
-  return { status: resultStatus, cwd: input.cwd, steps, finalEnvelope, ...(state.reason ? { reason: state.reason } : {}), finalState: state };
+  return {
+    status: resultStatus, cwd: input.cwd, steps, finalEnvelope,
+    ...(state.mergedRef ? { mergedRef: state.mergedRef } : {}),
+    ...(state.reason ? { reason: state.reason } : {}), finalState: state,
+  };
 }

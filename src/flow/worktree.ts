@@ -37,8 +37,13 @@ function flowRefPrefix(flowId: string): string {
   return `refs/omp-enhance/${safeFlow}`;
 }
 
+function previewBranchName(flowId: string): string {
+  return `omp-enhance/${flowId.replace(/[^a-zA-Z0-9._-]/g, "-")}`;
+}
+
 function captureOrGetBaseRef(cwd: string, flowId: string): string {
   const baseRef = `${flowRefPrefix(flowId)}/base`;
+  const baseIndexRef = `${flowRefPrefix(flowId)}/base-index`;
   const existing = runGit(cwd, ["rev-parse", "--verify", baseRef]);
   if (existing.ok && existing.stdout) return existing.stdout;
 
@@ -47,6 +52,9 @@ function captureOrGetBaseRef(cwd: string, flowId: string): string {
     throw new Error(`Git repository at ${cwd} has no HEAD commit (make an initial commit before using worktrees).`);
   }
   const headSha = head.stdout;
+  const idxTree = runGit(cwd, ["write-tree"]);
+  if (idxTree.ok && idxTree.stdout) runGit(cwd, ["update-ref", baseIndexRef, idxTree.stdout]);
+
   const status = runGit(cwd, ["status", "--porcelain"]);
   if (!status.ok || !status.stdout) {
     runGit(cwd, ["update-ref", baseRef, headSha]);
@@ -157,15 +165,20 @@ export function createGitWorktreeManager(): WorktreeManagerLike {
 
         const stat = runGit(cwd, ["diff", "--stat", baseRef, mergedSha]).stdout;
         if (landingMode === "branch_preview") {
-          const previewBranch = `omp-enhance/${flowId.replace(/[^a-zA-Z0-9._-]/g, "-")}`;
+          const previewBranch = previewBranchName(flowId);
           runGit(cwd, ["branch", "-f", previewBranch, mergedSha]);
           return {
             ok: true,
             mergedRef: previewBranch,
-            summary: `Merged ${entries.length} branch(es) into preview branch "${previewBranch}".${stat ? `\n${stat}` : ""}`,
+            mergedCommitSha: mergedSha,
+            summary: `Merged ${entries.length} branch(es) into preview branch "${previewBranch}" (${mergedSha.slice(0, 12)}).${stat ? `\n${stat}` : ""}`,
           };
         }
 
+        const touchedRes = runGit(cwd, ["diff", "--name-only", baseRef, mergedSha]);
+        const touchedFiles = touchedRes.ok && touchedRes.stdout
+          ? touchedRes.stdout.split("\n").map((s) => s.trim()).filter(Boolean)
+          : [];
         const patchRes = spawnSync("git", ["diff", "--binary", baseRef, mergedSha], {
           cwd,
           maxBuffer: 64 * 1024 * 1024,
@@ -175,24 +188,84 @@ export function createGitWorktreeManager(): WorktreeManagerLike {
         }
         const patchBuf = patchRes.stdout;
         if (patchBuf && patchBuf.length > 0) {
-          const apply = spawnSync("git", ["apply", "--3way", "--whitespace=nowarn"], { cwd, input: patchBuf });
+          const driftReasons: string[] = [];
+          if (touchedFiles.length > 0) {
+            const wtDrift = runGit(cwd, ["diff", "--quiet", baseRef, "--", ...touchedFiles]);
+            if (!wtDrift.ok) driftReasons.push("working tree modified");
+            for (const rel of touchedFiles) {
+              if (existsSync(path.join(cwd, rel)) && !runGit(cwd, ["cat-file", "-e", `${baseRef}:${rel}`]).ok) {
+                driftReasons.push(`untracked file "${rel}" added locally`);
+              }
+            }
+            const curIdxTree = runGit(cwd, ["write-tree"]);
+            const baseIdxRef = runGit(cwd, ["rev-parse", "--verify", `${flowRefPrefix(flowId)}/base-index`]);
+            if (!curIdxTree.ok) {
+              driftReasons.push("staging index has unmerged entries");
+            } else if (baseIdxRef.ok && baseIdxRef.stdout) {
+              const idxDrift = runGit(cwd, ["diff-tree", "--quiet", baseIdxRef.stdout, curIdxTree.stdout, "--", ...touchedFiles]);
+              if (!idxDrift.ok) driftReasons.push("staging index modified");
+            }
+          }
+          const dryRun = driftReasons.length === 0
+            ? spawnSync("git", ["apply", "--check", "--whitespace=nowarn"], { cwd, input: patchBuf })
+            : { status: 1, stderr: "" };
+          if (driftReasons.length > 0 || dryRun.status !== 0) {
+            const previewBranch = previewBranchName(flowId);
+            runGit(cwd, ["branch", "-f", previewBranch, mergedSha]);
+            const detail = driftReasons.length > 0 ? driftReasons.join("; ") : String(dryRun.stderr ?? "").trim();
+            return {
+              ok: false,
+              mergedRef: previewBranch,
+              mergedCommitSha: mergedSha,
+              conflicts: ["working-tree-drift"],
+              summary: `Merged ref "${previewBranch}" (${mergedSha.slice(0, 12)}) created, but main workspace/index drifted (${detail}); left your working tree and staging index untouched.`,
+            };
+          }
+          const apply = spawnSync("git", ["apply", "--whitespace=nowarn"], { cwd, input: patchBuf });
           if (apply.status !== 0) {
-            const previewBranch = `omp-enhance/${flowId.replace(/[^a-zA-Z0-9._-]/g, "-")}`;
+            const previewBranch = previewBranchName(flowId);
             runGit(cwd, ["branch", "-f", previewBranch, mergedSha]);
             return {
               ok: false,
+              mergedRef: previewBranch,
+              mergedCommitSha: mergedSha,
               conflicts: ["working-tree-drift"],
-              summary: `Merged ref "${previewBranch}" created, but applying to main workspace failed (concurrent edits?): ${String(apply.stderr ?? "").trim()}`,
+              summary: `Merged ref "${previewBranch}" (${mergedSha.slice(0, 12)}) created, but applying to main workspace failed: ${String(apply.stderr ?? "").trim()}`,
             };
           }
         }
         return {
           ok: true,
           mergedRef,
+          mergedCommitSha: mergedSha,
           summary: `Merged and landed ${entries.length} parallel worktree(s) cleanly.${stat ? ` (${stat.split("\n").at(-1)?.trim() ?? ""})` : ""}`,
         };
       } finally {
         removeWorktreeSafe(cwd, mergeWt);
+      }
+    },
+
+    async withCommitWorktree<T>(
+      { cwd, flowId, nodeId, commitRef }: { cwd: string; flowId: string; nodeId: string; commitRef: string },
+      fn: (ctx: { worktreePath: string; commitSha: string }) => Promise<T>,
+    ): Promise<T> {
+      const rev = runGit(cwd, ["rev-parse", "--verify", commitRef]);
+      if (!rev.ok || !rev.stdout) {
+        throw new Error(`Cannot resolve commit ref "${commitRef}" for node "${nodeId}": ${rev.stderr}`);
+      }
+      const commitSha = rev.stdout;
+      const root = worktreeRoot(cwd, flowId);
+      mkdirSync(root, { recursive: true });
+      const safeNode = nodeId.replace(/[^a-zA-Z0-9._-]/g, "_");
+      const wtPath = path.join(root, `_eval-${safeNode}-${Date.now().toString(36)}`);
+      if (existsSync(wtPath)) removeWorktreeSafe(cwd, wtPath);
+      runGit(cwd, ["worktree", "prune"]);
+      const added = runGit(cwd, ["worktree", "add", "--detach", wtPath, commitSha]);
+      if (!added.ok) throw new Error(`git worktree add failed for "${nodeId}" at "${commitRef}": ${added.stderr}`);
+      try {
+        return await fn({ worktreePath: wtPath, commitSha });
+      } finally {
+        removeWorktreeSafe(cwd, wtPath);
       }
     },
 

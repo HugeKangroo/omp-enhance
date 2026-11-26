@@ -7,7 +7,9 @@ import {
   type RoleSource,
   type RoleSpec,
   type RoleThinkingLevel,
+  type RoleWorkflowSpec,
 } from "../core/types.ts";
+import { parseRoleWorkflowYaml, serializeRoleWorkflowYaml } from "./workflow-yaml.ts";
 
 export { ROLE_THINKING_LEVELS };
 
@@ -24,6 +26,7 @@ const TOP_KEYS: Record<string, true> = {
   method: true,
   permissions: true,
   exit: true,
+  workflow: true,
 };
 
 const PERMISSION_KEYS: Record<string, true> = {
@@ -126,6 +129,7 @@ export function computeRoleContentSha256(
       requireAlgoDeliverables: role.exit.requireAlgoDeliverables ?? false,
       criteria: role.exit.criteria,
     },
+    ...(role.workflow ? { workflow: role.workflow } : {}),
   };
   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
@@ -261,7 +265,7 @@ export function parseRoleYaml(
     };
   }
 
-  const draft = {
+  const baseDraft = {
     id,
     name,
     description,
@@ -273,6 +277,15 @@ export function parseRoleYaml(
     permissions,
     exit: exitSpec,
   };
+  let workflow: RoleWorkflowSpec | undefined;
+  if (roleYaml.workflow !== undefined) {
+    workflow = parseRoleWorkflowYaml(
+      roleYaml.workflow,
+      { ...baseDraft, source, filePath, contentSha256: "" },
+      filePath,
+    );
+  }
+  const draft = { ...baseDraft, ...(workflow ? { workflow } : {}) };
   return {
     ...draft,
     source,
@@ -353,6 +366,9 @@ export function serializeRoleYaml(
     if (criteria.length > 0) {
       lines.push("  criteria:", ...criteria.map((item) => `    - ${JSON.stringify(item)}`));
     }
+  }
+  if (role.workflow) {
+    lines.push(...serializeRoleWorkflowYaml(role.workflow));
   }
   return `${lines.join("\n")}\n`;
 }

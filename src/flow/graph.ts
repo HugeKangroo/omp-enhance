@@ -193,6 +193,16 @@ export function validateFlowGraph(input: {
       issues.push({ code: "worktree_requires_git", nodeId: node.id, message: `Node "${node.id}" requires workspace="worktree", but target directory is not a Git repository.` });
     }
   }
+  const mergedSources = new Set(spec.nodes.filter((n) => n.kind === "merge").flatMap((n) => n.merge?.sourceNodeIds ?? []));
+  for (const id of writableIds) {
+    if (effectiveWorkspaceByNode[id] === "worktree" && !mergedSources.has(id)) {
+      issues.push({
+        code: "missing_merge_delivery",
+        nodeId: id,
+        message: `Writable worktree node "${id}" has no downstream merge node to deliver its changes (add a merge node covering "${id}", or serialize via dependsOn / workspace="inherit").`,
+      });
+    }
+  }
 
   const waves: string[][] = [];
   for (const id of topo) {

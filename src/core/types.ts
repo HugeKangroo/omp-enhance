@@ -5,7 +5,7 @@
  * under RoleSpec (M_r) and HandoffEnvelope (H).
  */
 export * from "./graph-types.ts";
-import type { FlowLeaseMode, NodeKind } from "./graph-types.ts";
+import type { FlowLeaseMode, NodeKind, RoleWorkflowSpec } from "./graph-types.ts";
 
 export type RoleSource = "project" | "global" | "builtin";
 
@@ -63,6 +63,7 @@ export interface RoleSpec {
   method: string[];
   permissions: RolePermissions;
   exit: RoleExitSpec;
+  workflow?: RoleWorkflowSpec;
   source: RoleSource;
   filePath: string;
   contentSha256: string;
@@ -131,6 +132,8 @@ export interface VerificationEvidenceRecord {
   outputSnippet: string;
   testedTreeFingerprint: string;
   toolCallId: string;
+  stageId?: string;
+  testedCommitSha?: string;
 }
 
 export type HandoffVerdict = "ready" | "needs_input" | "rejected" | "blocked";
@@ -166,6 +169,8 @@ export interface ObservedToolCall {
   exitCode?: number | null;
   outputSnippet?: string;
   isBackgroundLaunch?: boolean;
+  stageId?: string;
+  testedTreeFingerprint?: string;
 }
 
 export interface RoomEntry {
@@ -340,5 +345,6 @@ export interface FlowRunResult {
   cwd?: string;
   steps: FlowStepResult[];
   finalEnvelope: HandoffEnvelope | null;
+  mergedRef?: string | null;
   reason?: string;
 }

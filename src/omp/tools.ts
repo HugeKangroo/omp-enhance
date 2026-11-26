@@ -10,6 +10,7 @@ import { cancelJob, readJobLogTail, reconcileJobs, startBackgroundJob } from "..
 import { watchBackgroundJob, type SupervisorInspector } from "../jobs/supervisor.ts";
 import { registerFlowTool } from "./flow-tool.ts";
 import type { WorkspaceHub } from "./hub.ts";
+import type { ForegroundWorkflowController } from "./workflow-fg.ts";
 import type { WorkspaceRuntime } from "./workspace.ts";
 export type { WorkspaceRuntime };
 
@@ -43,6 +44,7 @@ export function schemaKit(pi: any) {
     bool: (): unknown => (T?.Boolean ? T.Boolean() : { type: "boolean" }),
     arr: (item: unknown): unknown => (T?.Array ? T.Array(item) : { type: "array", items: item }),
     en: (values: readonly string[]): unknown => (T?.Union ? T.Union(values.map((v: string) => T.Literal(v))) : { type: "string", enum: values }),
+    anyOf: (variants: readonly unknown[]): unknown => (T?.Union ? T.Union([...variants]) : { anyOf: [...variants] }),
     obj: (props: Record<string, unknown>, req: string[]): unknown =>
       T?.Object
         ? T.Object(Object.fromEntries(Object.entries(props).map(([k, v]) => [k, req.includes(k) ? v : opt(v)])), { additionalProperties: false })
@@ -236,7 +238,7 @@ export function buildStageCompanionTools(
   return tools;
 }
 
-export function registerEnhanceTools(pi: any, hub: WorkspaceHub): void {
+export function registerEnhanceTools(pi: any, hub: WorkspaceHub, fgWorkflow?: ForegroundWorkflowController): void {
   const kit = schemaKit(pi);
   const registerTool = (input: {
     name: string; label: string; description: string; approval?: "read" | "write" | "exec"; parameters: unknown;
@@ -304,8 +306,10 @@ export function registerEnhanceTools(pi: any, hub: WorkspaceHub): void {
         }
 
         const sid = ws.getSessionId(ctx), tracker = ws.trackers.get(sid), mandate = ws.store.getActiveMandate({ sessionId: sid });
+        const fgPhase = !targetRole ? fgWorkflow?.getActivePhaseContext(sid, ws.cwd, role, mandate?.goal) : null;
+        const effectiveRole = fgPhase?.effectiveRole ?? role;
         const envelope = createAndVerifyHandoff({
-          store: ws.store, role, cwd: ws.cwd, mandate, sessionId: sid, toTarget,
+          store: ws.store, role: effectiveRole, cwd: ws.cwd, mandate, sessionId: sid, toTarget,
           parentHandoffId: mandate ? ws.store.getLatestHandoff(mandate.id)?.id ?? null : null,
           verdict: verdict as HandoffVerdict, summary, artifactPaths: asStringArray(params.artifactPaths),
           baselineSnapshot: tracker.getBaselineSnapshot(ws.cwd), baselineConfigSnapshot: tracker.getBaselineConfigSnapshot(ws.cwd),
@@ -322,6 +326,11 @@ export function registerEnhanceTools(pi: any, hub: WorkspaceHub): void {
             runner: ws.runnerFor(ctx), supervisor: ws.supervisorFor(ctx), signal,
           });
           return toolResult({ handoff: envelope, delegated }, !delegated.ok);
+        }
+        if (fgPhase && fgWorkflow) {
+          const prog = fgWorkflow.onPhaseHandoff({ sessionId: sid, cwd: ws.cwd, role, handoff: envelope });
+          if (prog.gateError) return toolResult({ handoff: envelope, error: prog.gateError, phaseAdvanced: false }, true);
+          return toolResult({ handoff: envelope, workflowProgress: prog });
         }
         return toolResult({ handoff: envelope });
       } catch (error) {
