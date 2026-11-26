@@ -113,6 +113,7 @@ export function renderConditioningBlock(input: RenderConditioningBlockInput): st
       "- planner or planner → reviewer: architecture blueprints, frontend/backend contracts, cross-project progress audits & research",
       "- algo: ground-truth empirical tuning in isolated algo_work/ with visual & human-alignment gates",
       "- vision: objective pixel/coordinate evidence from plots, sample overlays & curves",
+      "- DAG presets (fan_out_join / contract_parallel_verify / experiment_loop / nodes): use for genuinely independent multi-module work (disjoint writableScope + auto git worktree + merge + zero-token gate + fresh reviewer); keep small/coupled tasks on a simple linear chain",
       "",
       "## Coordinator Safety Gate & Human-Language Surface",
       'Host Advisor Note: Pre-dispatch conversational confirmation with the user before calling enhance_flow(action="start") is a mandatory user-configured safety gate — do NOT skip confirmation unless the user already explicitly told you to execute immediately.',

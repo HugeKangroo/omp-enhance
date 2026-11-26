@@ -3,6 +3,9 @@ import type { FlowRoomSnapshot, FlowRoomStatus, FlowRoomUiAdapter } from "../flo
 import { FlowRoomManager } from "../flow/state.ts";
 import type { ObservedToolCall, RoomEntry } from "../core/types.ts";
 import {
+  renderConcurrentWidgetSummary, renderGraphNodeInspectorSection, renderWaveOverviewBar,
+} from "./flow-graph-view.ts";
+import {
   decodeKittyCsiU, padLeftCell, padRightCell, parseOverlayKey,
   truncateDisplay, wrapPlainText,
 } from "./kit.ts";
@@ -123,11 +126,12 @@ export function renderMultiProjectWidgetLines(
     const snap = item.room.getSnapshot();
     const icon = flowStatusIcon(snap.status);
     const curStage = snap.stages.find((s) => s.stageId === snap.activeStageId) ?? snap.stages.at(-1);
+    const graphSummary = snap.graphSnapshot ? renderConcurrentWidgetSummary(snap.graphSnapshot) : null;
     const detail = snap.status === "waiting_input"
       ? `待确认: ${curStage?.envelope?.questionsForUser?.[0] ?? snap.reason ?? snap.goal}`
-      : curStage
+      : graphSummary ?? (curStage
         ? `${curStage.roleId} (${curStage.modelLabel})${curStage.activeTool ? ` → ${curStage.activeTool}` : ` · 工具 ${curStage.calls.length} 次`}`
-        : snap.goal;
+        : snap.goal);
     const row = `${icon} [${shortProjectLabel(item.cwd)}] ${snap.roleChain.join("→")} · ${detail}`;
     const colored = fg(snap.status === "waiting_input" ? "warning" : "accent", padLeftCell(row, inner));
     lines.push(`${fg("border", "│")} ${colored} ${fg("border", "│")}`);
@@ -268,7 +272,9 @@ function buildInspectorLines(snap: FlowRoomSnapshot, selected: RoomEntry | undef
       selected ? `发言者: ${selected.speaker} (${selected.badge ?? "消息"})` : "说明: 只读监控窗；任务派发与补充回答请在 /coord 聊天框进行",
     ];
     if (selected?.text) lines.push(...wrapPlainText(selected.text, rightW - 2, 8));
-    if (snap.stages.length > 0) {
+    if (snap.graphSnapshot && snap.graphSnapshot.nodes.length > 0) {
+      lines.push("", ...renderGraphNodeInspectorSection(snap.graphSnapshot, rightW));
+    } else if (snap.stages.length > 0) {
       lines.push("", `阶段概览 (${snap.stages.length}):`);
       snap.stages.forEach((s, i) => lines.push(` ${i + 1}. ${s.roleId} [${s.status}] · 工具 ${s.calls.length} 次`));
     }
@@ -400,6 +406,9 @@ export async function openFlowRoomOverlay(deps: FlowRoomOverlayDeps): Promise<vo
         }).join(" ");
         const projBar = targets.length > 0 ? `${tabs}  ${fg("muted", activeTarget?.cwd ?? "")}` : fg("muted", "(暂无受管项目)");
         out.push(`${fg("border", "│")} ${padLeftCell(projBar, inner)} ${fg("border", "│")}`);
+        if (snap.graphSnapshot && snap.graphSnapshot.waves.length > 0) {
+          out.push(`${fg("border", "│")} ${padLeftCell(renderWaveOverviewBar(snap.graphSnapshot, inner, theme), inner)} ${fg("border", "│")}`);
+        }
         out.push(fg("border", `├─${"─".repeat(inner)}─┤`));
 
         const flatLeft: string[] = [];

@@ -4,6 +4,8 @@
  * Unifies single-agent daily work (N = 1) and multi-agent collaboration (N > 1)
  * under RoleSpec (M_r) and HandoffEnvelope (H).
  */
+export * from "./graph-types.ts";
+import type { FlowLeaseMode, NodeKind } from "./graph-types.ts";
 
 export type RoleSource = "project" | "global" | "builtin";
 
@@ -192,12 +194,17 @@ export type FlowStageStatus =
 
 export interface FlowStageTrace {
   stageId: string;
+  nodeId?: string;
+  nodeKind?: NodeKind;
   roleId: string;
   roleName: string;
   round: number;
   status: FlowStageStatus;
   hostError?: string | null;
   modelLabel: string;
+  worktreePath?: string | null;
+  sessionReused?: boolean;
+  modelSwitches?: string[];
   startedAt: string;
   endedAt: string | null;
   activeTool: string | null;
@@ -307,6 +314,9 @@ export interface PersistedFlowCheckpoint {
   nextStageSeq?: number;
   lastRejectionSig?: string | null;
   userSteers?: FlowUserSteer[];
+  graphSpecJson?: string | null;
+  machineStateJson?: string | null;
+  leaseMode?: FlowLeaseMode;
 }
 
 export interface FlowStepResult {

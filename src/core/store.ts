@@ -3,6 +3,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
+  BOARD_SCHEMA_INDEX, BOARD_SCHEMA_TABLE, findFlowLeaseRow, GRAPH_COLUMN_MIGRATIONS,
+  listActiveLeasesQuery, listBoardEventsQuery, releaseScopedLeaseQuery, runAcquireScopedLeaseTx,
+  runAppendBoardEventTx,
+} from "./store-board.ts";
+import {
   type ArtifactRow, captureProcessStartToken, type EpistemicRow, type HandoffRow, hasCol, hasTable,
   isProcessAliveWithToken, type JobRow, LeaseLostError, type LeaseRow, listFlowSteersQuery, type MandateRow,
   type MandateScope, MAX_ARCHIVED_FLOW_RUNS, mergeSteerLists, mergeSteersIntoSnapshotJson, MIGRATIONS,
@@ -11,8 +16,8 @@ import {
   toArtifact, toEpistemicItem, toFlowCheckpoint, toHandoff, toJob, toLease, toMandate,
 } from "./store-schema.ts";
 import type {
-  ArtifactRecord, BackgroundJob, EpistemicItem, EpistemicKind, EpistemicStatus,
-  FlowUserSteer, HandoffEnvelope, JobStatus, Mandate, MandateStatus, PersistedFlowCheckpoint,
+  ArtifactRecord, BackgroundJob, EpistemicItem, EpistemicKind, EpistemicStatus, FlowBoardEntry,
+  FlowLeaseMode, FlowUserSteer, HandoffEnvelope, JobStatus, Mandate, MandateStatus, PersistedFlowCheckpoint,
 } from "./types.ts";
 
 export {
@@ -41,7 +46,7 @@ export class EnhanceStore {
 
   private migrateSchema(db: Database): void {
     const colsByTable = new Map<string, Set<string>>();
-    for (const [table, col, ddl] of MIGRATIONS) {
+    for (const [table, col, ddl] of [...MIGRATIONS, ...GRAPH_COLUMN_MIGRATIONS]) {
       let cols = colsByTable.get(table);
       if (!cols) {
         cols = new Set((db.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((r) => r.name));
@@ -64,7 +69,7 @@ export class EnhanceStore {
     }
     this.db = new Database(this.dbPath);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
-    this.db.exec(SCHEMA_TABLES); this.migrateSchema(this.db); this.db.exec(SCHEMA_INDEXES);
+    this.db.exec(`${SCHEMA_TABLES}\n${BOARD_SCHEMA_TABLE}`); this.migrateSchema(this.db); this.db.exec(`${SCHEMA_INDEXES}\n${BOARD_SCHEMA_INDEX}`);
     return this.db;
   }
 
@@ -188,27 +193,12 @@ export class EnhanceStore {
       envelope.feedbackForUpstream, envelope.observedUsage ? JSON.stringify(envelope.observedUsage) : null, envelope.createdAt,
     );
   }
-  getHandoff(id: string): HandoffEnvelope | null {
-    const db = this.readConn(), row = db && hasTable(db, "handoffs") ? (db.query("SELECT * FROM handoffs WHERE id = ?").get(id) as HandoffRow | null) : null;
-    return row ? toHandoff(row) : null;
-  }
-  getLatestHandoff(mandateId?: string): HandoffEnvelope | null {
-    const db = this.readConn(), row = db && hasTable(db, "handoffs")
-      ? (db.query("SELECT * FROM handoffs WHERE (? IS NULL OR mandate_id = ?) ORDER BY created_at DESC, rowid DESC LIMIT 1").get(mandateId ?? null, mandateId ?? null) as HandoffRow | null) : null;
-    return row ? toHandoff(row) : null;
-  }
-  listHandoffs(mandateId?: string, limit?: number): HandoffEnvelope[] {
-    const db = this.readConn();
-    return db && hasTable(db, "handoffs") ? (db.query("SELECT * FROM handoffs WHERE (? IS NULL OR mandate_id = ?) ORDER BY created_at DESC, rowid DESC LIMIT COALESCE(?, -1)")
-      .all(mandateId ?? null, mandateId ?? null, limit ?? null) as HandoffRow[]).map(toHandoff) : [];
-  }
+  getHandoff(id: string): HandoffEnvelope | null { const db = this.readConn(), row = db && hasTable(db, "handoffs") ? (db.query("SELECT * FROM handoffs WHERE id = ?").get(id) as HandoffRow | null) : null; return row ? toHandoff(row) : null; }
+  getLatestHandoff(mandateId?: string): HandoffEnvelope | null { const db = this.readConn(), row = db && hasTable(db, "handoffs") ? (db.query("SELECT * FROM handoffs WHERE (? IS NULL OR mandate_id = ?) ORDER BY created_at DESC, rowid DESC LIMIT 1").get(mandateId ?? null, mandateId ?? null) as HandoffRow | null) : null; return row ? toHandoff(row) : null; }
+  listHandoffs(mandateId?: string, limit?: number): HandoffEnvelope[] { const db = this.readConn(); return db && hasTable(db, "handoffs") ? (db.query("SELECT * FROM handoffs WHERE (? IS NULL OR mandate_id = ?) ORDER BY created_at DESC, rowid DESC LIMIT COALESCE(?, -1)").all(mandateId ?? null, mandateId ?? null, limit ?? null) as HandoffRow[]).map(toHandoff) : []; }
   saveJob(job: BackgroundJob): void {
-    this.writeConn(true)!.query(
-      "INSERT OR REPLACE INTO jobs (job_id, mandate_id, hypothesis_id, idempotency_key, command, cwd, pid, pgid, owner_pid, process_start_token, log_path, exit_file_path, status, exit_code, started_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    ).run(
-      job.jobId, job.mandateId, job.hypothesisId, job.idempotencyKey ?? null, job.command, job.cwd, job.pid, job.pgid,
-      job.ownerPid ?? null, job.processStartToken ?? null, job.logPath, job.exitFilePath, job.status, job.exitCode, job.startedAt, job.endedAt,
-    );
+    this.writeConn(true)!.query("INSERT OR REPLACE INTO jobs (job_id, mandate_id, hypothesis_id, idempotency_key, command, cwd, pid, pgid, owner_pid, process_start_token, log_path, exit_file_path, status, exit_code, started_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(job.jobId, job.mandateId, job.hypothesisId, job.idempotencyKey ?? null, job.command, job.cwd, job.pid, job.pgid, job.ownerPid ?? null, job.processStartToken ?? null, job.logPath, job.exitFilePath, job.status, job.exitCode, job.startedAt, job.endedAt);
   }
 
   transitionJobStatus(jobId: string, expectedStatuses: readonly JobStatus[], patch: { status: JobStatus; exitCode?: number | null; endedAt?: string | null }): BackgroundJob | null {
@@ -257,25 +247,33 @@ export class EnhanceStore {
     return db.transaction(() => runAcquireProjectLeaseTx(db, this.dbPath, targetFlowId, pid, token, leaseToken, nowIso())).immediate();
   }
 
+  acquireScopedFlowLease(
+    flowId: string, mode: FlowLeaseMode, ownerPid?: number, ownerStartToken?: string | null, leaseToken?: string,
+  ): { leaseToken: string; stateVersion: number; leaseKey: string } {
+    const targetFlowId = flowId.trim();
+    if (!targetFlowId) throw new Error("acquireScopedFlowLease requires a non-empty flowId.");
+    const pid = ownerPid ?? process.pid, token = ownerStartToken !== undefined ? ownerStartToken : captureProcessStartToken(pid);
+    return this.writeConn(true)!.transaction(() => runAcquireScopedLeaseTx(this.db!, this.dbPath, targetFlowId, mode, pid, token, leaseToken, nowIso())).immediate();
+  }
   releaseProjectFlowLease(flowId?: string, expectedLeaseToken?: string | null): boolean {
     if (this.closed) return false;
     const db = this.writeConn(false);
-    if (!db || !hasTable(db, "project_leases")) return false;
-    if (expectedLeaseToken !== undefined) {
-      const res = db.query("DELETE FROM project_leases WHERE lease_key = 'active_flow' AND (? IS NULL OR flow_id = ?) AND lease_token IS ?")
-        .run(flowId ?? null, flowId ?? null, expectedLeaseToken);
-      return res.changes > 0;
-    }
-    const res = flowId
-      ? db.query("DELETE FROM project_leases WHERE lease_key = 'active_flow' AND flow_id = ?").run(flowId)
-      : db.query("DELETE FROM project_leases WHERE lease_key = 'active_flow'").run();
-    return res.changes > 0;
+    return db ? releaseScopedLeaseQuery(db, flowId, expectedLeaseToken) : false;
   }
-
-  getProjectFlowLease(): ProjectFlowLease | null {
+  getProjectFlowLease(flowId?: string): ProjectFlowLease | null {
     const db = this.readConn();
-    const row = db && hasTable(db, "project_leases") ? (db.query("SELECT * FROM project_leases WHERE lease_key = 'active_flow'").get() as LeaseRow | null) : null;
+    if (!db || !hasTable(db, "project_leases")) return null;
+    const row = flowId ? findFlowLeaseRow(db, flowId) : (db.query("SELECT * FROM project_leases WHERE lease_key = 'active_flow'").get() as LeaseRow | null);
     return row ? toLease(row) : null;
+  }
+  listActiveFlowLeases(): Array<ProjectFlowLease & { leaseKey: string }> { const db = this.readConn(); return db ? listActiveLeasesQuery(db) : []; }
+  appendFlowBoardEvent(flowId: string, entry: Omit<FlowBoardEntry, "seq" | "eventId" | "flowId" | "createdAt"> & { eventId?: string; createdAt?: string }): FlowBoardEntry {
+    const db = this.writeConn(false);
+    if (!db || !hasTable(db, "flow_runs")) throw new Error(`Unknown flowId "${flowId}".`);
+    return db.transaction(() => runAppendBoardEventTx(db, flowId, entry, nowIso())).immediate();
+  }
+  listFlowBoardEvents(flowId: string, opts?: { afterSeq?: number; seqs?: readonly number[]; limit?: number; target?: string }): FlowBoardEntry[] {
+    const db = this.readConn(); return db ? listBoardEventsQuery(db, flowId, opts) : [];
   }
 
   saveFlowCheckpoint(cp: PersistedFlowCheckpoint, options?: SaveFlowCheckpointOptions): PersistedFlowCheckpoint | null {
@@ -285,7 +283,7 @@ export class EnhanceStore {
       const strict = options?.expectedLeaseToken !== undefined || options?.expectedStateVersion !== undefined;
       const hasExplicitToken = options?.expectedLeaseToken !== undefined || cp.leaseToken !== undefined;
       const callerToken = options?.expectedLeaseToken !== undefined ? options.expectedLeaseToken : (cp.leaseToken ?? null);
-      const activeLease = db.query("SELECT * FROM project_leases WHERE lease_key = 'active_flow'").get() as LeaseRow | null;
+      const activeLease = findFlowLeaseRow(db, cp.flowId);
       const existingRow = db.query("SELECT * FROM flow_runs WHERE flow_id = ?").get(cp.flowId) as Record<string, unknown> | null;
       const leaseLive = Boolean(
         activeLease && (activeLease.owner_pid === process.pid || isProcessAliveWithToken(activeLease.owner_pid, activeLease.owner_start_token)),
@@ -334,11 +332,11 @@ export class EnhanceStore {
       const steersJson = cp.userSteers !== undefined || mergedSteers.length > 0 ? JSON.stringify(mergedSteers) : null;
 
       db.query(
-        "INSERT INTO flow_runs (flow_id, mandate_id, goal, cwd, role_chain, status, current_index, repair_round, last_handoff_id, max_repair_rounds, snapshot_json, owner_pid, owner_start_token, lease_token, state_version, next_stage_seq, last_rejection_sig, user_steers, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(flow_id) DO UPDATE SET mandate_id=excluded.mandate_id, goal=excluded.goal, cwd=excluded.cwd, role_chain=excluded.role_chain, status=excluded.status, current_index=excluded.current_index, repair_round=excluded.repair_round, last_handoff_id=excluded.last_handoff_id, max_repair_rounds=excluded.max_repair_rounds, snapshot_json=excluded.snapshot_json, owner_pid=excluded.owner_pid, owner_start_token=excluded.owner_start_token, lease_token=excluded.lease_token, state_version=excluded.state_version, next_stage_seq=excluded.next_stage_seq, last_rejection_sig=excluded.last_rejection_sig, user_steers=excluded.user_steers, updated_at=excluded.updated_at",
+        "INSERT INTO flow_runs (flow_id, mandate_id, goal, cwd, role_chain, status, current_index, repair_round, last_handoff_id, max_repair_rounds, snapshot_json, owner_pid, owner_start_token, lease_token, state_version, next_stage_seq, last_rejection_sig, user_steers, graph_spec_json, machine_state_json, lease_mode, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(flow_id) DO UPDATE SET mandate_id=excluded.mandate_id, goal=excluded.goal, cwd=excluded.cwd, role_chain=excluded.role_chain, status=excluded.status, current_index=excluded.current_index, repair_round=excluded.repair_round, last_handoff_id=excluded.last_handoff_id, max_repair_rounds=excluded.max_repair_rounds, snapshot_json=excluded.snapshot_json, owner_pid=excluded.owner_pid, owner_start_token=excluded.owner_start_token, lease_token=excluded.lease_token, state_version=excluded.state_version, next_stage_seq=excluded.next_stage_seq, last_rejection_sig=excluded.last_rejection_sig, user_steers=excluded.user_steers, graph_spec_json=COALESCE(excluded.graph_spec_json, flow_runs.graph_spec_json), machine_state_json=COALESCE(excluded.machine_state_json, flow_runs.machine_state_json), lease_mode=COALESCE(excluded.lease_mode, flow_runs.lease_mode), updated_at=excluded.updated_at",
       ).run(
         cp.flowId, cp.mandateId, cp.goal, cp.cwd ?? null, JSON.stringify(cp.roleChain), cp.status, cp.currentIndex, cp.repairRound,
         cp.lastHandoffId, cp.maxRepairRounds, nextSnap, cp.ownerPid ?? null, cp.ownerStartToken ?? null, savedLeaseTok, nextVer,
-        cp.nextStageSeq ?? null, cp.lastRejectionSig ?? null, steersJson, cp.updatedAt,
+        cp.nextStageSeq ?? null, cp.lastRejectionSig ?? null, steersJson, cp.graphSpecJson ?? null, cp.machineStateJson ?? null, cp.leaseMode ?? null, cp.updatedAt,
       );
 
       for (const s of cp.userSteers ?? []) {
@@ -349,7 +347,7 @@ export class EnhanceStore {
 
       if (cp.status !== "running" && activeLease && activeLease.flow_id === cp.flowId) {
         const canRelease = hasExplicitToken ? activeLease.lease_token === callerToken : activeLease.owner_pid === process.pid;
-        if (canRelease) db.query("DELETE FROM project_leases WHERE lease_key = 'active_flow' AND flow_id = ?").run(cp.flowId);
+        if (canRelease) releaseScopedLeaseQuery(db, cp.flowId, hasExplicitToken ? callerToken : undefined);
       }
       db.query("DELETE FROM flow_runs WHERE status != 'running' AND flow_id NOT IN (SELECT flow_id FROM flow_runs ORDER BY updated_at DESC, rowid DESC LIMIT ?)").run(MAX_ARCHIVED_FLOW_RUNS);
       const row = db.query("SELECT * FROM flow_runs WHERE flow_id = ?").get(cp.flowId) as Record<string, unknown>;

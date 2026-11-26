@@ -42,6 +42,7 @@ export function snapshotFromCheckpoint(cp: PersistedFlowCheckpoint, fallbackCwd?
       ? snap.stages.map((s) => ({ ...s, calls: (s.calls ?? []).map((c) => ({ ...c, touchedPaths: [...(c.touchedPaths ?? [])] })), notes: [...(s.notes ?? [])] }))
       : [],
     userSteers: steers,
+    ...(snap.graphSnapshot ? { graphSnapshot: snap.graphSnapshot } : {}),
   };
 }
 

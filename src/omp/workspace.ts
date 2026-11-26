@@ -5,13 +5,17 @@ import {
   extractModelSpecThinking, loadEnhanceSettings, resolveDefaultGlobalRolesDir, resolveModelSpec,
 } from "../core/settings.ts";
 import { EnhanceStore } from "../core/store.ts";
-import type { EnhanceSettings, FlowRunResult, HandoffEnvelope, Mandate, RoleSpec } from "../core/types.ts";
+import type { EnhanceSettings, FlowGraphSpec, FlowRunResult, GraphValidationResult, HandoffEnvelope, Mandate, RoleSpec } from "../core/types.ts";
+import { executeFlowGraph } from "../flow/executor.ts";
+import { validateFlowGraph } from "../flow/graph.ts";
 import { executeRoleFlow, type RoleSessionRunner, type RoleSupervisorConfig } from "../flow/orchestrator.ts";
 import { FlowRoomManager, isCheckpointResumable } from "../flow/state.ts";
 import { SessionTrackerRegistry } from "../flow/tracker.ts";
+import { createGitWorktreeManager, isGitRepo } from "../flow/worktree.ts";
 import { discoverRolesWithDiagnostics } from "../roles/loader.ts";
 import { createFlowRoomUiAdapter, type FlowMonitorTarget } from "../ui/flow-room.ts";
 import { createOmpRoleSessionRunner, createOmpSupervisorInspector } from "./session.ts";
+import { FlowSessionPool } from "./session-pool.ts";
 import type { TrustEvaluation } from "./trust.ts";
 
 export interface EmitMessageOptions {
@@ -33,10 +37,12 @@ export interface WorkspaceRuntime {
   runnerFor(ctx: any): RoleSessionRunner;
   supervisorFor(ctx: any): RoleSupervisorConfig | undefined;
   emitMessage(ctx: any, text: string, options?: EmitMessageOptions): void;
+  patchActiveFlow?(patch: import("../core/graph-types.ts").FlowGraphPatch, validated: GraphValidationResult): boolean;
   startManagedFlow(input: {
     ctx: any; originWs?: ManagedWorkspace; flowId?: string; roles: RoleSpec[]; mandate: Mandate;
     initialHandoff: HandoffEnvelope | null; maxRepairRounds: number;
     background: boolean; initiatorText?: string; signal?: AbortSignal;
+    graphSpec?: FlowGraphSpec; graphValidation?: GraphValidationResult;
   }): Promise<{ started: true; flowId: string; cwd: string; background: true; status: "running"; roleChain: string[]; goal: string } | FlowRunResult>;
   resumeManagedFlow(
     ctx: any, background: boolean, signal?: AbortSignal, originWs?: ManagedWorkspace, targetFlowId?: string,
@@ -273,15 +279,33 @@ export function createManagedWorkspace(
   const room = new FlowRoomManager(createFlowRoomUiAdapter(pi, hooks?.getActiveTargets), store, cwd);
   const rolesBySession = new Map<string, string | null>();
 
+  const sessionPool = new FlowSessionPool(pi, { cwd });
+  const worktreeManager = createGitWorktreeManager();
+  let activePatchHandler: ((patch: import("../core/graph-types.ts").FlowGraphPatch, validated: GraphValidationResult) => boolean) | null = null;
+
   const runFlowTask = (fCtx: any, originWs: ManagedWorkspace, background: boolean, flowId: string, execInput: {
     roles: RoleSpec[]; mandate: Mandate; initialHandoff: HandoffEnvelope | null; maxRepairRounds: number;
     startIndex?: number; initialRepairRound?: number; initialStageSeq?: number; initialLastRejectionSig?: string | null; signal?: AbortSignal;
+    graphSpec?: FlowGraphSpec; graphValidation?: GraphValidationResult; resumeGraph?: boolean;
   }): Promise<FlowRunResult> => {
-    const roleChain = execInput.roles.map((r) => r.id);
+    const roleChain = execInput.graphSpec ? execInput.graphSpec.nodes.map((n) => n.id) : execInput.roles.map((r) => r.id);
     ws.syncStatusBar(fCtx);
     return (async () => {
       try {
-        const res = await executeRoleFlow({ cwd, store, flowId, ...execInput, runner: ws.runnerFor(fCtx), supervisor: ws.supervisorFor(fCtx), observer: room.createObserver(fCtx) });
+        let res: FlowRunResult;
+        if (execInput.graphSpec) {
+          const val = execInput.graphValidation ?? validateFlowGraph({ spec: execInput.graphSpec, roles: ws.roles, isGitRepo: isGitRepo(cwd) });
+          const persistedState = execInput.resumeGraph ? room.getPersistedMachineState() : null;
+          res = await executeFlowGraph({
+            cwd, store, flowId, mandate: execInput.mandate, spec: execInput.graphSpec, validation: val,
+            initialState: persistedState, roles: ws.roles, runner: ws.runnerFor(fCtx),
+            initialHandoff: execInput.initialHandoff, observer: room.createObserver(fCtx), supervisor: ws.supervisorFor(fCtx),
+            signal: execInput.signal, sessionPool, worktreeManager, onStateChange: (st) => room.setGraphState(st),
+            registerLivePatchHandler: (h) => { activePatchHandler = h; },
+          });
+        } else {
+          res = await executeRoleFlow({ cwd, store, flowId, ...execInput, runner: ws.runnerFor(fCtx), supervisor: ws.supervisorFor(fCtx), observer: room.createObserver(fCtx) });
+        }
         room.finishFlow(res, fCtx);
         if (background && res.status !== "cancelled") {
           hooks?.onBackgroundFlowSettled?.({ targetWs: ws, originWs, ctx: fCtx, flowId, mandate: execInput.mandate, roleChain, result: res });
@@ -289,9 +313,7 @@ export function createManagedWorkspace(
         return res;
       } catch (err) {
         room.failFlow(err, fCtx);
-        if (background) {
-          hooks?.onBackgroundFlowSettled?.({ targetWs: ws, originWs, ctx: fCtx, flowId, mandate: execInput.mandate, roleChain, error: err });
-        }
+        if (background) hooks?.onBackgroundFlowSettled?.({ targetWs: ws, originWs, ctx: fCtx, flowId, mandate: execInput.mandate, roleChain, error: err });
         throw err;
       } finally {
         ws.syncStatusBar(fCtx);
@@ -369,11 +391,16 @@ export function createManagedWorkspace(
       return { role: sup, inspector: createOmpSupervisorInspector(pi, bindCtxToCwd(c, cwd), ws.settings), initialDelayMs: ws.settings.supervisorInitialDelaySec * 1000 };
     },
     emitMessage: (c, text, emitOpts) => emitMessage(pi, c, text, emitOpts),
-    startManagedFlow: async ({ ctx: c, originWs, flowId: explicitId, roles: rList, mandate, initialHandoff, maxRepairRounds, background, initiatorText, signal }) => {
-      const roleChain = rList.map((r) => r.id);
-      const flowId = room.beginFlow({ flowId: explicitId, mandateId: mandate.id, goal: mandate.goal, roleChain, maxRepairRounds, lastHandoffId: initialHandoff?.id ?? null, initiatorText, ctx: c });
+    patchActiveFlow: (patch, validated) => Boolean(activePatchHandler?.(patch, validated)),
+    startManagedFlow: async ({ ctx: c, originWs, flowId: explicitId, roles: rList, mandate, initialHandoff, maxRepairRounds, background, initiatorText, signal, graphSpec, graphValidation }) => {
+      const roleChain = graphSpec ? graphSpec.nodes.map((n) => n.id) : rList.map((r) => r.id);
+      const flowId = room.beginFlow({
+        flowId: explicitId, mandateId: mandate.id, goal: mandate.goal, roleChain, maxRepairRounds,
+        lastHandoffId: initialHandoff?.id ?? null, initiatorText, ctx: c,
+        ...(graphValidation ? { leaseMode: graphValidation.leaseMode } : {}),
+      });
       const effSignal = combineAbortSignals(signal, room.getAbortSignal());
-      const p = runFlowTask(c, originWs ?? ws, background, flowId, { roles: rList, mandate, initialHandoff, maxRepairRounds, signal: effSignal });
+      const p = runFlowTask(c, originWs ?? ws, background, flowId, { roles: rList, mandate, initialHandoff, maxRepairRounds, signal: effSignal, graphSpec, graphValidation });
       if (!background) return await p;
       void p.catch(() => {});
       return { started: true, flowId, cwd, background: true, status: "running", roleChain, goal: mandate.goal };
@@ -387,30 +414,29 @@ export function createManagedWorkspace(
       if (cp ? !isCheckpointResumable(cp) : !room.isResumable()) {
         throw new Error(cp ? `Flow "${cp.flowId}" 当前状态为 ${cp.status}，无法断点续跑。` : "当前没有可断点续跑的中断/失败 Flow。");
       }
-      const chainToValidate = cp ? cp.roleChain : room.getSnapshot().roleChain;
+      let persistedSpec: FlowGraphSpec | undefined;
+      if (cp?.graphSpecJson) { try { persistedSpec = JSON.parse(cp.graphSpecJson) as FlowGraphSpec; } catch {} }
+      const chainToValidate = persistedSpec
+        ? persistedSpec.nodes.filter((n) => n.kind === "role" && n.role).map((n) => n.role!)
+        : (cp ? cp.roleChain : room.getSnapshot().roleChain);
       const rList = chainToValidate.map((id) => {
         const r = ws.roles.get(id);
-        if (id === "supervisor" || (r && isInternalRole(r))) {
-          throw new Error(`Role "${id}" is an internal monitor and cannot run as a Flow stage.`);
-        }
+        if (id === "supervisor" || (r && isInternalRole(r))) throw new Error(`Role "${id}" is an internal monitor and cannot run as a Flow stage.`);
         if (!r) throw new Error(`Unknown role "${id}" in Flow "${effectiveFlowId ?? "flow"}". Restore the role before resuming.`);
         return r;
       });
       const plan = room.resumeFlow(c, targetFlowId);
-      let mandate: Mandate;
-      let initialHandoff: HandoffEnvelope | null;
+      let mandate: Mandate, initialHandoff: HandoffEnvelope | null;
       try {
         mandate = store.getMandate(plan.mandateId) ?? store.upsertMandate({ goal: room.getSnapshot().goal || "Resumed Flow", flowId: plan.flowId });
         initialHandoff = plan.lastHandoffId ? store.getHandoff(plan.lastHandoffId) : null;
-      } catch (setupErr) {
-        room.failFlow(setupErr, c);
-        throw setupErr;
-      }
+      } catch (setupErr) { room.failFlow(setupErr, c); throw setupErr; }
       const effSignal = combineAbortSignals(signal, room.getAbortSignal());
       const p = runFlowTask(c, originWs ?? ws, background, plan.flowId, {
         roles: rList, mandate, initialHandoff, maxRepairRounds: plan.maxRepairRounds,
         startIndex: plan.startIndex, initialRepairRound: plan.repairRound, initialStageSeq: plan.initialStageSeq,
         initialLastRejectionSig: plan.lastRejectionSig, signal: effSignal,
+        ...(persistedSpec ? { graphSpec: persistedSpec, resumeGraph: true } : {}),
       });
       if (!background) return await p;
       void p.catch(() => {});

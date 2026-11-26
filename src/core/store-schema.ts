@@ -5,7 +5,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type {
   ArtifactDigestKind, ArtifactRecord, BackgroundJob, EpistemicItem, EpistemicKind, EpistemicStatus,
-  FlowStageTrace, FlowUserSteer, HandoffEnvelope, JobStatus, Mandate, MandateStatus,
+  FlowLeaseMode, FlowStageTrace, FlowUserSteer, HandoffEnvelope, JobStatus, Mandate, MandateStatus,
   PersistedFlowCheckpoint, RoomEntry, VerificationEvidenceRecord,
 } from "./types.ts";
 
@@ -196,6 +196,9 @@ export const toFlowCheckpoint = (row: Record<string, unknown>, tableSteers?: rea
     ...(row.next_stage_seq != null ? { nextStageSeq: Number(row.next_stage_seq) } : {}),
     ...(row.last_rejection_sig != null ? { lastRejectionSig: String(row.last_rejection_sig) } : {}),
     ...(mergedSteers !== undefined ? { userSteers: mergedSteers } : {}),
+    ...(row.graph_spec_json != null ? { graphSpecJson: String(row.graph_spec_json) } : {}),
+    ...(row.machine_state_json != null ? { machineStateJson: String(row.machine_state_json) } : {}),
+    ...(row.lease_mode != null ? { leaseMode: String(row.lease_mode) as FlowLeaseMode } : {}),
   };
 };
 export const toLease = (r: LeaseRow): ProjectFlowLease => ({

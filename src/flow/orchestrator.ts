@@ -20,15 +20,30 @@ export interface RoleSupervisorConfig {
   role: RoleSpec; inspector: SupervisorInspectorLike;
   initialDelayMs?: number; minIntervalMs?: number; maxIntervalMs?: number;
 }
+export interface RoleSessionPoolLike {
+  hasWarm(flowId: string, nodeId: string): boolean;
+  switchModelInPlace?(
+    flowId: string,
+    nodeId: string,
+    nextModel: string,
+  ): Promise<{ switched: boolean; modelLabel?: string; reason?: string }>;
+  disposeNode(flowId: string, nodeId: string): Promise<void>;
+  disposeFlow(flowId: string): Promise<void>;
+}
+
 export interface RoleStepContext {
   cwd: string; store: EnhanceStore; role: RoleSpec; mandate: Mandate;
   epistemicItems: readonly EpistemicItem[]; upstreamHandoff: HandoffEnvelope | null;
   userSteers?: readonly FlowUserSteer[]; toTarget: string; repairTargetRoleId?: string;
-  flowId?: string | null; conditioningPrompt: string; taskPrompt: string;
+  flowId?: string | null; nodeId?: string; conditioningPrompt: string; taskPrompt: string;
   stageId?: string; round?: number; observer?: FlowObserver; supervisor?: RoleSupervisorConfig;
   signal?: AbortSignal;
   beforeSnapshot?: ReadonlyMap<string, SnapshotEntry>;
   beforeConfigSnapshot?: ReadonlyMap<string, SnapshotEntry>;
+  reuseSession?: boolean; keepSessionWarm?: boolean; forkFromNodeId?: string;
+  modelOverride?: string; repairFeedback?: string; replyText?: string;
+  nodeBrief?: string; boardContext?: string; stallTimeoutMs?: number;
+  sessionPool?: RoleSessionPoolLike;
 }
 export interface RoleTurnOutcome {
   envelope: HandoffEnvelope | null; observedCalls: ObservedToolCall[];
@@ -37,6 +52,10 @@ export interface RoleTurnOutcome {
   cancelledByUser?: boolean;
   boundaryViolations?: string[];
   hostError?: string | null;
+  retryableHostError?: boolean;
+  stalled?: { idleSec: number; currentModel?: string } | null;
+  sessionWarm?: boolean;
+  modelLabel?: string;
 }
 export interface RoleSessionRunner {
   runRoleTurn(ctx: RoleStepContext): Promise<RoleTurnOutcome>;
@@ -44,24 +63,34 @@ export interface RoleSessionRunner {
 export interface ExecuteRoleStepInput {
   cwd: string; store: EnhanceStore; role: RoleSpec; mandate: Mandate;
   upstreamHandoff: HandoffEnvelope | null; userSteers?: readonly FlowUserSteer[];
-  toTarget: string; repairTargetRoleId?: string; flowId?: string | null;
+  toTarget: string; repairTargetRoleId?: string; flowId?: string | null; nodeId?: string;
   runner: RoleSessionRunner; stageId?: string; round?: number; modelLabel?: string;
   observer?: FlowObserver; supervisor?: RoleSupervisorConfig; signal?: AbortSignal;
+  reuseSession?: boolean; keepSessionWarm?: boolean; forkFromNodeId?: string;
+  modelOverride?: string; repairFeedback?: string; replyText?: string;
+  nodeBrief?: string; boardContext?: string; stallTimeoutMs?: number;
+  sessionPool?: RoleSessionPoolLike;
 }
 export type ExecuteRoleStepResult =
-  | { ok: true; envelope: HandoffEnvelope }
+  | { ok: true; envelope: HandoffEnvelope; sessionWarm?: boolean; modelLabel?: string }
   | { ok: false; status: "violation"; violations: string[]; reason: string }
-  | { ok: false; status: "host_error"; reason: string; hostError: string }
+  | { ok: false; status: "host_error"; reason: string; hostError: string; retryable?: boolean; modelLabel?: string }
+  | { ok: false; status: "stalled"; reason: string; idleSec: number; modelLabel?: string }
   | { ok: false; status: "missing_handoff"; reason: string }
   | { ok: false; status: "aborted_by_supervisor"; reason: string; decision: SupervisorDecision }
   | { ok: false; status: "cancelled"; reason: string };
 
 function taskPromptFor(input: {
   role: RoleSpec; mandate: Mandate; upstreamHandoff: HandoffEnvelope | null; userSteers: readonly FlowUserSteer[];
+  nodeBrief?: string; boardContext?: string; repairFeedback?: string; replyText?: string;
 }): string {
   const h = input.upstreamHandoff;
   const upstream = h ? `${h.fromRole} -> ${h.toTarget} [${h.verdict}]: ${h.summary}` : "(none)";
   const extra: string[] = [];
+  if (input.nodeBrief) extra.push(`Node assignment:\n${input.nodeBrief}`);
+  if (input.boardContext) extra.push(input.boardContext);
+  if (input.repairFeedback) extra.push(`Repair feedback from downstream verification (address this directly): ${input.repairFeedback}`);
+  if (input.replyText) extra.push(`User reply to your previous question: ${input.replyText}`);
   if (h?.verifiedFacts?.length) extra.push(`Upstream verifiedFacts: ${h.verifiedFacts.map((f) => `${f.claim} [${f.evidenceRef}]`).join("; ")}`);
   if (h?.deletedFiles?.length) extra.push(`Upstream deletedFiles: ${h.deletedFiles.join(", ")}`);
   if (h?.questionsForUser?.length) extra.push(`Upstream questionsForUser: ${h.questionsForUser.join(" | ")}`);
@@ -115,14 +144,35 @@ export async function executeRoleStep(input: ExecuteRoleStepInput): Promise<Exec
     upstreamHandoff: input.upstreamHandoff, userSteers, toTarget: input.toTarget,
     ...(input.repairTargetRoleId ? { repairTargetRoleId: input.repairTargetRoleId } : {}),
     ...(input.flowId ? { flowId: input.flowId } : {}),
-    conditioningPrompt, taskPrompt: taskPromptFor({ role: input.role, mandate: input.mandate, upstreamHandoff: input.upstreamHandoff, userSteers }),
+    ...(input.nodeId ? { nodeId: input.nodeId } : {}),
+    conditioningPrompt,
+    taskPrompt: taskPromptFor({
+      role: input.role, mandate: input.mandate, upstreamHandoff: input.upstreamHandoff, userSteers,
+      ...(input.nodeBrief ? { nodeBrief: input.nodeBrief } : {}),
+      ...(input.boardContext ? { boardContext: input.boardContext } : {}),
+      ...(input.repairFeedback ? { repairFeedback: input.repairFeedback } : {}),
+      ...(input.replyText ? { replyText: input.replyText } : {}),
+    }),
     stageId, round: input.round, observer: input.observer, beforeSnapshot: before, beforeConfigSnapshot: beforeIntegrity,
     ...(input.supervisor ? { supervisor: input.supervisor } : {}), ...(input.signal ? { signal: input.signal } : {}),
+    ...(input.reuseSession ? { reuseSession: true } : {}),
+    ...(input.keepSessionWarm ? { keepSessionWarm: true } : {}),
+    ...(input.forkFromNodeId ? { forkFromNodeId: input.forkFromNodeId } : {}),
+    ...(input.modelOverride ? { modelOverride: input.modelOverride } : {}),
+    ...(input.repairFeedback ? { repairFeedback: input.repairFeedback } : {}),
+    ...(input.replyText ? { replyText: input.replyText } : {}),
+    ...(input.stallTimeoutMs ? { stallTimeoutMs: input.stallTimeoutMs } : {}),
+    ...(input.sessionPool ? { sessionPool: input.sessionPool } : {}),
   });
 
   if (outcome.cancelledByUser || input.signal?.aborted || input.observer?.isCancelled?.()) {
     input.observer?.onStageEnd?.(stageId, { status: "aborted", outcome, reason: "Cancelled by user." });
     return { ok: false, status: "cancelled", reason: "Cancelled by user." };
+  }
+  if (outcome.stalled && !outcome.envelope) {
+    const reason = `[stage:${input.role.id}] Stream stalled for ${outcome.stalled.idleSec}s.`;
+    input.observer?.onStageEnd?.(stageId, { status: "host_error", outcome, reason, hostError: reason });
+    return { ok: false, status: "stalled", reason, idleSec: outcome.stalled.idleSec, modelLabel: outcome.stalled.currentModel ?? outcome.modelLabel };
   }
   if (outcome.abortedBySupervisor && !outcome.envelope) {
     input.observer?.onStageEnd?.(stageId, { status: "aborted", outcome, reason: outcome.abortedBySupervisor.reason });
@@ -143,7 +193,7 @@ export async function executeRoleStep(input: ExecuteRoleStepInput): Promise<Exec
     if (outcome.hostError) {
       const reason = `[stage:${input.role.id}] Host/model error: ${outcome.hostError}`;
       input.observer?.onStageEnd?.(stageId, { status: "host_error", outcome, reason, hostError: outcome.hostError });
-      return { ok: false, status: "host_error", reason, hostError: outcome.hostError };
+      return { ok: false, status: "host_error", reason, hostError: outcome.hostError, retryable: outcome.retryableHostError, modelLabel: outcome.modelLabel };
     }
     const reason = `[stage:${input.role.id}] Role ended without calling enhance_handoff.`;
     input.observer?.onStageEnd?.(stageId, { status: "missing_handoff", outcome, reason });
@@ -154,7 +204,7 @@ export async function executeRoleStep(input: ExecuteRoleStepInput): Promise<Exec
     if (input.store.getHandoff(outcome.envelope.id)) input.store.saveHandoff(outcome.envelope);
   }
   input.observer?.onStageEnd?.(stageId, { status: outcome.envelope.verdict, outcome });
-  return { ok: true, envelope: outcome.envelope };
+  return { ok: true, envelope: outcome.envelope, ...(outcome.sessionWarm ? { sessionWarm: true } : {}), ...(outcome.modelLabel ? { modelLabel: outcome.modelLabel } : {}) };
 }
 
 export interface ExecuteRoleFlowInput {

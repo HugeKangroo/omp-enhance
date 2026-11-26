@@ -1,11 +1,12 @@
 import { canRoleDelegateTo, isRoleReadOnly, resolveRoleActiveTools, summarizeToolCall, TurnTracker } from "../core/policy.ts";
-import { DEFAULT_ENHANCE_SETTINGS, modelSupportsVision, normalizeUsageSummary, resolveRoleRuntimeConfig } from "../core/settings.ts";
+import { DEFAULT_ENHANCE_SETTINGS, modelSupportsVision, normalizeUsageSummary, resolveModelSpec, resolveRoleRuntimeConfig } from "../core/settings.ts";
 import type { EnhanceSettings, HandoffEnvelope, ObservedToolCall, RoleSpec, SupervisorDecision, UsageSummary } from "../core/types.ts";
 import { BoundaryViolationError, createAndVerifyHandoff } from "../flow/handoff.ts";
 import { executeRoleStep, type RoleSessionRunner, type RoleStepContext, type RoleTurnOutcome } from "../flow/orchestrator.ts";
 import { cancelJobsByIds } from "../jobs/runner.ts";
 import { parseSupervisorDecision, renderSupervisorPrompt, runWithSessionSupervisor, type SessionSupervisorControl, type SupervisorInspector } from "../jobs/supervisor.ts";
 import { formatRuntimeVisionHint } from "../roles/conditioning.ts";
+import { type ActiveTurnBindings, FlowSessionPool, formatResolvedModelLabel, isRetryableHostError, startStallWatchdog, type WarmSessionHandle } from "./session-pool.ts";
 import { buildStageCompanionTools, schemaKit } from "./tools.ts";
 
 const MAX_CONSULTATION_DEPTH = 3;
@@ -180,33 +181,39 @@ export function createOmpRoleSessionRunner(
       const baselineSnap = stepCtx.beforeSnapshot ?? childTracker.getBaselineSnapshot(stepCtx.cwd);
       const baselineConfigSnap = stepCtx.beforeConfigSnapshot ?? childTracker.getBaselineConfigSnapshot(stepCtx.cwd);
       const stageId = stepCtx.stageId ?? `${stepCtx.role.id}-${Date.now()}`;
-      const stageStartedJobIds = new Set<string>();
-      let submittedEnvelope: HandoffEnvelope | null = null, childSession: any = null;
-      const boundaryViolations: string[] = [];
+      const pool = stepCtx.sessionPool instanceof FlowSessionPool ? stepCtx.sessionPool : null;
+      const nodeKeyId = stepCtx.nodeId ?? stepCtx.role.id;
+      const warmHandle = stepCtx.reuseSession && pool && stepCtx.flowId ? pool.getWarm(stepCtx.flowId, nodeKeyId) : null;
+      let childSession: any = null, stalledInfo: { idleSec: number } | null = null;
+      const watchdog = startStallWatchdog({
+        timeoutMs: stepCtx.stallTimeoutMs,
+        onStall: (idleSec) => { stalledInfo = { idleSec }; void triggerSessionAbort(true); },
+      });
+      const bindings: ActiveTurnBindings = {
+        stepCtx, childTracker, baselineSnap, baselineConfigSnap, stageId, stageStartedJobIds: new Set<string>(),
+        submittedEnvelope: null, boundaryViolations: [], touchActivity: () => watchdog.touch(),
+      };
+      const turnRef = warmHandle ? warmHandle.turnRef : { current: bindings };
+      if (warmHandle) warmHandle.turnRef.current = bindings;
 
       const collectObservedCalls = (): ObservedToolCall[] => {
-        const calls = new Map<string, ObservedToolCall>();
-        for (const call of childTracker.getObservedCalls()) calls.set(call.toolCallId, call);
+        const cur = turnRef.current, calls = new Map<string, ObservedToolCall>();
+        for (const call of cur.childTracker.getObservedCalls()) calls.set(call.toolCallId, call);
         const messages: any[] = Array.isArray(childSession?.messages) ? childSession.messages : [];
         const argsByCallId = new Map<string, unknown>();
         for (const m of messages) {
           if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
-          for (const part of m.content) {
-            if (part?.type === "toolCall" && typeof part.id === "string") argsByCallId.set(part.id, part.arguments ?? part.input ?? part.args);
-          }
+          for (const part of m.content) if (part?.type === "toolCall" && typeof part.id === "string") argsByCallId.set(part.id, part.arguments ?? part.input ?? part.args);
         }
         const fallbackTracker = new TurnTracker();
         for (const m of messages) {
           if (m?.role !== "toolResult" || typeof m.toolCallId !== "string" || calls.has(m.toolCallId)) continue;
-          const parsed = fallbackTracker.recordToolExecutionEnd(stepCtx.cwd, {
+          const parsed = fallbackTracker.recordToolExecutionEnd(cur.stepCtx.cwd, {
             toolCallId: m.toolCallId, toolName: typeof m.toolName === "string" ? m.toolName : "unknown",
             args: m.args ?? m.input ?? argsByCallId.get(m.toolCallId), result: m, output: m.output, details: m.details,
             exitCode: typeof m.exitCode === "number" ? m.exitCode : undefined, isError: m.isError === true,
           });
-          calls.set(m.toolCallId, {
-            ...parsed,
-            timestamp: typeof m.timestamp === "string" ? m.timestamp : parsed.timestamp,
-          });
+          calls.set(m.toolCallId, { ...parsed, timestamp: typeof m.timestamp === "string" ? m.timestamp : parsed.timestamp });
         }
         return [...calls.values()];
       };
@@ -216,45 +223,44 @@ export function createOmpRoleSessionRunner(
         description: "Submit the final verified role conclusion (or set toTarget + delegateNow=true to consult a specialist role such as vision mid-turn).",
         parameters: handoffSchema,
         async execute(_toolCallId: string, params: any) {
+          const cur = turnRef.current; cur.touchActivity();
           try {
-            const wantDelegate = params.delegateNow === true && typeof params.toTarget === "string" &&
-              params.toTarget.trim() !== "" && params.toTarget.trim() !== "user";
+            const wantDelegate = params.delegateNow === true && typeof params.toTarget === "string" && params.toTarget.trim() !== "" && params.toTarget.trim() !== "user";
             const consultId = wantDelegate ? params.toTarget.trim() : "";
             let consultRole: RoleSpec | undefined;
             if (wantDelegate) {
               if (consultationDepth >= MAX_CONSULTATION_DEPTH) throw new Error(`Maximum specialist consultation depth (${MAX_CONSULTATION_DEPTH}) reached.`);
-              const check = canRoleDelegateTo(stepCtx.role, roles?.get(consultId));
+              const check = canRoleDelegateTo(cur.stepCtx.role, roles?.get(consultId));
               if (!check.allowed) throw new Error(check.reason ?? `Unknown delegation target role "${consultId}".`);
               consultRole = roles?.get(consultId);
             }
-            const effectiveTarget = consultRole ? consultRole.id : (params.verdict === "rejected" ? (stepCtx.repairTargetRoleId ?? "user") : stepCtx.toTarget);
+            const effectiveTarget = consultRole ? consultRole.id : (params.verdict === "rejected" ? (cur.stepCtx.repairTargetRoleId ?? "user") : cur.stepCtx.toTarget);
             const questionsForUser = Array.isArray(params.questionsForUser)
-              ? params.questionsForUser.filter((q: unknown): q is string => typeof q === "string" && q.trim().length > 0)
-              : undefined;
+              ? params.questionsForUser.filter((q: unknown): q is string => typeof q === "string" && q.trim().length > 0) : undefined;
             const envelope = createAndVerifyHandoff({
-              store: stepCtx.store, role: stepCtx.role, cwd: stepCtx.cwd, mandate: stepCtx.mandate,
-              flowId: stepCtx.flowId, parentHandoffId: stepCtx.upstreamHandoff?.id ?? null,
+              store: cur.stepCtx.store, role: cur.stepCtx.role, cwd: cur.stepCtx.cwd, mandate: cur.stepCtx.mandate,
+              flowId: cur.stepCtx.flowId, parentHandoffId: cur.stepCtx.upstreamHandoff?.id ?? null,
               toTarget: effectiveTarget, verdict: params.verdict, summary: params.summary,
-              artifactPaths: params.artifactPaths, baselineSnapshot: baselineSnap,
-              baselineConfigSnapshot: baselineConfigSnap, enforceConfigIntegrity: true,
+              artifactPaths: params.artifactPaths, baselineSnapshot: cur.baselineSnap,
+              baselineConfigSnapshot: cur.baselineConfigSnap, enforceConfigIntegrity: true,
               observedCalls: collectObservedCalls(), verifiedFacts: params.verifiedFacts,
               openRisks: params.openRisks, questionsForUser, feedbackForUpstream: params.feedbackForUpstream,
               observedUsage: extractSessionUsage(childSession), isConsultation: Boolean(consultRole),
             });
             if (consultRole) {
               const delegated = await executeRoleStep({
-                cwd: stepCtx.cwd, store: stepCtx.store, role: consultRole, mandate: stepCtx.mandate,
-                upstreamHandoff: envelope, userSteers: stepCtx.userSteers, toTarget: stepCtx.role.id,
-                flowId: stepCtx.flowId, observer: stepCtx.observer, supervisor: stepCtx.supervisor, signal: stepCtx.signal,
+                cwd: cur.stepCtx.cwd, store: cur.stepCtx.store, role: consultRole, mandate: cur.stepCtx.mandate,
+                upstreamHandoff: envelope, userSteers: cur.stepCtx.userSteers, toTarget: cur.stepCtx.role.id,
+                flowId: cur.stepCtx.flowId, observer: cur.stepCtx.observer, supervisor: cur.stepCtx.supervisor, signal: cur.stepCtx.signal,
                 runner: createOmpRoleSessionRunner(pi, hostCtx, settings, roles, consultationDepth + 1),
               });
               return { content: [{ type: "text", text: JSON.stringify({ handoff: envelope, delegated }, null, 2) }], ...(!delegated.ok ? { isError: true } : {}) };
             }
-            submittedEnvelope = envelope;
-            stepCtx.observer?.bindControls?.(null, stageId);
+            cur.submittedEnvelope = envelope;
+            cur.stepCtx.observer?.bindControls?.(null, cur.stageId);
             return { content: [{ type: "text", text: JSON.stringify(envelope, null, 2) }] };
           } catch (error) {
-            if (error instanceof BoundaryViolationError) boundaryViolations.push(...error.violations);
+            if (error instanceof BoundaryViolationError) cur.boundaryViolations.push(...error.violations);
             return { content: [{ type: "text", text: JSON.stringify({ error: error instanceof Error ? error.message : String(error) }, null, 2) }], isError: true };
           }
         },
@@ -262,113 +268,126 @@ export function createOmpRoleSessionRunner(
 
       const childGuardExt = (childPi: any): void => {
         childPi.on("tool_call", (ev: any) => {
-          const toolName = ev.toolName ?? ev.name ?? "", input = ev.input ?? ev.args;
-          const decision = childTracker.checkToolCallAllowed(stepCtx.cwd, stepCtx.role, { toolName, input }, roles, "stage");
+          const cur = turnRef.current; cur.touchActivity();
+          const decision = cur.childTracker.checkToolCallAllowed(cur.stepCtx.cwd, cur.stepCtx.role, { toolName: ev.toolName ?? ev.name ?? "", input: ev.input ?? ev.args }, roles, "stage");
           return decision.block ? decision : undefined;
         });
         childPi.on("tool_execution_start", (ev: any) => {
+          const cur = turnRef.current; cur.touchActivity();
           const toolName = ev.toolName ?? ev.name ?? "", input = ev.args ?? ev.input;
-          childTracker.recordToolExecutionStart(toolName, input, ev.toolCallId ?? ev.id);
-          stepCtx.observer?.onToolStart?.(stageId, summarizeToolCall(toolName, input));
-          void stepCtx.observer?.drainPendingSteers?.({ roleId: stepCtx.role.id, stageId, phase: "mid_stage" });
+          cur.childTracker.recordToolExecutionStart(toolName, input, ev.toolCallId ?? ev.id);
+          cur.stepCtx.observer?.onToolStart?.(cur.stageId, summarizeToolCall(toolName, input));
+          void cur.stepCtx.observer?.drainPendingSteers?.({ roleId: cur.stepCtx.role.id, stageId: cur.stageId, phase: "mid_stage" });
         });
         childPi.on("tool_execution_end", (ev: any) => {
-          const call = childTracker.recordToolExecutionEnd(stepCtx.cwd, {
+          const cur = turnRef.current; cur.touchActivity();
+          const call = cur.childTracker.recordToolExecutionEnd(cur.stepCtx.cwd, {
             toolCallId: ev.toolCallId ?? ev.id ?? "call", toolName: ev.toolName ?? ev.name ?? "unknown",
             args: ev.args, input: ev.input, result: ev.result, output: ev.output, details: ev.details,
-            exitCode: typeof ev.exitCode === "number" ? ev.exitCode : undefined,
-            isError: Boolean(ev.isError ?? ev.result?.isError),
+            exitCode: typeof ev.exitCode === "number" ? ev.exitCode : undefined, isError: Boolean(ev.isError ?? ev.result?.isError),
           });
-          stepCtx.observer?.onToolEnd?.(stageId, call);
-          void stepCtx.observer?.drainPendingSteers?.({ roleId: stepCtx.role.id, stageId, phase: "mid_stage" });
+          cur.stepCtx.observer?.onToolEnd?.(cur.stageId, call);
+          void cur.stepCtx.observer?.drainPendingSteers?.({ roleId: cur.stepCtx.role.id, stageId: cur.stageId, phase: "mid_stage" });
         });
       };
 
       const available = pi.getAllTools?.().map((t: any) => t.name) ?? ["read", "write", "edit", "grep", "bash"];
       const allowedTools = resolveRoleActiveTools(stepCtx.role, available, "stage");
-      const extraStageTools = buildStageCompanionTools(
-        pi, stepCtx, settings ?? DEFAULT_ENHANCE_SETTINGS, (jobId) => stageStartedJobIds.add(jobId),
-      );
-      const { model, thinkingLevel } = resolveRoleRuntimeConfig(stepCtx.role, pi, hostCtx, settings);
-      const resolvedModel = model as { provider?: string; id?: string } | undefined;
-      const modelLabel = resolvedModel?.provider && resolvedModel?.id ? `${resolvedModel.provider}/${resolvedModel.id}` : (stepCtx.role.model ?? "default");
-      const vHint = !stepCtx.conditioningPrompt.includes("\nRuntimeVision: ") ? formatRuntimeVisionHint(modelSupportsVision(model), stepCtx.role.id) : null;
-      const sysPrompt = vHint ? stepCtx.conditioningPrompt.replace("\nStance:\n", `\n${vHint}\nStance:\n`) : stepCtx.conditioningPrompt;
-      stepCtx.observer?.onStageModelResolved?.(stageId, modelLabel);
+      const { model: defaultModel, thinkingLevel } = resolveRoleRuntimeConfig(stepCtx.role, pi, hostCtx, settings);
+      const overrideModel = stepCtx.modelOverride ? resolveModelSpec(stepCtx.modelOverride, hostCtx, pi) : undefined;
+      const model = overrideModel ?? defaultModel;
+      let modelLabel = formatResolvedModelLabel(model, stepCtx.modelOverride ?? stepCtx.role.model ?? "default");
+      let activeHandle: WarmSessionHandle | null = warmHandle;
 
-      const inMemorySession = pi?.pi?.SessionManager?.inMemory?.(stepCtx.cwd);
-      const stageAgentId = `enhance-stage-${stageId.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
-      const created = await pi.pi.createAgentSession({
-        cwd: stepCtx.cwd, agentId: stageAgentId, parentTaskPrefix: stageAgentId, taskDepth: 1,
-        modelRegistry: isolateModelRegistry(hostCtx.modelRegistry),
-        ...(inMemorySession ? { sessionManager: inMemorySession } : {}),
-        ...(model ? { model } : {}), ...(thinkingLevel ? { thinkingLevel } : {}),
-        settings: createChildSettingsProxy(pi.pi.settings),
-        hasUI: false, autoApprove: true, enableMemory: false, bindProcessState: false, disableExtensionDiscovery: true,
-        noContextFiles: false, enableMCP: false, enableLsp: allowedTools.includes("lsp"),
-        preloadedCustomToolPaths: [], promptTemplates: [], slashCommands: [],
-        customSystemPrompt: sysPrompt, customTools: [childHandoffTool, ...extraStageTools],
-        preloadedPreparedExtensions: [
-          { path: "<enhance-guard>", resolvedPath: "<enhance-guard>", factory: childGuardExt, error: null },
-        ],
-        restrictToolNames: true, toolNames: allowedTools, allowRestrictedCustomTools: true,
-      });
+      if (warmHandle) {
+        childSession = warmHandle.session;
+        modelLabel = warmHandle.modelLabel;
+        if (overrideModel && typeof childSession.setModel === "function") {
+          try { await childSession.setModel(overrideModel); modelLabel = formatResolvedModelLabel(overrideModel, stepCtx.modelOverride ?? modelLabel); warmHandle.modelLabel = modelLabel; } catch {}
+        }
+        stepCtx.observer?.onStageModelResolved?.(stageId, modelLabel);
+      } else {
+        const extraStageTools = buildStageCompanionTools(pi, stepCtx, settings ?? DEFAULT_ENHANCE_SETTINGS, (jobId) => turnRef.current.stageStartedJobIds.add(jobId));
+        const vHint = !stepCtx.conditioningPrompt.includes("\nRuntimeVision: ") ? formatRuntimeVisionHint(modelSupportsVision(model), stepCtx.role.id) : null;
+        const sysPrompt = vHint ? stepCtx.conditioningPrompt.replace("\nStance:\n", `\n${vHint}\nStance:\n`) : stepCtx.conditioningPrompt;
+        stepCtx.observer?.onStageModelResolved?.(stageId, modelLabel);
+        const inMemorySession = pi?.pi?.SessionManager?.inMemory?.(stepCtx.cwd);
+        const stageAgentId = `enhance-stage-${stageId.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+        const created = await pi.pi.createAgentSession({
+          cwd: stepCtx.cwd, agentId: stageAgentId, parentTaskPrefix: stageAgentId, taskDepth: 1,
+          modelRegistry: isolateModelRegistry(hostCtx.modelRegistry), ...(inMemorySession ? { sessionManager: inMemorySession } : {}),
+          ...(model ? { model } : {}), ...(thinkingLevel ? { thinkingLevel } : {}),
+          settings: createChildSettingsProxy(pi.pi.settings),
+          hasUI: false, autoApprove: true, enableMemory: false, bindProcessState: false, disableExtensionDiscovery: true,
+          noContextFiles: false, enableMCP: false, enableLsp: allowedTools.includes("lsp"),
+          preloadedCustomToolPaths: [], promptTemplates: [], slashCommands: [],
+          customSystemPrompt: sysPrompt, customTools: [childHandoffTool, ...extraStageTools],
+          preloadedPreparedExtensions: [{ path: "<enhance-guard>", resolvedPath: "<enhance-guard>", factory: childGuardExt, error: null }],
+          restrictToolNames: true, toolNames: allowedTools, allowRestrictedCustomTools: true,
+        });
+        childSession = created.session;
+        if (pool && stepCtx.flowId) {
+          activeHandle = { key: `${stepCtx.flowId}::${nodeKeyId}`, flowId: stepCtx.flowId, nodeId: nodeKeyId, roleId: stepCtx.role.id, cwd: stepCtx.cwd, session: childSession, modelLabel, turnRef, disposed: false };
+        }
+      }
 
-      childSession = created.session;
-      const triggerSessionAbort = async (): Promise<void> => {
-        cancelledByUser = true;
+      const unsubActivity = typeof childSession?.subscribe === "function" ? childSession.subscribe(() => watchdog.touch()) : null;
+      const triggerSessionAbort = async (isStall = false): Promise<void> => {
+        if (!isStall) cancelledByUser = true;
         if (abortSent) return;
         abortSent = true;
-        await created.session.abort?.();
+        await childSession?.abort?.();
       };
-      const onExternalAbort = () => { void triggerSessionAbort(); };
+      const onExternalAbort = () => { void triggerSessionAbort(false); };
+      let shouldKeepWarm = false;
 
       try {
-        if (isCancelledNow()) {
-          cancelledByUser = true;
-          return { envelope: null, observedCalls: [], assistantText: "", usage: null, cancelledByUser: true };
-        }
+        if (isCancelledNow()) { cancelledByUser = true; return { envelope: null, observedCalls: [], assistantText: "", usage: null, cancelledByUser: true }; }
         stepCtx.signal?.addEventListener("abort", onExternalAbort, { once: true });
         stepCtx.observer?.bindControls?.({
-          steer: async (msg: string) => { await created.session.steer?.(`[User interjection in Flow room]: ${msg}`); },
-          abort: async () => { await triggerSessionAbort(); },
+          steer: async (msg: string) => { watchdog.touch(); await childSession.steer?.(`[User interjection in Flow room]: ${msg}`); },
+          abort: async () => { await triggerSessionAbort(false); },
         }, stageId);
         await stepCtx.observer?.drainPendingSteers?.({ roleId: stepCtx.role.id, stageId, phase: "mid_stage" });
 
         const finish = (abortedBySupervisor: SupervisorDecision | null = null): RoleTurnOutcome => {
-          const usage = extractSessionUsage(created.session);
-          if (submittedEnvelope && usage && !submittedEnvelope.observedUsage) {
-            submittedEnvelope = { ...submittedEnvelope, observedUsage: usage };
-            if (stepCtx.store.getHandoff(submittedEnvelope.id)) stepCtx.store.saveHandoff(submittedEnvelope);
+          const cur = turnRef.current, usage = extractSessionUsage(childSession);
+          if (cur.submittedEnvelope && usage && !cur.submittedEnvelope.observedUsage) {
+            cur.submittedEnvelope = { ...cur.submittedEnvelope, observedUsage: usage };
+            if (stepCtx.store.getHandoff(cur.submittedEnvelope.id)) stepCtx.store.saveHandoff(cur.submittedEnvelope);
           }
           const cancelled = isCancelledNow();
-          const hostError = !submittedEnvelope && !cancelled && !abortedBySupervisor
-            ? (thrownHostError ?? extractSessionHostError(created.session))
-            : null;
+          const stalled = stalledInfo ?? watchdog.wasStalled();
+          const hostError = !cur.submittedEnvelope && !cancelled && !abortedBySupervisor && !stalled
+            ? (thrownHostError ?? extractSessionHostError(childSession)) : null;
+          shouldKeepWarm = Boolean(
+            stepCtx.keepSessionWarm && pool && activeHandle && !cancelled && !abortedBySupervisor &&
+            (cur.submittedEnvelope?.verdict === "ready" || cur.submittedEnvelope?.verdict === "needs_input" || Boolean(stalled) || isRetryableHostError(hostError)),
+          );
           return {
-            envelope: submittedEnvelope, observedCalls: collectObservedCalls(),
-            assistantText: created.session.getLastAssistantText?.() ?? "", usage,
-            ...(abortedBySupervisor && !submittedEnvelope ? { abortedBySupervisor } : {}),
+            envelope: cur.submittedEnvelope, observedCalls: collectObservedCalls(),
+            assistantText: childSession.getLastAssistantText?.() ?? "", usage, modelLabel,
+            ...(shouldKeepWarm ? { sessionWarm: true } : {}),
+            ...(stalled && !cur.submittedEnvelope ? { stalled: { idleSec: stalled.idleSec, currentModel: modelLabel } } : {}),
+            ...(abortedBySupervisor && !cur.submittedEnvelope ? { abortedBySupervisor } : {}),
             ...(cancelled ? { cancelledByUser: true } : {}),
-            ...(boundaryViolations.length > 0 ? { boundaryViolations } : {}),
-            ...(hostError ? { hostError } : {}),
+            ...(cur.boundaryViolations.length > 0 ? { boundaryViolations: cur.boundaryViolations } : {}),
+            ...(hostError ? { hostError, retryableHostError: isRetryableHostError(hostError) } : {}),
           };
         };
 
         const runTurn = async (control: SessionSupervisorControl): Promise<RoleTurnOutcome> => {
           try {
-            await created.session.prompt(stepCtx.taskPrompt);
-            if (!submittedEnvelope) {
-              await stepCtx.observer?.drainPendingSteers?.({ roleId: stepCtx.role.id, stageId, phase: "mid_stage" });
-            }
-            if (
-              !control.aborted && !isCancelledNow() &&
-              !submittedEnvelope && !lastAssistantErroredOrAborted(created.session)
-            ) {
-              await created.session.prompt("Submit your final role conclusion now using the enhance_handoff tool.");
+            const promptText = warmHandle
+              ? [stepCtx.replyText ? `User reply: ${stepCtx.replyText}` : "", stepCtx.repairFeedback ? `Repair / continuation feedback: ${stepCtx.repairFeedback}` : "", stepCtx.taskPrompt].filter(Boolean).join("\n\n")
+              : stepCtx.taskPrompt;
+            await childSession.prompt(promptText);
+            if (!turnRef.current.submittedEnvelope) await stepCtx.observer?.drainPendingSteers?.({ roleId: stepCtx.role.id, stageId, phase: "mid_stage" });
+            if (!control.aborted && !isCancelledNow() && !stalledInfo && !turnRef.current.submittedEnvelope && !lastAssistantErroredOrAborted(childSession)) {
+              await childSession.prompt("Submit your final role conclusion now using the enhance_handoff tool.");
             }
           } catch (err) {
-            if (!isCancelledNow() && !supervisorAborted && !control.aborted) {
+            if (!isCancelledNow() && !supervisorAborted && !control.aborted && !stalledInfo) {
               thrownHostError = sanitizeHostError(err instanceof Error ? err.message : String(err));
             }
           }
@@ -379,38 +398,35 @@ export function createOmpRoleSessionRunner(
         if (!supervisor) return await runTurn({ aborted: false, decisions: [] });
         const supervised = await runWithSessionSupervisor({
           supervisorRole: supervisor.role, inspector: supervisor.inspector as SupervisorInspector, goal: stepCtx.mandate.goal,
-          initialDelayMs: supervisor.initialDelayMs, minIntervalMs: supervisor.minIntervalMs, maxIntervalMs: supervisor.maxIntervalMs,
-          signal: stepCtx.signal,
+          initialDelayMs: supervisor.initialDelayMs, minIntervalMs: supervisor.minIntervalMs, maxIntervalMs: supervisor.maxIntervalMs, signal: stepCtx.signal,
           getPulse: () => {
             void stepCtx.observer?.drainPendingSteers?.({ roleId: stepCtx.role.id, stageId, phase: "mid_stage" });
             const calls = collectObservedCalls(), handoffErrs = calls.filter((c) => c.toolName === "enhance_handoff" && c.isError).length;
             return {
-              calls: calls.length, activeTool: childTracker.getActiveTool(),
+              calls: calls.length, activeTool: turnRef.current.childTracker.getActiveTool(),
               summary: calls.slice(-3).map((c) => `${c.toolName}${c.isError ? (c.toolName === "enhance_handoff" && handoffErrs < 3 ? ":validation_retry" : ":error") : ""}`).join(", "),
-              roleId: stepCtx.role.id, readOnly: isRoleReadOnly(stepCtx.role), allowedTools,
-              activeAsyncJobs: countActiveAsyncJobs(childSession, hostCtx),
+              roleId: stepCtx.role.id, readOnly: isRoleReadOnly(stepCtx.role), allowedTools, activeAsyncJobs: countActiveAsyncJobs(childSession, hostCtx),
             };
           },
           onSteer: async (message) => {
             const framed = message.startsWith("[Supervisor]:") ? message : `[Supervisor]: ${message}`;
             stepCtx.observer?.onSupervisorNote?.(stageId, `↺ steer: ${message}`);
-            await created.session.steer?.(framed);
+            await childSession.steer?.(framed);
           },
-          onAbort: async () => {
-            supervisorAborted = true; abortSent = true;
-            stepCtx.observer?.onSupervisorNote?.(stageId, "✕ aborted by supervisor");
-            await created.session.abort?.();
-          },
+          onAbort: async () => { supervisorAborted = true; abortSent = true; stepCtx.observer?.onSupervisorNote?.(stageId, "✕ aborted by supervisor"); await childSession.abort?.(); },
           run: runTurn,
         });
-        if (supervised.aborted && !submittedEnvelope) { supervisorAborted = true; return finish(supervised.aborted); }
+        if (supervised.aborted && !turnRef.current.submittedEnvelope) { supervisorAborted = true; return finish(supervised.aborted); }
         return supervised.result ?? finish();
       } finally {
+        watchdog.stop();
+        if (typeof unsubActivity === "function") { try { unsubActivity(); } catch {} }
         stepCtx.signal?.removeEventListener("abort", onExternalAbort);
         stepCtx.observer?.bindControls?.(null, stageId);
-        const stageAborted = (supervisorAborted && !submittedEnvelope) || isCancelledNow();
-        if (stageAborted && stageStartedJobIds.size > 0) cancelJobsByIds(stepCtx.store, stageStartedJobIds);
-        await created.session.dispose();
+        const stageAborted = (supervisorAborted && !turnRef.current.submittedEnvelope) || isCancelledNow();
+        if (stageAborted && turnRef.current.stageStartedJobIds.size > 0) cancelJobsByIds(stepCtx.store, turnRef.current.stageStartedJobIds);
+        if (shouldKeepWarm && pool && activeHandle) pool.putWarm(activeHandle);
+        else { if (activeHandle) activeHandle.disposed = true; await childSession?.dispose?.(); }
       }
     },
   };

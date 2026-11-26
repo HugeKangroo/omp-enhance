@@ -124,7 +124,7 @@ function formatFlowEventReport(settlement: BackgroundFlowSettlement): string {
   if (env?.questionsForUser?.length) {
     lines.push(
       "Questions for user:", ...env.questionsForUser.map((q) => `- ${q}`),
-      `Action required: Relay these questions to the user in plain language. Once answered, resume with enhance_flow(action="resume", flowId="${flowId}", cwd="${targetWs.cwd}", message="<user's answer>").`,
+      `Action required: Relay these questions to the user in plain language and STOP to wait for their reply — do NOT guess or answer on the user's behalf. Only after the user replies, resume with enhance_flow(action="resume", flowId="${flowId}", cwd="${targetWs.cwd}", message="<user's answer>").`,
     );
   }
   return lines.join("\n");

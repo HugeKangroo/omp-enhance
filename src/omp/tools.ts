@@ -177,16 +177,38 @@ export function buildStageCompanionTools(
 ): any[] {
   const kit = schemaKit(pi);
   const tools: any[] = [{
-    name: "enhance_mandate", label: "Stage Mandate & Epistemic Board", loadMode: "essential",
-    description: "Read the active Mandate or add/update epistemic-board items inside this stage.",
+    name: "enhance_mandate", label: "Stage Mandate, Epistemic & Flow Board", loadMode: "essential",
+    description: "Read the active Mandate, update epistemic-board items, or post/read shared Flow Board findings inside this stage.",
     parameters: kit.obj({
-      action: kit.en(["set", "get", "add_item", "update_item"]), goal: kit.str(),
+      action: kit.en(["set", "get", "add_item", "update_item", "post_board", "read_board"]), goal: kit.str(),
       constraints: kit.arr(kit.str()), acceptance: kit.arr(kit.str()),
       status: kit.en([...MANDATE_STATUSES, ...EPISTEMIC_STATUSES]), kind: kit.en(EPISTEMIC_KINDS),
       statement: kit.str(), evidenceRef: kit.str(), verificationPlan: kit.str(), itemId: kit.str(),
+      text: kit.str(), target: kit.str(), afterSeq: kit.num(), limit: kit.num(),
     }, ["action"]),
     async execute(_id: string, params: Record<string, unknown>) {
-      try { return toolResult(executeMandateParams(stepCtx.store, params, { lockedMandate: stepCtx.mandate })); }
+      try {
+        const action = asString(params.action);
+        if (action === "post_board") {
+          const text = asString(params.text) ?? asString(params.statement);
+          if (!text) throw new Error("enhance_mandate post_board requires non-empty text.");
+          if (!stepCtx.flowId) throw new Error("post_board is only available inside an active Flow.");
+          const entry = stepCtx.store.appendFlowBoardEvent(stepCtx.flowId, {
+            nodeId: stepCtx.nodeId ?? stepCtx.role.id, kind: "finding",
+            speaker: stepCtx.nodeId ?? stepCtx.role.id, target: asString(params.target) ?? "all", text,
+          });
+          return toolResult({ entry });
+        }
+        if (action === "read_board") {
+          if (!stepCtx.flowId) return toolResult({ entries: [] });
+          const entries = stepCtx.store.listFlowBoardEvents(stepCtx.flowId, {
+            afterSeq: typeof params.afterSeq === "number" ? params.afterSeq : undefined,
+            limit: typeof params.limit === "number" ? params.limit : 30,
+          });
+          return toolResult({ entries });
+        }
+        return toolResult(executeMandateParams(stepCtx.store, params, { lockedMandate: stepCtx.mandate }));
+      }
       catch (err) { return toolError(err); }
     },
   }];
