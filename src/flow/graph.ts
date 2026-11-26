@@ -8,9 +8,10 @@ import type {
   WorkspaceMode,
 } from "../core/graph-types.ts";
 import { isInternalRole, isRoleReadOnly } from "../core/policy.ts";
-import { globScopesMayOverlap, narrowRolePermissions, resolveEffectiveWritableScope } from "../core/scope.ts";
+import { globScopesMayOverlap, resolveEffectiveWritableScope, resolveNodeEffectiveRole } from "../core/scope.ts";
 import type { RoleSpec } from "../core/types.ts";
 import { normalizePolicies } from "./graph-presets.ts";
+import { expandGraphRoleWorkflows } from "./workflow.ts";
 
 export {
   compileContractParallelVerify,
@@ -21,7 +22,7 @@ export {
   type FanOutShardInput,
 } from "./graph-presets.ts";
 
-const NODE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+const NODE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 export function computeAncestorMap(nodes: readonly FlowNodeSpec[]): Map<string, Set<string>> {
   const byId = new Map(nodes.map((n) => [n.id, n]));
@@ -75,7 +76,7 @@ function validateNodeConfigs(
       else if (!role) issues.push({ code: "unknown_role", nodeId: node.id, message: `Node "${node.id}" references unknown role "${node.role}".` });
       else if (isInternalRole(role)) issues.push({ code: "internal_role_forbidden", nodeId: node.id, message: `Node "${node.id}" cannot run internal monitor role "${role.id}".` });
       else {
-        const narrowed = narrowRolePermissions(role, node.writableScope);
+        const narrowed = resolveNodeEffectiveRole(role, node);
         if (!narrowed.ok) issues.push({ code: "scope_violation", nodeId: node.id, message: `Node "${node.id}": ${narrowed.reason}` });
         else if (!isRoleReadOnly(narrowed.role)) writableRoleByNode.set(node.id, narrowed.role);
       }
@@ -85,14 +86,11 @@ function validateNodeConfigs(
         issues.push({ code: "invalid_repair_target", nodeId: node.id, message: `Gate "${node.id}" references unknown repairTargetNodeId "${node.gate.repairTargetNodeId}".` });
       }
     } else if (node.kind === "merge") {
+      if (node.join === "any") issues.push({ code: "invalid_node_config", nodeId: node.id, message: `Merge node "${node.id}" cannot use join="any" (all write sources must complete before merge).` });
       if (!node.merge?.sourceNodeIds?.length) issues.push({ code: "invalid_merge_source", nodeId: node.id, message: `Merge node "${node.id}" requires non-empty merge.sourceNodeIds.` });
       else for (const src of node.merge.sourceNodeIds) if (!byId.has(src)) issues.push({ code: "invalid_merge_source", nodeId: node.id, message: `Merge node "${node.id}" references unknown sourceNodeId "${src}".` });
     } else if (node.kind === "human") {
       if (!node.human?.prompt?.trim()) issues.push({ code: "invalid_node_config", nodeId: node.id, message: `Human node "${node.id}" requires a non-empty human.prompt.` });
-    } else if (node.kind === "native_task") {
-      if (!node.nativeTask?.agent?.trim() || !node.nativeTask.tasks?.length) {
-        issues.push({ code: "invalid_node_config", nodeId: node.id, message: `Native task node "${node.id}" requires agent and non-empty tasks.` });
-      }
     }
   }
 }
@@ -101,18 +99,25 @@ export function validateFlowGraph(input: {
   spec: FlowGraphSpec;
   roles: ReadonlyMap<string, RoleSpec>;
   isGitRepo?: boolean;
+  skippedNodeIds?: ReadonlySet<string>;
 }): GraphValidationResult {
-  const { spec, roles } = input;
+  const { roles } = input;
   const isGitRepo = input.isGitRepo ?? true;
-  const policies = normalizePolicies(spec.policies);
   const issues: GraphValidationIssue[] = [];
   const waveByNode: Record<string, number> = {};
   const effectiveWorkspaceByNode: Record<string, WorkspaceMode> = {};
 
-  if (!spec.nodes || spec.nodes.length === 0) {
+  if (!input.spec.nodes || input.spec.nodes.length === 0) {
     issues.push({ code: "empty_graph", message: "Flow graph must contain at least one node." });
     return { ok: false, issues, waveByNode, waves: [], effectiveWorkspaceByNode, hasWritableNodes: false, usesWorktree: false, leaseMode: "read" };
   }
+  let spec = input.spec;
+  try { spec = expandGraphRoleWorkflows(input.spec, roles); }
+  catch (err) {
+    issues.push({ code: "scope_violation", message: err instanceof Error ? err.message : String(err) });
+    return { ok: false, issues, waveByNode, waves: [], effectiveWorkspaceByNode, hasWritableNodes: false, usesWorktree: false, leaseMode: "read" };
+  }
+  const policies = normalizePolicies(spec.policies);
 
   const byId = new Map<string, FlowNodeSpec>();
   for (const node of spec.nodes) {
@@ -189,13 +194,27 @@ export function validateFlowGraph(input: {
   }
 
   for (const node of spec.nodes) {
+    if (effectiveWorkspaceByNode[node.id] === "worktree" && node.parentGroupId) {
+      for (const peer of spec.nodes) {
+        if (peer.parentGroupId === node.parentGroupId && peer.kind === "role") effectiveWorkspaceByNode[peer.id] = "worktree";
+      }
+    }
+  }
+  for (const node of spec.nodes) {
     if (effectiveWorkspaceByNode[node.id] === "worktree" && !isGitRepo) {
       issues.push({ code: "worktree_requires_git", nodeId: node.id, message: `Node "${node.id}" requires workspace="worktree", but target directory is not a Git repository.` });
     }
   }
-  const mergedSources = new Set(spec.nodes.filter((n) => n.kind === "merge").flatMap((n) => n.merge?.sourceNodeIds ?? []));
+  const activeMerges = spec.nodes.filter((n) => n.kind === "merge" && !input.skippedNodeIds?.has(n.id));
+  const mergedSources = new Set(activeMerges.flatMap((n) => n.merge?.sourceNodeIds ?? []));
+  const coveredGroups = new Set(
+    [...mergedSources].map((sid) => byId.get(sid)?.parentGroupId).filter((g): g is string => Boolean(g)),
+  );
   for (const id of writableIds) {
-    if (effectiveWorkspaceByNode[id] === "worktree" && !mergedSources.has(id)) {
+    if (input.skippedNodeIds?.has(id)) continue;
+    const node = byId.get(id)!;
+    const groupCovered = Boolean(node.parentGroupId && coveredGroups.has(node.parentGroupId));
+    if (effectiveWorkspaceByNode[id] === "worktree" && !mergedSources.has(id) && !groupCovered) {
       issues.push({
         code: "missing_merge_delivery",
         nodeId: id,
@@ -216,7 +235,10 @@ export function validateFlowGraph(input: {
   const normalizedSpec: FlowGraphSpec = {
     ...spec,
     policies,
-    nodes: spec.nodes.map((n) => ({ ...n, workspace: effectiveWorkspaceByNode[n.id] ?? n.workspace ?? "inherit" })),
+    nodes: spec.nodes.map((n) => {
+      const ws = effectiveWorkspaceByNode[n.id] ?? n.workspace ?? "inherit";
+      return { ...n, workspace: ws, ...(ws === "worktree" && n.parentGroupId ? { worktreeGroup: n.parentGroupId } : {}) };
+    }),
   };
   return { ok: issues.length === 0, issues, waveByNode, waves, effectiveWorkspaceByNode, hasWritableNodes, usesWorktree, leaseMode, ...(issues.length === 0 ? { normalizedSpec } : {}) };
 }
@@ -245,6 +267,10 @@ export function validateGraphPatch(input: {
   }
   for (const add of patch.addNodes ?? []) nextNodes.push({ ...add, dependsOn: [...add.dependsOn] });
 
-  const base = validateFlowGraph({ spec: { ...currentSpec, nodes: nextNodes }, roles, isGitRepo });
+  const skippedNodeIds = new Set<string>([
+    ...Object.entries(nodeStatuses).filter(([, s]) => s === "skipped").map(([k]) => k),
+    ...(patch.skipNodeIds ?? []),
+  ]);
+  const base = validateFlowGraph({ spec: { ...currentSpec, nodes: nextNodes }, roles, isGitRepo, skippedNodeIds });
   return issues.length > 0 ? { ...base, ok: false, issues: [...issues, ...base.issues] } : base;
 }

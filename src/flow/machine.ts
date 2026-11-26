@@ -81,6 +81,11 @@ export function transitionFlow(
         return { state: next, commands };
       }
       const waitingNodes = next.nodeOrder.filter((id) => next.nodes[id]!.status === "waiting_input");
+      const trimmedReply = event.replyText?.trim();
+      if (next.status === "waiting_input" && !trimmedReply) {
+        next.reason = formatWaitingNodesReason(next, waitingNodes);
+        return finish();
+      }
       if (next.status === "waiting_input" && !event.targetNodeId && waitingNodes.length > 1) {
         next.reason = formatWaitingNodesReason(next, waitingNodes);
         return finish();
@@ -91,7 +96,6 @@ export function transitionFlow(
       const prevStatus = next.status;
       next.status = "running"; next.endedAt = null; next.reason = undefined;
       const replyByNode = new Map<string, string>();
-      const trimmedReply = event.replyText?.trim();
       const targets = event.targetNodeId
         ? [event.targetNodeId]
         : prevStatus === "waiting_input"
@@ -103,9 +107,14 @@ export function transitionFlow(
       for (const id of targets) {
         const rt = next.nodes[id]!, spec = getNodeSpec(next, id)!;
         if (spec.kind === "human" && rt.status === "waiting_input") {
-          const recordedReply = trimmedReply || "已确认放行";
-          rt.status = "succeeded"; rt.endedAt = nowIso; rt.questionsForUser = []; rt.lastReply = recordedReply;
-          commands.push({ type: "APPEND_BOARD", entry: { nodeId: id, kind: "user_steer", speaker: "user", target: id, text: recordedReply } });
+          rt.status = "succeeded"; rt.endedAt = nowIso; rt.questionsForUser = []; rt.lastReply = trimmedReply!;
+          commands.push({
+            type: "APPEND_BOARD",
+            entry: {
+              nodeId: id, kind: "user_steer", speaker: "user", target: id, text: trimmedReply!,
+              metadata: { ...(rt.questionPrompt ? { question: rt.questionPrompt } : {}), nodeId: id },
+            },
+          });
         } else {
           rt.status = "ready"; rt.activeStageId = null; rt.lastError = null; rt.questionsForUser = [];
           if (trimmedReply) {
@@ -169,6 +178,13 @@ export function transitionFlow(
       rt.lastError = null; rt.lastRepairFeedback = null; rt.questionsForUser = [];
       rt.sessionResidency = event.sessionWarm ? "warm" : "disposed";
       if (event.commitRef) rt.commitRef = event.commitRef;
+      if (event.commitSha) {
+        rt.commitSha = event.commitSha;
+        if (next.mergedCommitSha || event.commitRef === next.mergedRef) {
+          next.mergedCommitSha = event.commitSha;
+          if (event.commitRef) next.mergedRef = event.commitRef;
+        }
+      }
       next.lastHandoffId = event.handoff.id;
       commands.push({ type: "APPEND_BOARD", entry: { nodeId: event.nodeId, kind: "handoff", speaker: event.handoff.fromRole, target: event.handoff.toTarget, text: event.handoff.summary } });
       scheduleReadyNodes(next, commands, nowIso);
@@ -248,10 +264,12 @@ export function transitionFlow(
       if (event.handoff) { rt.lastHandoff = event.handoff; rt.lastHandoffId = event.handoff.id; next.lastHandoffId = event.handoff.id; }
       commands.push({ type: "APPEND_BOARD", entry: { nodeId: event.nodeId, kind: "merge_result", speaker: event.nodeId, target: "all", text: event.summary } });
       if (event.ok) {
-        rt.status = "succeeded"; rt.endedAt = nowIso; rt.commitRef = event.mergedRef ?? null; next.mergedRef = event.mergedRef ?? null;
+        rt.status = "succeeded"; rt.endedAt = nowIso; rt.commitRef = event.mergedRef ?? null; rt.commitSha = event.mergedCommitSha ?? null;
+        next.mergedRef = event.mergedRef ?? null; next.mergedCommitSha = event.mergedCommitSha ?? null;
         scheduleReadyNodes(next, commands, nowIso); evaluateFlowSettlement(next, commands, nowIso);
       } else {
         if (event.mergedRef) { rt.commitRef = event.mergedRef; next.mergedRef = event.mergedRef; }
+        if (event.mergedCommitSha) { rt.commitSha = event.mergedCommitSha; next.mergedCommitSha = event.mergedCommitSha; }
         const conflictList = (event.conflicts ?? []).join(", ");
         const msg = `Merge conflicts in ${event.nodeId}: ${conflictList || event.summary}`;
         if ((spec.merge?.conflictPolicy ?? "spawn_resolver") === "fail") {

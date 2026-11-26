@@ -116,7 +116,7 @@ export function registerFlowTool(
             if (targetWs.room.hasActiveLeaseOwnership() && targetWs.room.getSnapshot().flowId === reqFlowId) {
               return toolResult({ cwd: targetWs.cwd, ...targetWs.room.getSnapshot(), resumable: targetWs.room.isResumable() });
             }
-            const cp = !targetWs.store.isClosed() ? targetWs.store.getFlowCheckpoint(reqFlowId) : null;
+            const cp = !targetWs.store.isClosed() ? targetWs.store.reclaimDeadCheckpoint(reqFlowId) : null;
             if (cp) {
               return toolResult({ cwd: targetWs.cwd, ...snapshotFromCheckpoint(cp, targetWs.cwd), resumable: isCheckpointResumable(cp) });
             }
@@ -228,10 +228,15 @@ export function registerFlowTool(
               : (targetWs.room.isResumable() ? targetWs.room.getSnapshot().flowId : null)
           );
           if (!targetFlowId) throw new Error("当前没有可断点续跑的中断/失败 Flow。");
-          const cp = !targetWs.store.isClosed() ? targetWs.store.getFlowCheckpoint(targetFlowId) : null;
+          const cp = !targetWs.store.isClosed()
+            ? (targetWs.room.hasActiveLeaseOwnership() && targetWs.room.getSnapshot().flowId === targetFlowId
+                ? targetWs.store.getFlowCheckpoint(targetFlowId)
+                : targetWs.store.reclaimDeadCheckpoint(targetFlowId))
+            : null;
           if (reqFlowId && !cp && targetWs.room.getSnapshot().flowId !== reqFlowId) throw new Error(`Unknown flowId "${reqFlowId}".`);
           if (cp && !isCheckpointResumable(cp)) throw new Error(`Flow "${cp.flowId}" 当前状态为 ${cp.status}，无法断点续跑。`);
-          if ((cp?.status ?? targetWs.room.getSnapshot().status) === "waiting_input" && hub.isSelfResumeBlockedDuringWakeup(targetFlowId, ctx)) {
+          const waitingNow = (cp?.status ?? targetWs.room.getSnapshot().status) === "waiting_input";
+          if (waitingNow && hub.isSelfResumeBlockedDuringWakeup(targetFlowId, ctx)) {
             return toolResult({
               started: false, resumed: false, awaitingUserReply: true, cwd: targetWs.cwd, flowId: targetFlowId, status: "waiting_input",
               error: `Flow "${targetFlowId}" just paused awaiting user input. Relay the specialist's questions to the user in plain language and wait for an explicit user message before calling resume.`,
@@ -243,8 +248,21 @@ export function registerFlowTool(
           let persistedMachine: FlowMachineState | null = null;
           if (cp?.machineStateJson) { try { persistedMachine = JSON.parse(cp.machineStateJson) as FlowMachineState; } catch {} }
           else if (targetWs.room.getSnapshot().flowId === targetFlowId) persistedMachine = targetWs.room.getPersistedMachineState();
+          const waitingIds = persistedMachine?.status === "waiting_input"
+            ? persistedMachine.nodeOrder.filter((id) => persistedMachine!.nodes[id]?.status === "waiting_input")
+            : [];
+          const hasHumanWaiting = waitingIds.some((id) => persistedMachine?.spec.nodes.find((n) => n.id === id)?.kind === "human");
+          const queuedSteers = !msg && waitingNow && !hasHumanWaiting && !targetWs.store.isClosed()
+            ? targetWs.store.listFlowSteers(targetFlowId, { unconsumedOnly: true })
+            : [];
+          const effectiveReplyText = msg ?? (queuedSteers.length > 0 ? queuedSteers.map((s) => s.text).join("\n") : undefined);
+          if (waitingNow && !effectiveReplyText) {
+            return toolResult({
+              started: false, resumed: false, requiresReply: true, cwd: targetWs.cwd, flowId: targetFlowId, status: "waiting_input",
+              error: `Flow "${targetFlowId}" is waiting for user input; pass the user's explicit non-empty reply in message before resuming.`,
+            }, true);
+          }
           if (persistedMachine?.status === "waiting_input") {
-            const waitingIds = persistedMachine.nodeOrder.filter((id) => persistedMachine!.nodes[id]?.status === "waiting_input");
             const waitingNodes = waitingIds.map((id) => ({ nodeId: id, questions: [...(persistedMachine!.nodes[id]?.questionsForUser ?? [])] }));
             if (reqNodeId && !waitingIds.includes(reqNodeId)) {
               return toolResult({
@@ -286,7 +304,7 @@ export function registerFlowTool(
             const background = params.wait === true ? false : Boolean(ctx?.hasUI);
             const res = await targetWs.resumeManagedFlow(
               ctx, background, background ? undefined : signal, originWs, targetFlowId,
-              { ...(reqNodeId ? { targetNodeId: reqNodeId } : {}), ...(msg ? { replyText: msg } : {}) },
+              { ...(reqNodeId ? { targetNodeId: reqNodeId } : {}), ...(effectiveReplyText ? { replyText: effectiveReplyText } : {}) },
             );
             hub.syncGlobalUi(ctx, originWs);
             return toolResult({ ...(res as object), ...(targetWs.trustNotice ? { trustNotice: targetWs.trustNotice } : {}) });

@@ -128,7 +128,7 @@ export function renderMultiProjectWidgetLines(
     const curStage = snap.stages.find((s) => s.stageId === snap.activeStageId) ?? snap.stages.at(-1);
     const graphSummary = snap.graphSnapshot ? renderConcurrentWidgetSummary(snap.graphSnapshot) : null;
     const detail = snap.status === "waiting_input"
-      ? `待确认: ${curStage?.envelope?.questionsForUser?.[0] ?? snap.reason ?? snap.goal}`
+      ? (graphSummary ?? `待确认: ${curStage?.envelope?.questionsForUser?.[0] ?? snap.reason ?? snap.goal}`)
       : graphSummary ?? (curStage
         ? `${curStage.roleId} (${curStage.modelLabel})${curStage.activeTool ? ` → ${curStage.activeTool}` : ` · 工具 ${curStage.calls.length} 次`}`
         : snap.goal);
@@ -149,6 +149,13 @@ export function renderRoomCardLines(snapshot: FlowRoomSnapshot, width: number, e
   const proj = snapshot.cwd ? `[${shortProjectLabel(snapshot.cwd)}] ` : "";
   const title = `⇄ 协作纪要 · ${proj}${snapshot.roleChain.join(" → ")} [${snapshotStatusBadge(snapshot).text}] · 工具 ${totalCalls} 次`;
   const lines = [fg("border", `╭─ ${padLeftCell(title, inner - 2)} ─╮`)];
+  if (snapshot.graphSnapshot && snapshot.graphSnapshot.waves.length > 0) {
+    lines.push(`${fg("border", "│")} ${padLeftCell(renderWaveOverviewBar(snapshot.graphSnapshot, inner, theme), inner)} ${fg("border", "│")}`);
+  }
+  if (snapshot.graphSnapshot?.mergedRef) {
+    const sha = snapshot.graphSnapshot.mergedCommitSha ? ` (${snapshot.graphSnapshot.mergedCommitSha.slice(0, 12)})` : "";
+    lines.push(`${fg("border", "│")} ${fg("success", padLeftCell(`📦 交付引用: ${snapshot.graphSnapshot.mergedRef}${sha}`, inner))} ${fg("border", "│")}`);
+  }
   for (const entry of snapshot.entries) {
     for (const row of renderChatBubbleLines(entry, inner, { maxBodyLines: expanded ? 5 : 2, theme })) lines.push(`${fg("border", "│")} ${row} ${fg("border", "│")}`);
   }
@@ -308,6 +315,9 @@ function buildInspectorLines(snap: FlowRoomSnapshot, selected: RoomEntry | undef
   }
   const conclusion = stage.envelope?.feedbackForUpstream ?? stage.envelope?.summary ?? stage.assistantText;
   if (conclusion) out.push("", "交付结论:", ...wrapPlainText(conclusion, rightW - 2, 8));
+  if (snap.graphSnapshot && snap.graphSnapshot.nodes.length > 0) {
+    out.push("", ...renderGraphNodeInspectorSection(snap.graphSnapshot, rightW));
+  }
   return out;
 }
 

@@ -28,12 +28,7 @@ export function makeNodeRuntime(node: FlowNodeSpec, waveIndex: number, effective
 export function cloneState(state: FlowMachineState): FlowMachineState {
   const nodes: Record<string, FlowNodeRuntime> = {};
   for (const [id, rt] of Object.entries(state.nodes)) {
-    nodes[id] = {
-      ...rt,
-      triedModels: [...rt.triedModels],
-      questionsForUser: [...rt.questionsForUser],
-      ...(rt.subState ? { subState: cloneState(rt.subState) } : {}),
-    };
+    nodes[id] = { ...rt, triedModels: [...rt.triedModels], questionsForUser: [...rt.questionsForUser] };
   }
   return {
     ...state,
@@ -51,17 +46,6 @@ export function buildFlowGraphSnapshot(state: FlowMachineState): FlowGraphSnapsh
   const specById = new Map(state.spec.nodes.map((n) => [n.id, n]));
   const nodes: FlowGraphNodeView[] = state.nodeOrder.map((id) => {
     const spec = specById.get(id)!, rt = state.nodes[id]!;
-    let subProgress: FlowGraphNodeView["subProgress"];
-    if (rt.subState) {
-      const subSpecById = new Map(rt.subState.spec.nodes.map((n) => [n.id, n]));
-      const phases = rt.subState.nodeOrder.map((pid) => {
-        const ps = subSpecById.get(pid)!, prt = rt.subState!.nodes[pid]!;
-        return { id: pid, title: ps.title ?? pid, kind: ps.kind, status: prt.status };
-      });
-      const completed = phases.filter((p) => p.status === "succeeded" || p.status === "skipped").length;
-      const activePhaseId = phases.find((p) => p.status === "running" || p.status === "waiting_input")?.id;
-      subProgress = { completed, total: phases.length, ...(activePhaseId ? { activePhaseId } : {}), phases };
-    }
     return {
       nodeId: id, title: spec.title ?? spec.role ?? id, kind: spec.kind,
       ...(spec.role ? { role: spec.role } : {}), waveIndex: rt.waveIndex, dependsOn: [...spec.dependsOn],
@@ -69,12 +53,15 @@ export function buildFlowGraphSnapshot(state: FlowMachineState): FlowGraphSnapsh
       ...(spec.writableScope ? { writableScope: [...spec.writableScope] } : {}),
       sessionResidency: rt.sessionResidency, attempt: rt.attempt, repairRound: rt.repairRound,
       currentModel: rt.currentModel, triedModels: [...rt.triedModels], activeStageId: rt.activeStageId,
+      ...(spec.parentGroupId ? { parentGroupId: spec.parentGroupId } : {}),
       ...(rt.questionsForUser.length > 0 ? { questionsForUser: [...rt.questionsForUser] } : {}),
-      ...(subProgress ? { subProgress } : {}),
       ...(rt.lastHandoff?.summary ? { summary: rt.lastHandoff.summary } : rt.lastReply ? { summary: rt.lastReply } : rt.lastError ? { summary: rt.lastError } : {}),
     };
   });
-  return { preset: state.spec.preset ?? "custom", waves: state.waves.map((w) => [...w]), nodes, mergedRef: state.mergedRef };
+  return {
+    preset: state.spec.preset ?? "custom", waves: state.waves.map((w) => [...w]), nodes,
+    mergedRef: state.mergedRef, ...(state.mergedCommitSha ? { mergedCommitSha: state.mergedCommitSha } : {}),
+  };
 }
 
 function inferNearestWritableAncestor(state: FlowMachineState, fromNodeId: string, isRoleReadOnly?: (roleId: string) => boolean): string | null {
@@ -91,15 +78,17 @@ function inferNearestWritableAncestor(state: FlowMachineState, fromNodeId: strin
 
 function isPureReadOnlyGraph(state: FlowMachineState, isRoleReadOnly?: (roleId: string) => boolean): boolean {
   if (!isRoleReadOnly) return false;
-  return state.spec.nodes.every((n) => (n.kind === "role" && n.role ? isRoleReadOnly(n.role) : n.kind === "human" || n.kind === "native_task"));
+  return state.spec.nodes.every((n) => (n.kind === "role" && n.role ? isRoleReadOnly(n.role) : n.kind === "human"));
 }
 
 export function emitTerminalCleanup(next: FlowMachineState, commands: FlowCommand[], kind: "settled" | "conflict" = "settled"): void {
+  const disposedSlots = new Set<string>();
   for (const id of next.nodeOrder) {
-    const rt = next.nodes[id]!;
+    const rt = next.nodes[id]!, spec = getNodeSpec(next, id);
     if (rt.sessionResidency === "warm" || rt.sessionResidency === "hibernated") {
       rt.sessionResidency = "disposed";
-      commands.push({ type: "DISPOSE_SESSION", nodeId: id });
+      const slot = spec?.sessionGroup ?? id;
+      if (!disposedSlots.has(slot)) { disposedSlots.add(slot); commands.push({ type: "DISPOSE_SESSION", nodeId: slot }); }
     }
   }
   if (next.nodeOrder.some((id) => next.nodes[id]!.worktreePath !== null)) {
@@ -109,15 +98,25 @@ export function emitTerminalCleanup(next: FlowMachineState, commands: FlowComman
   commands.push({ type: "WAKE_COORDINATOR", kind, summary: next.reason ?? next.spec.goal });
 }
 
-function findUpstreamPreviewMergeRef(state: FlowMachineState, nodeId: string): string | null {
+function findUpstreamPreviewMerge(state: FlowMachineState, nodeId: string): { commitRef: string; commitSha?: string } | null {
   const ancestors = computeAncestorMap(state.spec.nodes).get(nodeId);
   if (!ancestors || ancestors.size === 0) return null;
   const specById = new Map(state.spec.nodes.map((n) => [n.id, n]));
-  const hits = [...ancestors]
+  const previewMerges = [...ancestors]
     .map((id) => ({ id, spec: specById.get(id), rt: state.nodes[id] }))
-    .filter((c) => c.spec?.kind === "merge" && c.spec.merge?.landingMode === "branch_preview" && Boolean(c.rt?.commitRef))
+    .filter((c) => c.spec?.kind === "merge" && c.spec.merge?.landingMode === "branch_preview" && Boolean(c.rt?.commitRef || c.rt?.commitSha));
+  if (previewMerges.length === 0) return null;
+  const previewCommits = [...ancestors]
+    .map((id) => ({ id, spec: specById.get(id), rt: state.nodes[id] }))
+    .filter((c) => {
+      if (c.spec?.kind === "merge" && c.spec.merge?.landingMode === "branch_preview") return Boolean(c.rt?.commitRef || c.rt?.commitSha);
+      return c.spec?.kind === "role" && Boolean(c.rt?.commitSha);
+    })
     .sort((a, b) => (b.rt!.waveIndex - a.rt!.waveIndex));
-  return hits[0]?.rt?.commitRef ?? null;
+  const hit = previewCommits[0]?.rt;
+  if (!hit) return null;
+  const ref = hit.commitRef ?? state.mergedRef ?? hit.commitSha!;
+  return { commitRef: ref, ...(hit.commitSha ? { commitSha: hit.commitSha } : {}) };
 }
 
 export function dispatchSingleNode(
@@ -129,10 +128,17 @@ export function dispatchSingleNode(
 ): void {
   const spec = getNodeSpec(next, nodeId)!, rt = next.nodes[nodeId]!;
   if (spec.kind === "role" && rt.effectiveWorkspace === "worktree" && !rt.worktreePath) {
-    rt.status = "running";
-    if (!rt.startedAt) rt.startedAt = nowIso;
-    commands.push({ type: "PREPARE_WORKTREE", nodeId, dependsOn: [...spec.dependsOn] });
-    return;
+    const existingGroupWt = spec.worktreeGroup
+      ? next.nodeOrder.map((id) => (getNodeSpec(next, id)?.worktreeGroup === spec.worktreeGroup ? next.nodes[id]!.worktreePath : null)).find(Boolean)
+      : null;
+    if (existingGroupWt) {
+      rt.worktreePath = existingGroupWt;
+    } else {
+      rt.status = "running";
+      if (!rt.startedAt) rt.startedAt = nowIso;
+      commands.push({ type: "PREPARE_WORKTREE", nodeId, ...(spec.worktreeGroup ? { worktreeGroup: spec.worktreeGroup } : {}), dependsOn: [...spec.dependsOn] });
+      return;
+    }
   }
 
   next.nextStageSeq += 1;
@@ -141,7 +147,7 @@ export function dispatchSingleNode(
   if (!rt.startedAt) rt.startedAt = nowIso;
 
   if (spec.kind === "human") {
-    rt.status = "waiting_input"; rt.questionsForUser = [spec.human!.prompt];
+    rt.status = "waiting_input"; rt.questionsForUser = [spec.human!.prompt]; rt.questionPrompt = spec.human!.prompt;
     commands.push({ type: "RUN_HUMAN_NODE", nodeId, stageId, config: spec.human! });
     commands.push({ type: "APPEND_BOARD", entry: { nodeId, kind: "system", speaker: nodeId, target: "user", text: `等待确认: ${spec.human!.prompt}` } });
     return;
@@ -149,31 +155,31 @@ export function dispatchSingleNode(
 
   rt.status = "running";
   if (spec.kind === "role") {
-    const reuseSession = Boolean(next.spec.policies.enableSessionReuse && rt.sessionResidency === "warm" && spec.sessionMode !== "fresh");
-    const previewRef = !rt.worktreePath ? findUpstreamPreviewMergeRef(next, nodeId) : null;
+    const groupWarm = Boolean(spec.sessionGroup && next.nodeOrder.some((id) => getNodeSpec(next, id)?.sessionGroup === spec.sessionGroup && next.nodes[id]!.sessionResidency === "warm"));
+    const reuseSession = Boolean(next.spec.policies.enableSessionReuse && spec.sessionMode !== "fresh" && (rt.sessionResidency === "warm" || groupWarm));
+    const preview = !rt.worktreePath ? findUpstreamPreviewMerge(next, nodeId) : null;
     commands.push({
       type: "DISPATCH_ROLE_NODE", nodeId, stageId, attempt: rt.attempt, repairRound: rt.repairRound, reuseSession,
+      ...(spec.sessionGroup ? { sessionGroup: spec.sessionGroup } : {}),
       ...(spec.sessionMode === "fork" && spec.forkFromNodeId ? { forkFromNodeId: spec.forkFromNodeId } : {}),
       ...(rt.worktreePath ? { worktreePath: rt.worktreePath } : {}),
-      ...(previewRef ? { targetCommitRef: previewRef } : {}),
+      ...(preview ? { targetCommitRef: preview.commitRef, ...(preview.commitSha ? { targetCommitSha: preview.commitSha } : {}) } : {}),
       ...(extra?.modelOverride ? { modelOverride: extra.modelOverride } : {}),
       ...(rt.lastRepairFeedback ? { repairFeedback: rt.lastRepairFeedback } : {}),
       ...(extra?.replyText ? { replyText: extra.replyText } : {}),
     });
   } else if (spec.kind === "gate") {
-    const previewRef = findUpstreamPreviewMergeRef(next, nodeId);
-    const depWt = previewRef ? undefined : (spec.dependsOn.map((d) => next.nodes[d]?.worktreePath).find(Boolean) ?? undefined);
+    const preview = findUpstreamPreviewMerge(next, nodeId);
+    const depWt = preview ? undefined : (spec.dependsOn.map((d) => next.nodes[d]?.worktreePath).find(Boolean) ?? undefined);
     commands.push({
       type: "RUN_GATE_NODE", nodeId, stageId, attempt: rt.attempt,
-      ...(previewRef ? { targetCommitRef: previewRef } : {}),
+      ...(preview ? { targetCommitRef: preview.commitRef, ...(preview.commitSha ? { targetCommitSha: preview.commitSha } : {}) } : {}),
       ...(depWt ? { worktreePath: depWt } : {}), config: spec.gate!,
     });
   } else if (spec.kind === "merge") {
     const sourceRefs: Record<string, string> = {};
     for (const srcId of spec.merge!.sourceNodeIds) { const ref = next.nodes[srcId]?.commitRef; if (ref) sourceRefs[srcId] = ref; }
     commands.push({ type: "RUN_MERGE_NODE", nodeId, stageId, attempt: rt.attempt, sourceNodeIds: [...spec.merge!.sourceNodeIds], sourceRefs, config: spec.merge! });
-  } else if (spec.kind === "native_task") {
-    commands.push({ type: "RUN_NATIVE_TASK_NODE", nodeId, stageId, attempt: rt.attempt, config: spec.nativeTask! });
   }
 }
 
@@ -237,6 +243,14 @@ export function evaluateFlowSettlement(
   const waitingNodes = next.nodeOrder.filter((id) => next.nodes[id]!.status === "waiting_input");
   const shouldPauseForWaiting = waitingNodes.length > 0 && (!active || (next.spec.policies.pauseOnWaitingInput === "whole_flow" && !allowActiveOnTargetedResume));
   if (shouldPauseForWaiting) {
+    for (const id of next.nodeOrder) {
+      const rt = next.nodes[id]!;
+      if (rt.status === "running" || rt.status === "retrying") {
+        commands.push({ type: "ABORT_NODE", nodeId: id, reason: "Paused while flow awaits user input." });
+        rt.status = "ready"; rt.activeStageId = null;
+        if (rt.sessionResidency === "none") rt.sessionResidency = "disposed";
+      }
+    }
     next.status = "waiting_input";
     next.reason = formatWaitingNodesReason(next, waitingNodes);
     commands.push({ type: "WAKE_COORDINATOR", kind: "needs_input", summary: next.reason, ...(waitingNodes.length === 1 ? { nodeId: waitingNodes[0] } : {}) });
@@ -248,7 +262,23 @@ export function evaluateFlowSettlement(
   if (viol) { next.status = "violation"; next.endedAt = nowIso; next.reason = next.nodes[viol]!.lastError ?? `Node "${viol}" violated boundaries.`; emitTerminalCleanup(next, commands); return; }
   if (blocked) { next.status = "blocked"; next.endedAt = nowIso; next.reason = next.nodes[blocked]!.lastError ?? next.nodes[blocked]!.lastHandoff?.summary ?? `Node "${blocked}" blocked.`; emitTerminalCleanup(next, commands); return; }
   if (failed) { next.status = "failed"; next.endedAt = nowIso; next.reason = next.nodes[failed]!.lastError ?? `Node "${failed}" failed.`; emitTerminalCleanup(next, commands); return; }
-  if (statuses.every((s) => s === "succeeded" || s === "skipped")) { next.status = "completed"; next.endedAt = nowIso; emitTerminalCleanup(next, commands); }
+  if (statuses.every((s) => s === "succeeded" || s === "skipped")) {
+    const succeededMerges = next.spec.nodes.filter((n) => n.kind === "merge" && next.nodes[n.id]!.status === "succeeded");
+    const deliveredSources = new Set(succeededMerges.flatMap((n) => n.merge?.sourceNodeIds ?? []));
+    const undelivered = next.nodeOrder.filter((id) => {
+      const rt = next.nodes[id]!;
+      if (rt.effectiveWorkspace !== "worktree" || !rt.commitRef || rt.status !== "succeeded") return false;
+      const group = getNodeSpec(next, id)?.worktreeGroup;
+      return !deliveredSources.has(id) && !(group && [...deliveredSources].some((s) => getNodeSpec(next, s)?.worktreeGroup === group));
+    });
+    if (undelivered.length > 0) {
+      next.status = "failed"; next.endedAt = nowIso;
+      next.reason = `Cannot complete Flow: worktree outputs from [${undelivered.join(", ")}] were not delivered by a succeeded merge node.`;
+      emitTerminalCleanup(next, commands);
+      return;
+    }
+    next.status = "completed"; next.endedAt = nowIso; emitTerminalCleanup(next, commands);
+  }
 }
 
 export function handleRejection(
@@ -273,20 +303,34 @@ export function handleRejection(
     next.status = "stagnated"; next.endedAt = nowIso; next.reason = "Identical rejection feedback repeated without progress.";
     emitTerminalCleanup(next, commands); return;
   }
-  if (next.repairRound >= next.maxRepairRounds) {
-    next.status = "rejected_max_rounds"; next.endedAt = nowIso; next.reason = `Exceeded maxRepairRounds (${next.maxRepairRounds}).`;
-    emitTerminalCleanup(next, commands); return;
+  const isLocalGate = fromSpec?.localRepairBudget !== undefined;
+  let roundLabel: number;
+  if (isLocalGate) {
+    const curLocal = next.nodes[fromNodeId]!.repairRound;
+    if (curLocal >= fromSpec!.localRepairBudget!) {
+      next.status = "rejected_max_rounds"; next.endedAt = nowIso; next.reason = `Exceeded phase maxRepairRounds (${fromSpec!.localRepairBudget}).`;
+      emitTerminalCleanup(next, commands); return;
+    }
+    roundLabel = curLocal + 1;
+  } else {
+    if (next.repairRound >= next.maxRepairRounds) {
+      next.status = "rejected_max_rounds"; next.endedAt = nowIso; next.reason = `Exceeded maxRepairRounds (${next.maxRepairRounds}).`;
+      emitTerminalCleanup(next, commands); return;
+    }
+    next.repairRound += 1;
+    roundLabel = next.repairRound;
   }
-  next.repairRound += 1; next.lastRejectionSig = sig;
+  next.lastRejectionSig = sig;
   const dirty = new Set<string>([targetId, ...(descMap.get(targetId) ?? []), fromNodeId]);
   for (const id of dirty) {
     const rt = next.nodes[id]!;
     if (rt.status === "running" && id !== fromNodeId) commands.push({ type: "ABORT_NODE", nodeId: id, reason: `Invalidated by ${fromNodeId}` });
     rt.status = id === targetId ? "ready" : "pending";
-    rt.repairRound = next.repairRound; rt.activeStageId = null; rt.endedAt = null; rt.lastError = null;
+    rt.repairRound = isLocalGate ? (id === fromNodeId || id === targetId ? roundLabel : rt.repairRound) : next.repairRound;
+    rt.activeStageId = null; rt.endedAt = null; rt.lastError = null;
     rt.lastRepairFeedback = id === targetId ? feedback : null;
   }
-  commands.push({ type: "APPEND_BOARD", entry: { nodeId: fromNodeId, kind: "repair_feedback", speaker: fromNodeId, target: targetId, text: `[R${next.repairRound}] ${feedback}` } });
+  commands.push({ type: "APPEND_BOARD", entry: { nodeId: fromNodeId, kind: "repair_feedback", speaker: fromNodeId, target: targetId, text: `[R${roundLabel}] ${feedback}` } });
   scheduleReadyNodes(next, commands, nowIso);
   evaluateFlowSettlement(next, commands, nowIso);
 }

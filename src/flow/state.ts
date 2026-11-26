@@ -256,7 +256,7 @@ export class FlowRoomManager {
     const effectiveId = targetFlowId ?? this.flowId;
     let cp: PersistedFlowCheckpoint | null = null;
     if (this.store && !this.store.isClosed() && effectiveId) {
-      cp = this.store.getFlowCheckpoint(effectiveId);
+      cp = this.store.reclaimDeadCheckpoint(effectiveId);
       if (cp && !isCheckpointResumable(cp)) throw new Error(`Flow "${effectiveId}" 当前状态为 ${cp.status}，无法断点续跑。`);
       if (!cp && targetFlowId && targetFlowId !== this.flowId) throw new Error(`Unknown flowId "${targetFlowId}".`);
     }

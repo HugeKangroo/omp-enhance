@@ -244,12 +244,12 @@ describe("Phase 11: 2-Level Isomorphic Route A (Role-Internal Workflow FSM)", ()
 
     const runner = {
       runRoleTurn: async (ctx: any) => {
-        if (ctx.nodeId === "audit") {
+        if (ctx.nodeId.endsWith("__audit")) {
           mkdirSync(path.join(cwd, "work", "bench"), { recursive: true });
           writeFileSync(path.join(cwd, "work", "bench", "profile.json"), "{}\n", "utf8");
-        } else if (ctx.nodeId === "baseline") {
+        } else if (ctx.nodeId.endsWith("__baseline")) {
           writeFileSync(path.join(cwd, "work", "bench", "eval.py"), "print('v1')\n", "utf8");
-        } else if (ctx.nodeId === "iterate") {
+        } else if (ctx.nodeId.endsWith("__iterate")) {
           // Illegal tamper on locked eval.py!
           writeFileSync(path.join(cwd, "work", "bench", "eval.py"), "print('cheated')\n", "utf8");
         }
@@ -271,6 +271,7 @@ describe("Phase 11: 2-Level Isomorphic Route A (Role-Internal Workflow FSM)", ()
     // 2. Foreground single-agent /role workflow progression + lock_protected enforcement
     const fg = new ForegroundWorkflowController();
     const sid = "fg-sess-1";
+    fg.observeUserTurn(sid, { turnKey: "u1", userText: "开始数据体检" });
     const p1 = fg.getActivePhaseContext(sid, cwd, algoWf, "FG test")!;
     expect(p1.phaseId).toBe("audit");
     // In audit phase, bash is narrowed out (tools: ["read", "write"])
@@ -284,13 +285,18 @@ describe("Phase 11: 2-Level Isomorphic Route A (Role-Internal Workflow FSM)", ()
     expect(adv1.advanced).toBe(true);
     expect(adv1.humanPrompt).toContain("Confirm target metric?");
 
-    // Next foreground turn without explicit confirmation (e.g. asking "现在进度如何？") MUST stay in human gate `align` (read-only)!
+    // Next foreground turn asking "现在进度如何？" MUST stay in human gate `align` (read-only) AND reject model self-handoff!
+    fg.observeUserTurn(sid, { turnKey: "u2", userText: "现在进度如何？" });
     const p2StillWaiting = fg.getActivePhaseContext(sid, cwd, algoWf, "FG test", true)!;
     expect(p2StillWaiting.phaseId).toBe("align");
     expect(p2StillWaiting.waitingHumanPrompt).toContain("Confirm target metric?");
     expect(checkToolCallAllowed(cwd, p2StillWaiting.effectiveRole, { toolName: "write", input: { path: "work/bench/eval.py", content: "x" } }).block).toBe(true);
+    const blockedQueryAdv = fg.onPhaseHandoff({ sessionId: sid, cwd, role: algoWf, handoff: mkHo("Status check") });
+    expect(blockedQueryAdv.advanced).toBe(false);
+    expect(blockedQueryAdv.gateError).toBeTruthy();
 
-    // Explicit user confirmation via enhance_handoff advances past human gate to baseline
+    // Explicit user confirmation in a new turn advances past human gate to baseline
+    fg.observeUserTurn(sid, { turnKey: "u3", userText: "确认采用 F1 >= 0.9" });
     const adv2 = fg.onPhaseHandoff({ sessionId: sid, cwd, role: algoWf, handoff: mkHo("User confirmed F1 >= 0.9") });
     expect(adv2.advanced).toBe(true);
     expect(adv2.nextPhaseId).toBe("baseline");

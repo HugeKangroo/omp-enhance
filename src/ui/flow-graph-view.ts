@@ -21,36 +21,52 @@ function nodeStatusTone(status: NodeStatus): string {
   return "muted";
 }
 
-export function renderWaveOverviewBar(
-  graph: FlowGraphSnapshot,
-  maxWidth: number,
-  theme?: any,
-): string {
+const shortSubId = (n: FlowGraphNodeView): string =>
+  n.parentGroupId && n.nodeId.startsWith(`${n.parentGroupId}__`) ? n.nodeId.slice(n.parentGroupId.length + 2) : n.nodeId;
+
+function summarizeGroup(members: readonly FlowGraphNodeView[]): { glyph: string; status: NodeStatus; label: string } {
+  const groupId = members[0]!.parentGroupId!;
+  const done = members.filter((m) => m.status === "succeeded" || m.status === "skipped").length;
+  const active = members.find((m) => m.status === "running" || m.status === "waiting_input");
+  const bad = members.find((m) => m.status === "violation" || m.status === "failed" || m.status === "blocked");
+  const status: NodeStatus = bad?.status ?? active?.status ?? (done === members.length ? "succeeded" : "pending");
+  const wt = members.some((m) => m.workspace === "worktree") ? ":wt" : "";
+  const activeShort = active ? `:${shortSubId(active)}` : "";
+  return { glyph: nodeStatusGlyph(status), status, label: `${groupId}${wt}(${done}/${members.length}${activeShort})` };
+}
+
+export function renderWaveOverviewBar(graph: FlowGraphSnapshot, maxWidth: number, theme?: any): string {
   const fg = (c: string, s: string): string => (typeof theme?.fg === "function" ? theme.fg(c, s) : s);
   const byId = new Map<string, FlowGraphNodeView>(graph.nodes.map((n) => [n.nodeId, n]));
-  const plainParts = graph.waves.map((wave, idx) => {
-    const items = wave.map((id) => {
+  const grouped = new Map<string, FlowGraphNodeView[]>();
+  for (const n of graph.nodes) {
+    if (n.parentGroupId) grouped.set(n.parentGroupId, [...(grouped.get(n.parentGroupId) ?? []), n]);
+  }
+  const seenGroups = new Set<string>();
+  const waveEntries: Array<{ idx: number; items: Array<{ tone: string; text: string }> }> = [];
+
+  graph.waves.forEach((wave, idx) => {
+    const items: Array<{ tone: string; text: string }> = [];
+    for (const id of wave) {
       const n = byId.get(id);
-      if (!n) return id;
-      const wt = n.workspace === "worktree" ? ":wt" : "";
-      const sub = n.subProgress ? `(${n.subProgress.completed}/${n.subProgress.total}${n.subProgress.activePhaseId ? `:${n.subProgress.activePhaseId}` : ""})` : "";
-      return `${nodeStatusGlyph(n.status)} ${n.nodeId}${wt}${sub}`;
-    });
-    return `W${idx}[${items.join(" | ")}]`;
+      if (!n) continue;
+      if (n.parentGroupId) {
+        if (seenGroups.has(n.parentGroupId)) continue;
+        seenGroups.add(n.parentGroupId);
+        const gs = summarizeGroup(grouped.get(n.parentGroupId)!);
+        items.push({ tone: nodeStatusTone(gs.status), text: `${gs.glyph} ${gs.label}` });
+      } else {
+        const wt = n.workspace === "worktree" ? ":wt" : "";
+        items.push({ tone: nodeStatusTone(n.status), text: `${nodeStatusGlyph(n.status)} ${n.nodeId}${wt}` });
+      }
+    }
+    if (items.length > 0) waveEntries.push({ idx, items });
   });
-  const plain = plainParts.join(" → ");
+
+  const plain = waveEntries.map((w, i) => `W${i}[${w.items.map((x) => x.text).join(" | ")}]`).join(" → ");
   if (plain.length <= maxWidth && typeof theme?.fg === "function") {
-    return graph.waves
-      .map((wave, idx) => {
-        const items = wave.map((id) => {
-          const n = byId.get(id);
-          if (!n) return id;
-          const wt = n.workspace === "worktree" ? ":wt" : "";
-          const sub = n.subProgress ? `(${n.subProgress.completed}/${n.subProgress.total}${n.subProgress.activePhaseId ? `:${n.subProgress.activePhaseId}` : ""})` : "";
-          return fg(nodeStatusTone(n.status), `${nodeStatusGlyph(n.status)} ${n.nodeId}${wt}${sub}`);
-        });
-        return `${fg("muted", `W${idx}[`)}${items.join(fg("border", " | "))}${fg("muted", "]")}`;
-      })
+    return waveEntries
+      .map((w, i) => `${fg("muted", `W${i}[`)}${w.items.map((x) => fg(x.tone, x.text)).join(fg("border", " | "))}${fg("muted", "]")}`)
       .join(fg("muted", " → "));
   }
   return fg("accent", truncateDisplay(plain, Math.max(12, maxWidth)));
@@ -76,10 +92,21 @@ export function renderConcurrentWidgetSummary(graph: FlowGraphSnapshot): string 
 }
 
 export function renderGraphNodeInspectorSection(graph: FlowGraphSnapshot, rightW: number): string[] {
-  const out: string[] = [
-    `任务图 (${graph.preset} · ${graph.waves.length} 波次 / ${graph.nodes.length} 节点):`,
-  ];
+  const out: string[] = [`任务图 (${graph.preset} · ${graph.waves.length} 波次 / ${graph.nodes.length} 节点):`];
+  const seenGroups = new Set<string>();
   for (const n of graph.nodes) {
+    if (n.parentGroupId) {
+      if (seenGroups.has(n.parentGroupId)) continue;
+      seenGroups.add(n.parentGroupId);
+      const members = graph.nodes.filter((m) => m.parentGroupId === n.parentGroupId);
+      const gs = summarizeGroup(members);
+      out.push(` ${gs.glyph} ${gs.label}`);
+      members.forEach((ph, idx) => {
+        const branch = idx === members.length - 1 ? "└─" : "├─";
+        out.push(`   ${branch} ${nodeStatusGlyph(ph.status)} ${shortSubId(ph)} (${ph.kind})`);
+      });
+      continue;
+    }
     const glyph = nodeStatusGlyph(n.status);
     const kindLabel = n.kind === "role" ? (n.role ?? "role") : n.kind;
     const tags: string[] = [];
@@ -92,14 +119,10 @@ export function renderGraphNodeInspectorSection(graph: FlowGraphSnapshot, rightW
     if (n.writableScope?.length) {
       out.push(...wrapPlainText(`   scope: ${n.writableScope.join(", ")}`, Math.max(16, rightW - 2), 2));
     }
-    if (n.subProgress && n.subProgress.phases.length > 0) {
-      const pList = n.subProgress.phases;
-      pList.forEach((ph, idx) => {
-        const branch = idx === pList.length - 1 ? "└─" : "├─";
-        out.push(`   ${branch} ${nodeStatusGlyph(ph.status)} ${ph.id} (${ph.kind})`);
-      });
-    }
   }
-  if (graph.mergedRef) out.push(` 合流引用: ${graph.mergedRef}`);
+  if (graph.mergedRef) {
+    const sha = graph.mergedCommitSha ? ` (${graph.mergedCommitSha.slice(0, 12)})` : "";
+    out.push(` 交付引用: ${graph.mergedRef}${sha}`);
+  }
   return out;
 }

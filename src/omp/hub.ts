@@ -21,14 +21,11 @@ export interface HubOptions {
 export interface HubFlowSummary {
   cwd: string; flowId: string | null; status: FlowRoomStatus; resumable: boolean;
   roleChain: string[]; currentIndex: number; repairRound: number; goal: string;
-  reason?: string; questionsForUser?: string[];
-  waitingNodes?: Array<{ nodeId: string; questions: string[] }>;
-  mergedRef?: string | null;
+  reason?: string; questionsForUser?: string[]; waitingNodes?: Array<{ nodeId: string; questions: string[] }>;
+  mergedRef?: string | null; mergedCommitSha?: string | null; graphProgress?: { done: number; total: number };
 }
 
-export interface PendingWakeup {
-  flowId: string; settlementKey: string; originWs: ManagedWorkspace; ctx: any; report: string;
-}
+export interface PendingWakeup { flowId: string; settlementKey: string; originWs: ManagedWorkspace; ctx: any; report: string; }
 
 export interface WorkspaceHub {
   readonly pendingWakeups: Map<string, PendingWakeup>;
@@ -94,14 +91,17 @@ function persistSecondaryProject(filePath: string, primaryCwd: string, targetCwd
   } catch {}
 }
 
-export function computeSettlementKey(snap: Pick<FlowRoomSnapshot, "flowId" | "status" | "stages">): string | null {
+export function computeSettlementKey(snap: Pick<FlowRoomSnapshot, "flowId" | "status" | "stages" | "graphSnapshot" | "reason">): string | null {
   if (!snap.flowId || snap.status === "idle" || snap.status === "running") return null;
-  return `${snap.flowId}:${snap.status}:${snap.stages.length}`;
+  const waitSig = snap.status === "waiting_input" && snap.graphSnapshot?.nodes?.length
+    ? snap.graphSnapshot.nodes.filter((n) => n.status === "waiting_input").map((n) => `${n.nodeId}@${n.activeStageId ?? n.attempt}`).join(",")
+    : "";
+  const extra = waitSig || (snap.status === "waiting_input" ? (snap.reason ?? "") : (snap.graphSnapshot?.mergedCommitSha ?? ""));
+  return `${snap.flowId}:${snap.status}:${snap.stages.length}${extra ? `:${extra}` : ""}`;
 }
 
 function collectWaitingNodes(snap: FlowRoomSnapshot): Array<{ nodeId: string; questions: string[] }> {
-  const fromGraph = (snap.graphSnapshot?.nodes ?? [])
-    .filter((n) => n.status === "waiting_input")
+  const fromGraph = (snap.graphSnapshot?.nodes ?? []).filter((n) => n.status === "waiting_input")
     .map((n) => ({ nodeId: n.nodeId, questions: n.questionsForUser?.length ? [...n.questionsForUser] : [n.summary ?? "需要用户确认"] }));
   if (fromGraph.length > 0) return fromGraph;
   const env = [...snap.stages].reverse().find((s) => s.envelope?.questionsForUser?.length)?.envelope;
@@ -111,13 +111,15 @@ function collectWaitingNodes(snap: FlowRoomSnapshot): Array<{ nodeId: string; qu
 function toFlowSummary(cwd: string, snap: FlowRoomSnapshot, resumable: boolean): HubFlowSummary {
   const waitingNodes = snap.status === "waiting_input" ? collectWaitingNodes(snap) : [];
   const allQuestions = waitingNodes.flatMap((w) => w.questions.map((q) => (waitingNodes.length > 1 ? `[${w.nodeId}] ${q}` : q)));
+  const gNodes = snap.graphSnapshot?.nodes;
+  const graphProgress = gNodes?.length ? { done: gNodes.filter((n) => n.status === "succeeded" || n.status === "skipped").length, total: gNodes.length } : undefined;
   return {
-    cwd, flowId: snap.flowId, status: snap.status, resumable,
-    roleChain: snap.roleChain, currentIndex: snap.currentIndex ?? 0, repairRound: snap.repairRound ?? 0, goal: snap.goal,
-    ...(snap.reason ? { reason: snap.reason } : {}),
-    ...(allQuestions.length > 0 ? { questionsForUser: allQuestions } : {}),
-    ...(waitingNodes.length > 0 ? { waitingNodes } : {}),
-    ...(snap.graphSnapshot?.mergedRef ? { mergedRef: snap.graphSnapshot.mergedRef } : {}),
+    cwd, flowId: snap.flowId, status: snap.status, resumable, roleChain: snap.roleChain,
+    currentIndex: snap.currentIndex ?? 0, repairRound: snap.repairRound ?? 0, goal: snap.goal,
+    ...(snap.reason ? { reason: snap.reason } : {}), ...(allQuestions.length > 0 ? { questionsForUser: allQuestions } : {}),
+    ...(waitingNodes.length > 0 ? { waitingNodes } : {}), ...(snap.graphSnapshot?.mergedRef ? { mergedRef: snap.graphSnapshot.mergedRef } : {}),
+    ...(snap.graphSnapshot?.mergedCommitSha ? { mergedCommitSha: snap.graphSnapshot.mergedCommitSha } : {}),
+    ...(graphProgress ? { graphProgress } : {}),
   };
 }
 
@@ -132,7 +134,8 @@ function formatFlowEventReport(settlement: BackgroundFlowSettlement): string {
     `Goal: ${mandate.goal}`, `Summary: ${summary}`,
   ];
   const mergedRef = result?.mergedRef ?? snap.graphSnapshot?.mergedRef;
-  if (mergedRef) lines.push(`Delivery ref: ${mergedRef}`);
+  const mergedSha = result?.mergedCommitSha ?? snap.graphSnapshot?.mergedCommitSha;
+  if (mergedRef) lines.push(`Delivery ref: ${mergedRef}${mergedSha ? ` (${mergedSha})` : ""}`);
   if (isRejectedAudit && env?.feedbackForUpstream) lines.push(`Findings: ${env.feedbackForUpstream}`);
   else if (result?.reason && result.reason !== summary) lines.push(`Detail: ${result.reason}`);
   if (env?.artifacts.length) lines.push(`Artifacts: ${env.artifacts.map((a) => `${a.path} [${a.role}]`).join(", ")}`);
@@ -203,19 +206,13 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
     const key = computeSettlementKey(snap) ?? `${settlement.flowId}:${status}:${snap.stages.length}`;
     if (lastReportedKeys.get(settlement.flowId) === key) return;
     const report = formatFlowEventReport(settlement);
-    if (status === "waiting_input") {
-      const uc = countBranchUserMessages(settlement.ctx);
-      if (uc !== null) waitingWakeupUserCounts.set(settlement.flowId, uc);
-    } else {
-      waitingWakeupUserCounts.delete(settlement.flowId);
-    }
+    if (status === "waiting_input") { const uc = countBranchUserMessages(settlement.ctx); if (uc !== null) waitingWakeupUserCounts.set(settlement.flowId, uc); }
+    else waitingWakeupUserCounts.delete(settlement.flowId);
     if (settlement.ctx?.isIdle?.() === false) {
       pendingWakeups.set(settlement.flowId, { flowId: settlement.flowId, settlementKey: key, originWs: settlement.originWs, ctx: settlement.ctx, report });
-      scheduleFallbackFlush();
-      return;
+      scheduleFallbackFlush(); return;
     }
-    lastReportedKeys.set(settlement.flowId, key);
-    pendingWakeups.delete(settlement.flowId);
+    lastReportedKeys.set(settlement.flowId, key); pendingWakeups.delete(settlement.flowId);
     emitEventMessage(report, settlement.originWs, settlement.ctx);
   };
 
@@ -223,17 +220,13 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
     const trustEval = evaluateTrustFor(cwd, effectiveCtx), existing = workspaces.get(cwd);
     if (existing) {
       if (existing.isTrusted !== trustEval.trusted) existing.refresh(effectiveCtx);
-      else {
-        existing.trustNotice = trustEval.trustNotice;
-        existing.settings = loadEnhanceSettings({ cwd, pluginLockPath: options.pluginLockPath, isProjectTrusted: existing.isTrusted });
-      }
+      else { existing.trustNotice = trustEval.trustNotice; existing.settings = loadEnhanceSettings({ cwd, pluginLockPath: options.pluginLockPath, isProjectTrusted: existing.isTrusted }); }
       return existing;
     }
     const created = createManagedWorkspace(pi, cwd, trustEval, options, {
       syncGlobalUi: (c, ws) => hub.syncGlobalUi(c, ws), getActiveTargets, onBackgroundFlowSettled, evaluateTrust: evaluateTrustFor,
     });
-    workspaces.set(cwd, created);
-    return created;
+    workspaces.set(cwd, created); return created;
   };
 
   const hydrateTrackedProjectsFor = (rootCwd: string, ctx: any, force = false): void => {
@@ -380,8 +373,9 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
           seen.add(roomSnap.flowId); emittedForWs += 1;
         }
         const cps = !ws.store.isClosed() ? ws.store.listFlowCheckpoints(20) : [];
-        for (const cp of cps) {
-          if (seen.has(cp.flowId)) continue;
+        for (const rawCp of cps) {
+          if (seen.has(rawCp.flowId)) continue;
+          const cp = rawCp.status === "running" ? (ws.store.reclaimDeadCheckpoint(rawCp.flowId) ?? rawCp) : rawCp;
           const actionable = cp.status === "running" || cp.status === "waiting_input" || cp.status === "interrupted";
           if (emittedForWs === 0 || actionable) {
             out.push(toFlowSummary(ws.cwd, snapshotFromCheckpoint(cp, ws.cwd), isCheckpointResumable(cp)));

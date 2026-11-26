@@ -268,10 +268,9 @@ export function mergeSteersIntoSnapshotJson(snapshotJson: string, steers: readon
 export function markMachineStateInterrupted(state: FlowMachineState, ts: string): FlowMachineState {
   const nodes: FlowMachineState["nodes"] = {};
   for (const [id, rt] of Object.entries(state.nodes)) {
-    const subState = rt.subState ? markMachineStateInterrupted(rt.subState, ts) : rt.subState;
     nodes[id] = rt.status === "running" || rt.status === "retrying"
-      ? { ...rt, status: "ready", activeStageId: null, sessionResidency: "disposed", endedAt: ts, ...(subState !== undefined ? { subState } : {}) }
-      : (subState !== undefined ? { ...rt, subState } : rt);
+      ? { ...rt, status: "ready", activeStageId: null, sessionResidency: "disposed", endedAt: ts }
+      : rt;
   }
   return state.status === "running"
     ? { ...state, status: "interrupted", endedAt: ts, reason: "上次进程中断，可在总秘书 (/coord) 中断点续跑", nodes }

@@ -71,6 +71,8 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
       if (!role) return undefined;
 
       ws.trackers.get(sid).beginTurn(ws.cwd, true);
+      const userTurn = extractLatestUserTurn(event, ctx);
+      if (userTurn) fgWorkflow.observeUserTurn(sid, userTurn);
       const mandate = ws.store.getActiveMandate({ sessionId: sid });
       const fgPhase = fgWorkflow.getActivePhaseContext(sid, ws.cwd, role, mandate?.goal);
       const effectiveRole = fgPhase?.effectiveRole ?? role;
@@ -159,4 +161,33 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
 
 function evHasError(event: any): boolean {
   return Boolean(event?.isError ?? event?.result?.isError);
+}
+
+function extractMsgText(msg: any): string {
+  if (!msg) return "";
+  if (typeof msg === "string") return msg.trim();
+  if (typeof msg.content === "string") return msg.content.trim();
+  if (Array.isArray(msg.content)) {
+    return msg.content.map((p: any) => (typeof p === "string" ? p : typeof p?.text === "string" ? p.text : "")).filter(Boolean).join("\n").trim();
+  }
+  return typeof msg.text === "string" ? msg.text.trim() : "";
+}
+
+let fgTurnSeq = 0;
+
+function extractLatestUserTurn(event: any, ctx: any): { turnKey: string; userText: string } | null {
+  const fn = ctx?.sessionManager?.getBranch ?? ctx?.sessionManager?.getEntries;
+  if (typeof fn === "function") {
+    try {
+      const entries: any[] = fn.call(ctx.sessionManager) ?? [];
+      let userCount = 0, lastKey = "", lastText = "";
+      for (let i = 0; i < entries.length; i++) {
+        const e = entries[i], m = e?.type === "message" ? e.message : e;
+        if (m?.role === "user") { userCount += 1; lastKey = typeof e?.id === "string" ? e.id : `u-${userCount}`; lastText = extractMsgText(m); }
+      }
+      if (userCount > 0) return { turnKey: lastKey, userText: lastText };
+    } catch {}
+  }
+  const direct = extractMsgText(event?.userMessage ?? event?.prompt ?? event?.message);
+  return direct ? { turnKey: `ev-${++fgTurnSeq}`, userText: direct } : null;
 }

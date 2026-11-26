@@ -412,8 +412,8 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
       messages: [{ role: "assistant", stopReason: "stop" }],
     }, ctx);
 
-    // Turn 2: algo is now at human gate `align_metric`; explicitly confirm it to enter `baseline`
-    await h.emit("before_agent_start", { systemPrompt: ["Base"] }, ctx);
+    // Turn 2: algo is now at human gate `align_metric`; explicitly confirm it via a real user reply to enter `baseline`
+    await h.emit("before_agent_start", { systemPrompt: ["Base"], userMessage: "确认采用 Recall 优先，进入 baseline" }, ctx);
     const confirmGateRes = await h.tools.get("enhance_handoff")!.execute("ho-confirm", {
       verdict: "ready", summary: "User confirmed metric preference: prioritize recall",
     }, null, null, ctx);
@@ -847,7 +847,7 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
     // Remove the custom role YAML and attempt resume -> diagnostic error, checkpoint stays waiting_input, lease stays null!
     rmSync(customYamlPath, { force: true });
     const failedResume = await h.tools.get("enhance_flow")!.execute("res-missing", {
-      action: "resume", wait: true,
+      action: "resume", message: "Yes, use schema v2", wait: true,
     }, null, null, ctx);
     expect(failedResume.isError).toBe(true);
     expect(JSON.parse(failedResume.content[0].text).error).toContain('Unknown role "ephemeral-spec"');
@@ -982,7 +982,7 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
 
       ompEnhance(pi, { builtinRolesDir, globalRolesDir: globalDir, pluginLockPath: lockPath, runnerFactory: () => runner });
       const res = JSON.parse((await tools.get("enhance_flow")!.execute("res-b", {
-        action: "resume", flowId: flowXId, wait: true,
+        action: "resume", flowId: flowXId, message: "Use WAL", wait: true,
       }, null, null, { cwd, hasUI: false })).content[0].text);
       writeFileSync(bSummaryFile, JSON.stringify({ status: res.status, liveSteersReceived, reviewerPrompt }), "utf8");
       for (const fn of handlers.get("session_shutdown") ?? []) await fn({}, { cwd });
@@ -1046,15 +1046,17 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
         const cpAfterSave = inspectAfterSave.getFlowCheckpoint(flowXId)!;
         expect(cpAfterSave.status).toBe("running");
         expect(cpAfterSave.userSteers?.map((s) => s.text)).toEqual([
+          "Use WAL",
           "A_OMITTED_ID_REPLY_WAL",
           "A_EXPLICIT_ID_REPLY_STRICT",
           "CHECK_WAL_LOCKING",
         ]);
         const dbSteers = inspectAfterSave.listFlowSteers(flowXId);
-        expect(dbSteers).toHaveLength(3);
+        expect(dbSteers).toHaveLength(4);
         expect(dbSteers[0]?.consumedByStage).toBe(bInfo.stageId);
         expect(dbSteers[1]?.consumedByStage).toBe(bInfo.stageId);
-        expect(dbSteers[2]?.consumedAt).toBeNull();
+        expect(dbSteers[2]?.consumedByStage).toBe(bInfo.stageId);
+        expect(dbSteers[3]?.consumedAt).toBeNull();
       } finally {
         inspectAfterSave.close();
       }
@@ -1082,9 +1084,9 @@ describe("Phase 7 State Persistence & Interruption/Retry Resilience", () => {
       try {
         expect(finalStore.getProjectFlowLease()).toBeNull();
         const finalSteers = finalStore.listFlowSteers(flowXId);
-        expect(finalSteers).toHaveLength(3);
+        expect(finalSteers).toHaveLength(4);
         expect(finalSteers.every((s) => Boolean(s.consumedAt && s.consumedByStage))).toBe(true);
-        expect(finalSteers[2]?.consumedByStage).toContain("reviewer");
+        expect(finalSteers[3]?.consumedByStage).toContain("reviewer");
       } finally {
         finalStore.close();
       }

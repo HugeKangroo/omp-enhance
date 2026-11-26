@@ -699,7 +699,7 @@ workflow:
     expect(viaRoles.done.status).toBe("completed");
     expect(viaDag.done.status).toBe("completed");
     expect(viaRoles.workerCalls).toEqual(viaDag.workerCalls);
-    expect(viaRoles.workerCalls).toEqual(["confirm-first__work:work"]);
+    expect(viaRoles.workerCalls).toEqual(["confirm-first__work:confirm-first__work"]);
 
     // Compatibility: workflow-less roles:["dev","qa"] and legacy linear checkpoint resume still work identically
     const compatCwd = makeTmpDir("wf-compat");

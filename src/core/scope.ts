@@ -1,5 +1,5 @@
 import { matchesGlobList, normalizeRelPath } from "./fs.ts";
-import type { RoleWorkflowPhaseSpec } from "./graph-types.ts";
+import type { FlowNodeSpec, RoleWorkflowPhaseSpec } from "./graph-types.ts";
 import { isRoleReadOnly } from "./policy.ts";
 import type { RoleSpec } from "./types.ts";
 
@@ -222,7 +222,10 @@ export function applyPhasePermissions(
   }
 
   const mergedProtected = [...new Set([...(baseRole.permissions.protected ?? []), ...nextLocks])];
-  const phaseArtifacts = phase.exitArtifacts?.length ? [...phase.exitArtifacts] : undefined;
+  const phaseArtifacts = phase.exitArtifacts?.length ? [...phase.exitArtifacts] : [];
+  const mergedArtifacts = isFinalPhase
+    ? [...new Set([...(baseRole.exit.requiredArtifacts ?? []), ...phaseArtifacts])]
+    : phaseArtifacts;
   const phaseRole: RoleSpec = {
     ...baseRole,
     workflow: undefined,
@@ -235,11 +238,32 @@ export function applyPhasePermissions(
     exit: {
       requireToolEvidence: baseRole.exit.requireToolEvidence,
       ...(isFinalPhase && baseRole.exit.requiredTools ? { requiredTools: [...baseRole.exit.requiredTools] } : {}),
-      ...(phaseArtifacts ? { requiredArtifacts: phaseArtifacts } : isFinalPhase && baseRole.exit.requiredArtifacts ? { requiredArtifacts: [...baseRole.exit.requiredArtifacts] } : {}),
+      ...(mergedArtifacts.length > 0 ? { requiredArtifacts: mergedArtifacts } : {}),
       ...(isFinalPhase && baseRole.exit.requireTestExecution ? { requireTestExecution: true } : {}),
       ...(isFinalPhase && baseRole.exit.requireAlgoDeliverables ? { requireAlgoDeliverables: true } : {}),
       criteria: phase.brief ? [phase.brief, ...baseRole.exit.criteria] : [...baseRole.exit.criteria],
     },
   };
   return { ok: true, role: phaseRole, nextCumulativeProtected: nextLocks };
+}
+
+export function resolveNodeEffectiveRole(
+  baseRole: RoleSpec,
+  nodeSpec: FlowNodeSpec,
+): { ok: true; role: RoleSpec } | { ok: false; reason: string } {
+  if (!nodeSpec.isWorkflowPhase) return narrowRolePermissions(baseRole, nodeSpec.writableScope);
+  const res = applyPhasePermissions(
+    baseRole,
+    {
+      id: nodeSpec.id,
+      ...(nodeSpec.phaseTools ? { tools: nodeSpec.phaseTools } : {}),
+      ...(nodeSpec.writableScope ? { writable: nodeSpec.writableScope } : {}),
+      ...(nodeSpec.lockedProtected ? { lockProtected: nodeSpec.lockedProtected } : {}),
+      ...(nodeSpec.requiredArtifacts ? { exitArtifacts: nodeSpec.requiredArtifacts } : {}),
+      ...(typeof nodeSpec.brief === "string" ? { brief: nodeSpec.brief } : {}),
+    },
+    [],
+    Boolean(nodeSpec.isFinalWorkflowPhase),
+  );
+  return res.ok ? { ok: true, role: res.role } : res;
 }

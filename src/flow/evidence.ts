@@ -48,33 +48,46 @@ function isTestRunnerSegment(rawSeg: string): boolean {
   return Boolean(seg && !NON_TEST_TRIVIAL_CMD_RE.test(seg) && SEGMENT_TEST_RUNNER_RE.test(seg));
 }
 
-function splitShellStatements(rawCommand: string): Array<{ stmt: string; nextOp: string | null }> {
+const SHELL_CONDITIONAL_RE = /\b(?:if|then|elif|else|fi|while|until|case)\b/;
+const SHELL_BG_OP_RE = /(?:^|[^&>])&(?!&|>)/;
+
+function splitShellStatements(rawCommand: string): Array<{ prevOp: string | null; stmt: string; nextOp: string | null }> {
   const tokens = rawCommand.split(/(\&\&|\|\||;|\n)/);
-  const out: Array<{ stmt: string; nextOp: string | null }> = [];
+  const out: Array<{ prevOp: string | null; stmt: string; nextOp: string | null }> = [];
   for (let i = 0; i < tokens.length; i += 2) {
     const stmt = (tokens[i] ?? "").trim();
+    const prevOp = i > 0 ? (tokens[i - 1] ?? null) : null;
     const nextOp = tokens[i + 1] ?? null;
-    if (stmt) out.push({ stmt, nextOp });
+    if (stmt) out.push({ prevOp, stmt, nextOp });
   }
   return out;
 }
 
 export function isRecognizedTestCommand(rawCommand: string): boolean {
   const trimmed = rawCommand.trim();
-  if (!trimmed) return false;
-  const hasPipefail = SHELL_PIPEFAIL_RE.test(trimmed);
-  const hasErrexit = SHELL_ERREXIT_RE.test(trimmed);
+  if (!trimmed || SHELL_CONDITIONAL_RE.test(trimmed) || SHELL_BG_OP_RE.test(trimmed)) return false;
   const statements = splitShellStatements(trimmed);
+  let hasPipefail = false;
+  let hasErrexit = false;
   for (let i = 0; i < statements.length; i++) {
-    const { stmt, nextOp } = statements[i]!;
+    const { prevOp, stmt, nextOp } = statements[i]!;
+    if (SHELL_PIPEFAIL_RE.test(stmt)) hasPipefail = true;
+    if (SHELL_ERREXIT_RE.test(stmt)) hasErrexit = true;
     const pipeStages = stmt.split("|");
     const testStageIdx = pipeStages.findIndex((s) => isTestRunnerSegment(s));
     if (testStageIdx < 0) continue;
-    // Left side of an unguarded pipe masks the test runner's exit code (e.g. `bun test | tee log`)
+    // Left of an unguarded pipe masks test runner exit code (`bun test | tee log`)
     if (testStageIdx < pipeStages.length - 1 && !hasPipefail) continue;
-    // `|| ...` masks test failure; `; <later>` without `set -e` replaces exit code with the trailing command
-    if (nextOp === "||") continue;
-    if ((nextOp === ";" || nextOp === "\n") && i < statements.length - 1 && !hasErrexit) continue;
+    // Right of `||` can be short-circuit skipped (`test -f x || bun test`); left of `||` masks failures
+    if (prevOp === "||" || nextOp === "||") continue;
+    // Any trailing `;`/`\n` (without errexit) or `||` AFTER this test statement can replace/mask its exit code
+    let maskedLater = false;
+    for (let j = i; j < statements.length; j++) {
+      const op = statements[j]!.nextOp;
+      if (op === "||") { maskedLater = true; break; }
+      if ((op === ";" || op === "\n") && j < statements.length - 1 && !hasErrexit) { maskedLater = true; break; }
+    }
+    if (maskedLater) continue;
     return true;
   }
   return false;

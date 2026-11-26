@@ -393,7 +393,10 @@ export function createManagedWorkspace(
     },
     resumeManagedFlow: async (c, background, signal, originWs, targetFlowId, opts) => {
       const effectiveFlowId = targetFlowId ?? room.getSnapshot().flowId;
-      const cp = effectiveFlowId && !store.isClosed() ? store.getFlowCheckpoint(effectiveFlowId) : null;
+      let cp = effectiveFlowId && !store.isClosed() ? store.getFlowCheckpoint(effectiveFlowId) : null;
+      if (cp?.status === "running" && (!room.hasActiveLeaseOwnership() || room.getSnapshot().flowId !== cp.flowId)) {
+        cp = store.reclaimDeadCheckpoint(cp.flowId) ?? cp;
+      }
       if (targetFlowId && !cp && room.getSnapshot().flowId !== targetFlowId) {
         throw new Error(`Unknown flowId "${targetFlowId}".`);
       }

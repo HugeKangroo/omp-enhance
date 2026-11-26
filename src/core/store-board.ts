@@ -1,16 +1,19 @@
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import type { FlowBoardEntry, FlowBoardKind, FlowLeaseMode } from "./graph-types.ts";
+import type { PersistedFlowCheckpoint } from "./types.ts";
 import {
   hasTable,
   inferStoreCwd,
   isProcessAliveWithToken,
   type LeaseRow,
+  listFlowSteersQuery,
   mutateMachineStateForInterrupt,
   mutateSnapshotForInterrupt,
   ProjectBusyError,
   type ProjectFlowLease,
   safeParseObject,
+  toFlowCheckpoint,
   toLease,
 } from "./store-schema.ts";
 
@@ -173,4 +176,24 @@ export function listActiveLeasesQuery(db: Database): Array<ProjectFlowLease & { 
   if (!hasTable(db, "project_leases")) return [];
   const rows = db.query("SELECT * FROM project_leases ORDER BY acquired_at DESC").all() as LeaseRow[];
   return rows.map((r) => ({ ...toLease(r), leaseKey: r.lease_key }));
+}
+
+export function runReclaimDeadCheckpointTx(db: Database, flowId: string, ts: string): PersistedFlowCheckpoint | null {
+  if (!hasTable(db, "flow_runs")) return null;
+  const row = db.query("SELECT * FROM flow_runs WHERE flow_id = ?").get(flowId) as Record<string, unknown> | null;
+  if (!row) return null;
+  if (String(row.status) !== "running") return toFlowCheckpoint(row, listFlowSteersQuery(db, flowId));
+  const pid = row.owner_pid != null ? Number(row.owner_pid) : null;
+  const tok = row.owner_start_token != null ? String(row.owner_start_token) : null;
+  if (pid != null && isProcessAliveWithToken(pid, tok)) {
+    return toFlowCheckpoint(row, listFlowSteersQuery(db, flowId));
+  }
+  const nextSnap = mutateSnapshotForInterrupt(String(row.snapshot_json ?? "{}"), ts);
+  const nextMachine = mutateMachineStateForInterrupt(row.machine_state_json != null ? String(row.machine_state_json) : null, ts);
+  db.query(
+    "UPDATE flow_runs SET status = 'interrupted', owner_pid = NULL, owner_start_token = NULL, lease_token = NULL, state_version = COALESCE(state_version, 0) + 1, snapshot_json = ?, machine_state_json = ?, updated_at = ? WHERE flow_id = ?",
+  ).run(nextSnap, nextMachine, ts, flowId);
+  if (hasTable(db, "project_leases")) db.query("DELETE FROM project_leases WHERE flow_id = ?").run(flowId);
+  const updated = db.query("SELECT * FROM flow_runs WHERE flow_id = ?").get(flowId) as Record<string, unknown>;
+  return toFlowCheckpoint(updated, listFlowSteersQuery(db, flowId));
 }

@@ -346,5 +346,6 @@ export interface FlowRunResult {
   steps: FlowStepResult[];
   finalEnvelope: HandoffEnvelope | null;
   mergedRef?: string | null;
+  mergedCommitSha?: string | null;
   reason?: string;
 }

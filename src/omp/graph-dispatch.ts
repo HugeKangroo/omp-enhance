@@ -40,6 +40,7 @@ export function parseNodeSpecs(rawNodes: unknown): FlowNodeSpec[] {
       ...(writableScope ? { writableScope } : {}),
       ...(r.workspace === "inherit" || r.workspace === "worktree" ? { workspace: r.workspace } : {}),
       ...(r.sessionMode === "fresh" || r.sessionMode === "reuse" || r.sessionMode === "fork" ? { sessionMode: r.sessionMode } : {}),
+      ...(asStr(r.sessionGroup) ? { sessionGroup: asStr(r.sessionGroup) } : {}),
       ...(asStr(r.forkFromNodeId) ? { forkFromNodeId: asStr(r.forkFromNodeId) } : {}),
       ...(fallbackModels ? { fallbackModels } : {}),
       ...(asStr(r.repairTargetNodeId) ? { repairTargetNodeId: asStr(r.repairTargetNodeId) } : {}),
@@ -49,7 +50,6 @@ export function parseNodeSpecs(rawNodes: unknown): FlowNodeSpec[] {
       ...(r.gate && typeof r.gate === "object" ? { gate: r.gate as FlowNodeSpec["gate"] } : {}),
       ...(r.merge && typeof r.merge === "object" ? { merge: r.merge as FlowNodeSpec["merge"] } : {}),
       ...(r.human && typeof r.human === "object" ? { human: r.human as FlowNodeSpec["human"] } : {}),
-      ...(r.nativeTask && typeof r.nativeTask === "object" ? { nativeTask: r.nativeTask as FlowNodeSpec["nativeTask"] } : {}),
     };
   });
 }

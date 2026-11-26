@@ -5,7 +5,7 @@ import path from "node:path";
 import {
   BOARD_SCHEMA_INDEX, BOARD_SCHEMA_TABLE, findFlowLeaseRow, GRAPH_COLUMN_MIGRATIONS,
   listActiveLeasesQuery, listBoardEventsQuery, releaseScopedLeaseQuery, runAcquireScopedLeaseTx,
-  runAppendBoardEventTx,
+  runAppendBoardEventTx, runReclaimDeadCheckpointTx,
 } from "./store-board.ts";
 import {
   type ArtifactRow, captureProcessStartToken, type EpistemicRow, type HandoffRow, hasCol, hasTable,
@@ -418,6 +418,18 @@ export class EnhanceStore {
     const db = this.readConn();
     const row = db && hasTable(db, "flow_runs") ? (db.query("SELECT * FROM flow_runs WHERE flow_id = ?").get(flowId) as Record<string, unknown> | null) : null;
     return row && db ? toFlowCheckpoint(row, listFlowSteersQuery(db, flowId)) : null;
+  }
+
+  reclaimDeadCheckpoint(flowId: string): PersistedFlowCheckpoint | null {
+    const ro = this.readConn();
+    if (!ro || !hasTable(ro, "flow_runs")) return null;
+    const peek = ro.query("SELECT status, owner_pid, owner_start_token FROM flow_runs WHERE flow_id = ?").get(flowId) as { status: string; owner_pid: number | null; owner_start_token: string | null } | null;
+    if (!peek) return null;
+    if (peek.status !== "running" || (peek.owner_pid != null && isProcessAliveWithToken(peek.owner_pid, peek.owner_start_token))) {
+      return this.getFlowCheckpoint(flowId);
+    }
+    const db = this.writeConn(false);
+    return db ? db.transaction(() => runReclaimDeadCheckpointTx(db, flowId, nowIso())).immediate() : this.getFlowCheckpoint(flowId);
   }
 
   getLatestFlowCheckpoint(): PersistedFlowCheckpoint | null {

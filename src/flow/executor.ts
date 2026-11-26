@@ -4,10 +4,10 @@ import path from "node:path";
 import { snapshotWorkspace } from "../core/fs.ts";
 import type {
   FlowCommand, FlowEvent, FlowGraphSpec, FlowMachineState, FlowNodeSpec,
-  GateNodeConfig, GraphValidationResult, NativeTaskNodeConfig,
+  GateNodeConfig, GraphValidationResult,
 } from "../core/graph-types.ts";
 import { isRoleReadOnly } from "../core/policy.ts";
-import { narrowRolePermissions } from "../core/scope.ts";
+import { resolveNodeEffectiveRole } from "../core/scope.ts";
 import type { EnhanceStore } from "../core/store.ts";
 import type {
   FlowRunResult, FlowStepResult, FlowUserSteer, HandoffEnvelope, Mandate, RoleSpec, VerificationEvidenceRecord,
@@ -18,12 +18,14 @@ import {
   executeRoleStep, type RoleSessionPoolLike, type RoleSessionRunner, type RoleSupervisorConfig,
 } from "./orchestrator.ts";
 import type { FlowObserver } from "./state.ts";
-import { buildOuterEventFromSubResult, compileRoleWorkflow, prepareOuterRepairReentry } from "./workflow.ts";
 
 export interface WorktreeManagerLike {
   isGitRepo(cwd: string): boolean;
   prepareNodeWorktree(input: { cwd: string; flowId: string; nodeId: string }): Promise<{ worktreePath: string; baseRef: string }>;
   commitNodeWorktree(input: { worktreePath: string; flowId: string; nodeId: string; summary: string }): Promise<string | null>;
+  commitAndUpdatePreviewRef?(input: {
+    cwd: string; worktreePath: string; flowId: string; nodeId: string; targetRef: string; summary: string;
+  }): Promise<{ commitRef: string; commitSha: string } | null>;
   mergeWorktrees(input: {
     cwd: string; flowId: string; nodeId: string; sourceRefs: Record<string, string>; landingMode: "apply" | "branch_preview";
   }): Promise<{ ok: boolean; mergedRef?: string | null; mergedCommitSha?: string | null; summary: string; conflicts?: string[] }>;
@@ -34,35 +36,14 @@ export interface WorktreeManagerLike {
   cleanupFlowWorktrees(cwd: string, flowId: string): Promise<void>;
 }
 
-export interface NativeTaskRunnerLike {
-  runNativeTasks(input: {
-    cwd: string; agent: string; tasks: ReadonlyArray<{ id: string; prompt: string }>; signal?: AbortSignal;
-  }): Promise<{ summary: string; verifiedFacts?: Array<{ claim: string; evidenceRef: string }> }>;
-}
-
 export interface ExecuteFlowGraphInput {
-  cwd: string;
-  store: EnhanceStore;
-  flowId: string;
-  mandate: Mandate;
-  spec: FlowGraphSpec;
-  validation: GraphValidationResult;
-  roles: ReadonlyMap<string, RoleSpec>;
-  runner: RoleSessionRunner;
-  initialState?: FlowMachineState | null;
-  resumeReplyText?: string;
-  resumeTargetNodeId?: string;
-  initialHandoff?: HandoffEnvelope | null;
-  userSteers?: readonly FlowUserSteer[];
-  observer?: FlowObserver;
-  supervisor?: RoleSupervisorConfig;
-  signal?: AbortSignal;
-  sessionPool?: RoleSessionPoolLike;
-  worktreeManager?: WorktreeManagerLike;
-  nativeTaskRunner?: NativeTaskRunnerLike;
-  nestingDepth?: 0 | 1;
-  sharedSessionSlotId?: string;
-  boardNodePrefix?: string;
+  cwd: string; store: EnhanceStore; flowId: string; mandate: Mandate;
+  spec: FlowGraphSpec; validation: GraphValidationResult;
+  roles: ReadonlyMap<string, RoleSpec>; runner: RoleSessionRunner;
+  initialState?: FlowMachineState | null; resumeReplyText?: string; resumeTargetNodeId?: string;
+  initialHandoff?: HandoffEnvelope | null; userSteers?: readonly FlowUserSteer[];
+  observer?: FlowObserver; supervisor?: RoleSupervisorConfig; signal?: AbortSignal;
+  sessionPool?: RoleSessionPoolLike; worktreeManager?: WorktreeManagerLike;
   onStateChange?: (state: FlowMachineState) => void;
   registerLivePatchHandler?: (handler: ((patch: import("../core/graph-types.ts").FlowGraphPatch, validated: GraphValidationResult) => boolean) | null) => void;
 }
@@ -158,11 +139,13 @@ export async function executeFlowGraph(
   const onExternalAbort = () => pushEvent({ type: "FLOW_CANCEL", reason: "Cancelled by user." });
   input.signal?.addEventListener("abort", onExternalAbort, { once: true });
 
-  const launchAsync = (nodeId: string, fn: (nodeSignal: AbortSignal) => Promise<void>): void => {
+  const launchAsync = (nodeId: string, fn: (nodeSignal: AbortSignal, isInternalAbort: () => boolean) => Promise<void>): void => {
     const ac = new AbortController();
     nodeAborts.set(nodeId, ac);
     const effSignal = input.signal ? AbortSignal.any([input.signal, ac.signal]) : ac.signal;
-    const p: Promise<void> = fn(effSignal).catch((err) => {
+    const isInternalAbort = () => ac.signal.aborted && !input.signal?.aborted && !input.observer?.isCancelled?.();
+    const p: Promise<void> = fn(effSignal, isInternalAbort).catch((err) => {
+      if (isInternalAbort()) return;
       const msg = err instanceof Error ? err.message : String(err);
       pushEvent({ type: "NODE_HOST_ERROR", nodeId, error: msg, retryable: false });
     }).finally(() => {
@@ -176,58 +159,31 @@ export async function executeFlowGraph(
   const executeRoleDispatch = async (
     cmd: Extract<FlowCommand, { type: "DISPATCH_ROLE_NODE" }>,
     nodeSignal: AbortSignal,
+    isInternalAbort: () => boolean,
   ): Promise<void> => {
     const spec = state.spec.nodes.find((n) => n.id === cmd.nodeId)!;
     const baseRole = input.roles.get(spec.role!)!;
     const effCwd = cmd.worktreePath ?? input.cwd;
     const upstreamHandoff = resolveUpstreamHandoff(state, spec, input.initialHandoff ?? null);
-
-    // 2-Level Isomorphic Route A: delegate roles declaring `workflow:` to nested Depth-1 FlowMachine (max depth strictly 2)
-    if ((input.nestingDepth ?? 0) === 0 && baseRole.workflow && baseRole.workflow.phases.length > 0) {
-      const compiled = compileRoleWorkflow({ role: baseRole, outerGoal: input.mandate.goal, outerWritableScope: spec.writableScope });
-      const existingSub = state.nodes[cmd.nodeId]?.subState ?? null;
-      const subInitial = existingSub && cmd.repairFeedback ? prepareOuterRepairReentry(existingSub, baseRole.workflow, cmd.repairFeedback) : existingSub;
-      const subRes = await executeFlowGraph({
-        cwd: effCwd, store: input.store, flowId: input.flowId, mandate: input.mandate,
-        spec: compiled.spec, validation: compiled.validation, initialState: subInitial,
-        ...(cmd.replyText ? { resumeReplyText: cmd.replyText } : {}),
-        roles: compiled.phaseRoles, runner: input.runner, initialHandoff: upstreamHandoff,
-        userSteers: input.userSteers, observer: input.observer, supervisor: input.supervisor,
-        signal: nodeSignal, sessionPool: input.sessionPool, nestingDepth: 1,
-        sharedSessionSlotId: cmd.nodeId, boardNodePrefix: cmd.nodeId,
-        onStateChange: (innerSt) => { state.nodes[cmd.nodeId]!.subState = innerSt; input.onStateChange?.(state); },
-      });
-      state.nodes[cmd.nodeId]!.subState = subRes.finalState;
-      steps.push(...subRes.steps);
-      let commitRef: string | null = null;
-      if (subRes.status === "completed" && cmd.worktreePath && input.worktreeManager) {
-        commitRef = await input.worktreeManager.commitNodeWorktree({ worktreePath: cmd.worktreePath, flowId: input.flowId, nodeId: cmd.nodeId, summary: subRes.finalEnvelope?.summary ?? baseRole.id });
-      }
-      pushEvent(buildOuterEventFromSubResult({
-        nodeId: cmd.nodeId, baseRole, mandate: input.mandate, upstreamHandoff, subRes,
-        sessionWarm: Boolean(input.sessionPool?.hasWarm(input.flowId, cmd.nodeId)), commitRef,
-      }));
-      return;
-    }
-
-    const narrowed = narrowRolePermissions(baseRole, spec.writableScope);
+    const narrowed = resolveNodeEffectiveRole(baseRole, spec);
     if (!narrowed.ok) {
       pushEvent({ type: "NODE_VIOLATION", nodeId: cmd.nodeId, violations: spec.writableScope ?? [], reason: narrowed.reason });
       return;
     }
-    const effRole = narrowed.role;
+    const effRole = spec.isWorkflowPhase ? { ...narrowed.role, id: `${baseRole.id}__${spec.id.split("__").slice(1).join("__") || spec.id}` } : narrowed.role;
     const boardContext = renderBoardContextForNode({ store: input.store, flowId: input.flowId, nodeSpec: spec });
     const nodeBrief = spec.brief ? formatNodeBrief(spec.brief, input.mandate.goal) : undefined;
     const toTarget = state.spec.nodes.find((n) => n.dependsOn.includes(spec.id))?.id ?? "user";
     const keepWarm = Boolean(state.spec.policies.enableSessionReuse && spec.sessionMode !== "fresh");
+    const sessionSlotId = cmd.sessionGroup ?? spec.sessionGroup ?? cmd.nodeId;
     const reuseSharedWarm = Boolean(
-      cmd.reuseSession || (input.sharedSessionSlotId && keepWarm && input.sessionPool?.hasWarm(input.flowId, input.sharedSessionSlotId)),
+      cmd.reuseSession || (spec.sessionGroup && keepWarm && input.sessionPool?.hasWarm(input.flowId, sessionSlotId)),
     );
 
     const runStepInCwd = async (stepCwd: string) => executeRoleStep({
       cwd: stepCwd, store: input.store, role: effRole, mandate: input.mandate, upstreamHandoff, userSteers: input.userSteers, toTarget,
       repairTargetRoleId: spec.repairTargetNodeId ?? "user", flowId: input.flowId, nodeId: cmd.nodeId,
-      ...(input.sharedSessionSlotId ? { sessionSlotId: input.sharedSessionSlotId } : {}),
+      sessionSlotId,
       runner: input.runner, stageId: cmd.stageId, round: cmd.repairRound, observer: input.observer, supervisor: input.supervisor,
       signal: nodeSignal, reuseSession: reuseSharedWarm, keepSessionWarm: keepWarm,
       ...(cmd.forkFromNodeId ? { forkFromNodeId: cmd.forkFromNodeId } : {}),
@@ -237,11 +193,30 @@ export async function executeFlowGraph(
       ...(boardContext ? { boardContext } : {}), ...(spec.stallTimeoutSec ? { stallTimeoutMs: spec.stallTimeoutSec * 1000 } : {}),
       ...(input.sessionPool ? { sessionPool: input.sessionPool } : {}),
     });
-    const res = cmd.targetCommitRef && !cmd.worktreePath && input.worktreeManager?.withCommitWorktree
-      ? await input.worktreeManager.withCommitWorktree({ cwd: input.cwd, flowId: input.flowId, nodeId: cmd.nodeId, commitRef: cmd.targetCommitRef }, ({ worktreePath }) => runStepInCwd(worktreePath))
+
+    let previewUpdated: { commitRef: string; commitSha: string } | null = null;
+    const pinnedPreviewTarget = cmd.targetCommitSha ?? cmd.targetCommitRef;
+    const res = pinnedPreviewTarget && !cmd.worktreePath && input.worktreeManager?.withCommitWorktree
+      ? await input.worktreeManager.withCommitWorktree(
+          { cwd: input.cwd, flowId: input.flowId, nodeId: cmd.nodeId, commitRef: pinnedPreviewTarget },
+          async ({ worktreePath }) => {
+            const stepRes = await runStepInCwd(worktreePath);
+            if (stepRes.ok && stepRes.envelope.verdict === "ready" && !isRoleReadOnly(effRole) && input.worktreeManager?.commitAndUpdatePreviewRef) {
+              previewUpdated = await input.worktreeManager.commitAndUpdatePreviewRef({
+                cwd: input.cwd, worktreePath, flowId: input.flowId, nodeId: cmd.nodeId,
+                targetRef: cmd.targetCommitRef ?? state.mergedRef ?? pinnedPreviewTarget, summary: stepRes.envelope.summary,
+              });
+            }
+            return stepRes;
+          },
+        )
       : await runStepInCwd(effCwd);
+    if (isInternalAbort()) return;
     if (!res.ok) {
-      if (res.status === "cancelled") { pushEvent({ type: "FLOW_CANCEL", reason: res.reason }); return; }
+      if (res.status === "cancelled") {
+        if (input.signal?.aborted || input.observer?.isCancelled?.()) pushEvent({ type: "FLOW_CANCEL", reason: res.reason });
+        return;
+      }
       if (res.status === "violation") { pushEvent({ type: "NODE_VIOLATION", nodeId: cmd.nodeId, violations: res.violations, reason: res.reason }); return; }
       if (res.status === "aborted_by_supervisor") { pushEvent({ type: "NODE_ABORTED_BY_SUPERVISOR", nodeId: cmd.nodeId, reason: res.reason }); return; }
       if (res.status === "stalled") { pushEvent({ type: "NODE_STALLED", nodeId: cmd.nodeId, idleSec: res.idleSec, currentModel: res.modelLabel }); return; }
@@ -267,27 +242,25 @@ export async function executeFlowGraph(
       });
       return;
     }
-    let commitRef: string | null = null;
+    let commitRef: string | null = (previewUpdated as { commitRef: string; commitSha: string } | null)?.commitRef ?? null;
+    const commitSha: string | null = (previewUpdated as { commitRef: string; commitSha: string } | null)?.commitSha ?? null;
     if (cmd.worktreePath && input.worktreeManager) {
       commitRef = await input.worktreeManager.commitNodeWorktree({
         worktreePath: cmd.worktreePath, flowId: input.flowId, nodeId: cmd.nodeId, summary: env.summary,
       });
     }
-    pushEvent({ type: "NODE_SUCCEEDED", nodeId: cmd.nodeId, handoff: env, sessionWarm: res.sessionWarm, commitRef });
+    pushEvent({ type: "NODE_SUCCEEDED", nodeId: cmd.nodeId, handoff: env, sessionWarm: res.sessionWarm, commitRef, commitSha });
   };
 
   const runRoleDispatch = (cmd: Extract<FlowCommand, { type: "DISPATCH_ROLE_NODE" }>): void => {
-    launchAsync(cmd.nodeId, (nodeSignal) => executeRoleDispatch(cmd, nodeSignal));
+    launchAsync(cmd.nodeId, (nodeSignal, isInternalAbort) => executeRoleDispatch(cmd, nodeSignal, isInternalAbort));
   };
 
   const executeCommands = async (commands: readonly FlowCommand[]): Promise<void> => {
     for (const cmd of commands) {
       switch (cmd.type) {
         case "APPEND_BOARD": {
-          const entry = input.boardNodePrefix && cmd.entry.nodeId
-            ? { ...cmd.entry, nodeId: `${input.boardNodePrefix}/${cmd.entry.nodeId}` }
-            : cmd.entry;
-          const saved = appendBoardEntrySafe(input.store, input.flowId, entry);
+          const saved = appendBoardEntrySafe(input.store, input.flowId, cmd.entry);
           if (saved?.seq) state.boardSeq = Math.max(state.boardSeq, saved.seq);
           break;
         }
@@ -297,7 +270,7 @@ export async function executeFlowGraph(
         case "PREPARE_WORKTREE":
           launchAsync(cmd.nodeId, async () => {
             if (!input.worktreeManager) throw new Error(`Worktree manager unavailable for node "${cmd.nodeId}".`);
-            const wt = await input.worktreeManager.prepareNodeWorktree({ cwd: input.cwd, flowId: input.flowId, nodeId: cmd.nodeId });
+            const wt = await input.worktreeManager.prepareNodeWorktree({ cwd: input.cwd, flowId: input.flowId, nodeId: cmd.worktreeGroup ?? cmd.nodeId });
             pushEvent({ type: "NODE_WORKTREE_READY", nodeId: cmd.nodeId, worktreePath: wt.worktreePath });
           });
           break;
@@ -305,51 +278,57 @@ export async function executeFlowGraph(
           runRoleDispatch(cmd);
           break;
         case "SWITCH_MODEL_AND_RESUME":
-          launchAsync(cmd.nodeId, async (nodeSignal) => {
+          launchAsync(cmd.nodeId, async (nodeSignal, isInternalAbort) => {
+            const spec = state.spec.nodes.find((n) => n.id === cmd.nodeId);
+            const slotId = spec?.sessionGroup ?? cmd.nodeId;
             let switched = false;
             if (input.sessionPool?.switchModelInPlace) {
-              const sw = await input.sessionPool.switchModelInPlace(input.flowId, cmd.nodeId, cmd.nextModel);
+              const sw = await input.sessionPool.switchModelInPlace(input.flowId, slotId, cmd.nextModel);
               switched = sw.switched;
             }
             const rt = state.nodes[cmd.nodeId]!;
             await executeRoleDispatch({
               type: "DISPATCH_ROLE_NODE", nodeId: cmd.nodeId, stageId: cmd.stageId, attempt: cmd.attempt,
               repairRound: rt.repairRound, reuseSession: switched,
+              ...(spec?.sessionGroup ? { sessionGroup: spec.sessionGroup } : {}),
               ...(rt.worktreePath ? { worktreePath: rt.worktreePath } : {}),
               modelOverride: cmd.nextModel,
               repairFeedback: `Previous attempt interrupted (${cmd.reason}); switched model to ${cmd.nextModel}. Continue and call enhance_handoff when done.`,
-            }, nodeSignal);
+            }, nodeSignal, isInternalAbort);
           });
           break;
         case "RUN_GATE_NODE":
-          launchAsync(cmd.nodeId, async (nodeSignal) => {
+          launchAsync(cmd.nodeId, async (nodeSignal, isInternalAbort) => {
             const evalGate = (gateCwd: string, testedCommitSha?: string) => runDeterministicGate({
               cwd: gateCwd, flowId: input.flowId, mandate: input.mandate, store: input.store,
               nodeId: cmd.nodeId, stageId: cmd.stageId, config: cmd.config, testedCommitSha, signal: nodeSignal,
             });
+            const pinnedCommit = cmd.targetCommitSha ?? cmd.targetCommitRef;
             let g: Awaited<ReturnType<typeof runDeterministicGate>>;
-            if (cmd.targetCommitRef) {
+            if (pinnedCommit) {
               if (!input.worktreeManager?.withCommitWorktree) {
-                throw new Error(`Worktree manager unavailable to evaluate candidate ref "${cmd.targetCommitRef}" for gate "${cmd.nodeId}".`);
+                throw new Error(`Worktree manager unavailable to evaluate candidate ref "${pinnedCommit}" for gate "${cmd.nodeId}".`);
               }
               g = await input.worktreeManager.withCommitWorktree(
-                { cwd: input.cwd, flowId: input.flowId, nodeId: cmd.nodeId, commitRef: cmd.targetCommitRef },
+                { cwd: input.cwd, flowId: input.flowId, nodeId: cmd.nodeId, commitRef: pinnedCommit },
                 ({ worktreePath, commitSha }) => evalGate(worktreePath, commitSha),
               );
             } else {
               g = await evalGate(cmd.worktreePath ?? input.cwd);
             }
+            if (isInternalAbort()) return;
             steps.push({ stepIndex: state.nodeOrder.indexOf(cmd.nodeId), roleId: cmd.nodeId, round: state.nodes[cmd.nodeId]!.repairRound, envelope: g.handoff });
             pushEvent({ type: "GATE_COMPLETED", nodeId: cmd.nodeId, passed: g.passed, evidence: g.evidence, handoff: g.handoff, ...(g.feedback ? { feedback: g.feedback } : {}) });
           });
           break;
         case "RUN_MERGE_NODE":
-          launchAsync(cmd.nodeId, async () => {
+          launchAsync(cmd.nodeId, async (_nodeSignal, isInternalAbort) => {
             if (!input.worktreeManager) throw new Error(`Worktree manager unavailable for merge node "${cmd.nodeId}".`);
             const m = await input.worktreeManager.mergeWorktrees({
               cwd: input.cwd, flowId: input.flowId, nodeId: cmd.nodeId,
               sourceRefs: cmd.sourceRefs, landingMode: cmd.config.landingMode ?? "apply",
             });
+            if (isInternalAbort()) return;
             const handoff: HandoffEnvelope = {
               id: `ho-merge-${randomUUID()}`, mandateId: input.mandate.id, mandateRev: input.mandate.rev,
               parentHandoffId: null, fromRole: cmd.nodeId, toTarget: "user", verdict: m.ok ? "ready" : "needs_input",
@@ -358,31 +337,20 @@ export async function executeFlowGraph(
               feedbackForUpstream: null, observedUsage: { inputTokens: 0, outputTokens: 0, costUsd: 0 }, createdAt: nowIso(),
             };
             if (!input.store.isClosed()) input.store.saveHandoff(handoff);
-            pushEvent({ type: "MERGE_COMPLETED", nodeId: cmd.nodeId, ok: m.ok, mergedRef: m.mergedRef, summary: m.summary, conflicts: m.conflicts, handoff });
-          });
-          break;
-        case "RUN_NATIVE_TASK_NODE":
-          launchAsync(cmd.nodeId, async (nodeSignal) => {
-            if (!input.nativeTaskRunner) throw new Error(`Native task runner unavailable for node "${cmd.nodeId}".`);
-            const nt = await input.nativeTaskRunner.runNativeTasks({ cwd: input.cwd, agent: cmd.config.agent, tasks: cmd.config.tasks, signal: nodeSignal });
-            const handoff: HandoffEnvelope = {
-              id: `ho-task-${randomUUID()}`, mandateId: input.mandate.id, mandateRev: input.mandate.rev,
-              parentHandoffId: null, fromRole: cmd.nodeId, toTarget: "user", verdict: "ready",
-              summary: nt.summary, artifacts: [], verifiedFacts: nt.verifiedFacts ?? [], openRisks: [],
-              feedbackForUpstream: null, observedUsage: null, createdAt: nowIso(),
-            };
-            if (!input.store.isClosed()) input.store.saveHandoff(handoff);
-            pushEvent({ type: "NODE_SUCCEEDED", nodeId: cmd.nodeId, handoff, sessionWarm: false });
+            pushEvent({
+              type: "MERGE_COMPLETED", nodeId: cmd.nodeId, ok: m.ok,
+              mergedRef: m.mergedRef, mergedCommitSha: m.mergedCommitSha, summary: m.summary, conflicts: m.conflicts, handoff,
+            });
           });
           break;
         case "ABORT_NODE":
           nodeAborts.get(cmd.nodeId)?.abort();
           break;
         case "DISPOSE_SESSION":
-          if ((input.nestingDepth ?? 0) === 0) await input.sessionPool?.disposeNode(input.flowId, cmd.nodeId);
+          await input.sessionPool?.disposeNode(input.flowId, cmd.nodeId);
           break;
         case "CLEANUP_WORKTREES":
-          if ((input.nestingDepth ?? 0) === 0) await input.worktreeManager?.cleanupFlowWorktrees(input.cwd, cmd.flowId);
+          await input.worktreeManager?.cleanupFlowWorktrees(input.cwd, cmd.flowId);
           break;
         case "RUN_HUMAN_NODE":
         case "DELIVER_STEER":
@@ -420,10 +388,10 @@ export async function executeFlowGraph(
     input.signal?.removeEventListener("abort", onExternalAbort);
     for (const ac of nodeAborts.values()) ac.abort();
     if (inFlight.size > 0) await Promise.allSettled([...inFlight.values()]);
-    if ((input.nestingDepth ?? 0) === 0 && isFlowTerminal(state.status)) await input.sessionPool?.disposeFlow(input.flowId);
+    if (isFlowTerminal(state.status)) await input.sessionPool?.disposeFlow(input.flowId);
   }
 
-  if ((input.nestingDepth ?? 0) === 0 && state.status === "completed") input.store.completeMandate(input.mandate.id);
+  if (state.status === "completed") input.store.completeMandate(input.mandate.id);
   const finalEnvelope = (state.lastHandoffId ? input.store.getHandoff(state.lastHandoffId) : null)
     ?? [...state.nodeOrder].reverse().map((id) => state.nodes[id]?.lastHandoff).find(Boolean)
     ?? input.initialHandoff
@@ -437,6 +405,7 @@ export async function executeFlowGraph(
   return {
     status: resultStatus, cwd: input.cwd, steps, finalEnvelope,
     ...(state.mergedRef ? { mergedRef: state.mergedRef } : {}),
+    ...(state.mergedCommitSha ? { mergedCommitSha: state.mergedCommitSha } : {}),
     ...(state.reason ? { reason: state.reason } : {}), finalState: state,
   };
 }

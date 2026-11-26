@@ -26,9 +26,12 @@ function renderMultiProjectFlowStatus(hub: WorkspaceHub, primaryWs: ManagedWorks
   const lines = ["跨项目后台专员监控 (/flow status)"];
   for (const s of summaries) {
     const chain = s.roleChain.length > 0 ? s.roleChain.join(" → ") : "待命";
-    const stageInfo = s.roleChain.length > 0 ? ` · 阶段 ${s.currentIndex + 1}/${s.roleChain.length}` : "";
+    const stageInfo = s.graphProgress
+      ? ` · 节点 ${s.graphProgress.done}/${s.graphProgress.total}`
+      : (s.roleChain.length > 0 ? ` · 阶段 ${s.currentIndex + 1}/${s.roleChain.length}` : "");
     lines.push(`• ${s.cwd}`);
     lines.push(`  状态: ${s.status}${s.resumable ? " (可续跑)" : ""} · Flow: ${s.flowId ?? "无"} · 专员链: ${chain}${stageInfo}`);
+    if (s.mergedRef) lines.push(`  交付引用: ${s.mergedRef}${s.mergedCommitSha ? ` (${s.mergedCommitSha.slice(0, 12)})` : ""}`);
     if (s.goal) lines.push(`  目标: ${s.goal}`);
     if (s.reason) lines.push(`  说明: ${s.reason}`);
   }
