@@ -40,6 +40,7 @@ const EXIT_KEYS: Record<string, true> = {
   require_tool_evidence: true,
   required_tools: true,
   required_artifacts: true,
+  required_checks: true,
   require_test_execution: true,
   require_algo_deliverables: true,
   criteria: true,
@@ -125,6 +126,7 @@ export function computeRoleContentSha256(
       requireToolEvidence: role.exit.requireToolEvidence,
       requiredTools: role.exit.requiredTools ?? null,
       requiredArtifacts: role.exit.requiredArtifacts ?? null,
+      ...(role.exit.requiredChecks ? { requiredChecks: role.exit.requiredChecks } : {}),
       requireTestExecution: role.exit.requireTestExecution ?? false,
       requireAlgoDeliverables: role.exit.requireAlgoDeliverables ?? false,
       criteria: role.exit.criteria,
@@ -245,6 +247,10 @@ export function parseRoleYaml(
       exitYaml.required_artifacts === undefined
         ? undefined
         : stringList(exitYaml.required_artifacts, "exit.required_artifacts", filePath);
+    const requiredChecks =
+      exitYaml.required_checks === undefined
+        ? undefined
+        : stringList(exitYaml.required_checks, "exit.required_checks", filePath);
     if (exitYaml.require_test_execution !== undefined && typeof exitYaml.require_test_execution !== "boolean") {
       throw new Error(`exit.require_test_execution must be a boolean in ${filePath}`);
     }
@@ -259,6 +265,7 @@ export function parseRoleYaml(
       requireToolEvidence,
       ...(requiredTools !== undefined ? { requiredTools } : {}),
       ...(requiredArtifacts !== undefined ? { requiredArtifacts } : {}),
+      ...(requiredChecks !== undefined ? { requiredChecks } : {}),
       ...(exitYaml.require_test_execution !== undefined ? { requireTestExecution: exitYaml.require_test_execution } : {}),
       ...(exitYaml.require_algo_deliverables !== undefined ? { requireAlgoDeliverables: exitYaml.require_algo_deliverables } : {}),
       criteria,
@@ -339,13 +346,14 @@ export function serializeRoleYaml(
   }
 
   const {
-    requireToolEvidence, requiredTools, requiredArtifacts,
+    requireToolEvidence, requiredTools, requiredArtifacts, requiredChecks,
     requireTestExecution, requireAlgoDeliverables, criteria,
   } = role.exit;
   if (
     requireToolEvidence ||
     requiredTools !== undefined ||
     requiredArtifacts !== undefined ||
+    requiredChecks !== undefined ||
     requireTestExecution !== undefined ||
     requireAlgoDeliverables !== undefined ||
     criteria.length > 0
@@ -356,6 +364,9 @@ export function serializeRoleYaml(
     }
     if (requiredArtifacts !== undefined) {
       lines.push(`  required_artifacts: [${requiredArtifacts.map((item) => JSON.stringify(item)).join(", ")}]`);
+    }
+    if (requiredChecks !== undefined) {
+      lines.push(`  required_checks: [${requiredChecks.map((item) => JSON.stringify(item)).join(", ")}]`);
     }
     if (requireTestExecution !== undefined) {
       lines.push(`  require_test_execution: ${requireTestExecution}`);

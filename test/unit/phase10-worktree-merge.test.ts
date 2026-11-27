@@ -225,7 +225,7 @@ describe("Phase 3: Git Worktree Isolation, Merge, Dirty Base, and Scope Enforcem
       snapshotJson: "{}", updatedAt: new Date().toISOString(),
     });
 
-    let livePatch: ((patch: any, validated: any) => boolean) | null = null;
+    let livePatch: ((patch: any, patchRoles?: any) => Promise<{ patched: boolean }>) | null = null;
     let latestState: any = null;
     let midRunWidget = "";
     const ranNodes: string[] = [];
@@ -243,7 +243,8 @@ describe("Phase 3: Git Worktree Isolation, Merge, Dirty Base, and Scope Enforcem
               patch, roles, isGitRepo: true,
             });
             expect(pv.ok).toBe(true);
-            expect(livePatch(patch, pv)).toBe(true);
+            const patchRes = await livePatch(patch, roles);
+            expect(patchRes.patched).toBe(true);
           }
         }
         const ho = {

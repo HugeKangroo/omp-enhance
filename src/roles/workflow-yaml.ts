@@ -1,4 +1,10 @@
-import type { RoleWorkflowExitGateSpec, RoleWorkflowPhaseSpec, RoleWorkflowSpec } from "../core/graph-types.ts";
+import type {
+  HumanNodeMode,
+  HumanOptionAction,
+  RoleWorkflowExitGateSpec,
+  RoleWorkflowPhaseSpec,
+  RoleWorkflowSpec,
+} from "../core/graph-types.ts";
 import { applyPhasePermissions } from "../core/scope.ts";
 import type { RoleSpec } from "../core/types.ts";
 
@@ -6,9 +12,26 @@ const PHASE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const WORKFLOW_KEYS: Record<string, true> = { session: true, repair_entry: true, max_repair_rounds: true, phases: true };
 const PHASE_KEYS: Record<string, true> = {
   id: true, title: true, kind: true, depends_on: true, tools: true, writable: true,
-  lock_protected: true, exit_artifacts: true, exit_gate: true, prompt: true, brief: true, max_attempts: true, fallback_models: true,
+  lock_protected: true, exit_artifacts: true, required_checks: true, exit_gate: true, prompt: true, brief: true,
+  options: true, allow_free_text: true, mode: true, option_actions: true,
+  max_attempts: true, fallback_models: true,
 };
 const GATE_KEYS: Record<string, true> = { command: true, timeout_sec: true, expect_exit_code: true, parse_json_metrics_path: true };
+const HUMAN_ACTIONS = new Set<HumanOptionAction>(["proceed", "hold", "cancel"]);
+
+function parseOptionActions(raw: unknown, field: string, filePath: string): Record<string, HumanOptionAction> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`${field} must be an object mapping option label to proceed|hold|cancel in ${filePath}`);
+  }
+  const out: Record<string, HumanOptionAction> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!k.trim() || typeof v !== "string" || !HUMAN_ACTIONS.has(v as HumanOptionAction)) {
+      throw new Error(`${field}["${k}"] must be "proceed", "hold", or "cancel" in ${filePath}`);
+    }
+    out[k.trim()] = v as HumanOptionAction;
+  }
+  return out;
+}
 
 function assertAllowed(obj: Record<string, unknown>, allowed: Record<string, true>, scope: string, filePath: string): void {
   for (const key of Object.keys(obj)) if (!allowed[key]) throw new Error(`Unknown ${scope} field "${key}" in ${filePath}`);
@@ -70,6 +93,16 @@ export function parseRoleWorkflowYaml(raw: unknown, baseRole: RoleSpec, filePath
     if (kind !== "role" && kind !== "gate" && kind !== "human") throw new Error(`workflow.phases[${i}].kind must be "role", "gate", or "human" in ${filePath}`);
     if (kind === "human" && p.prompt === undefined && p.brief === undefined) throw new Error(`Human phase "${id}" requires prompt or brief in ${filePath}`);
     if (kind === "gate" && p.exit_gate === undefined) throw new Error(`Gate phase "${id}" requires exit_gate in ${filePath}`);
+    let mode: HumanNodeMode | undefined;
+    if (p.mode !== undefined) {
+      if (p.mode !== "approval" && p.mode !== "input") {
+        throw new Error(`workflow.phases[${i}].mode must be "approval" or "input" in ${filePath}`);
+      }
+      mode = p.mode;
+    }
+    if (p.allow_free_text !== undefined && typeof p.allow_free_text !== "boolean") {
+      throw new Error(`workflow.phases[${i}].allow_free_text must be a boolean in ${filePath}`);
+    }
     phases.push({
       id, kind,
       ...(p.title !== undefined ? { title: readStr(p.title, `workflow.phases[${i}].title`, filePath) } : {}),
@@ -78,9 +111,14 @@ export function parseRoleWorkflowYaml(raw: unknown, baseRole: RoleSpec, filePath
       ...(p.writable !== undefined ? { writable: readStrList(p.writable, `workflow.phases[${i}].writable`, filePath) } : {}),
       ...(p.lock_protected !== undefined ? { lockProtected: readStrList(p.lock_protected, `workflow.phases[${i}].lock_protected`, filePath) } : {}),
       ...(p.exit_artifacts !== undefined ? { exitArtifacts: readStrList(p.exit_artifacts, `workflow.phases[${i}].exit_artifacts`, filePath) } : {}),
+      ...(p.required_checks !== undefined ? { requiredChecks: readStrList(p.required_checks, `workflow.phases[${i}].required_checks`, filePath) } : {}),
       ...(p.exit_gate !== undefined ? { exitGate: parseExitGate(p.exit_gate, `workflow.phases[${i}].exit_gate`, filePath) } : {}),
       ...(p.prompt !== undefined ? { prompt: readStr(p.prompt, `workflow.phases[${i}].prompt`, filePath) } : {}),
       ...(p.brief !== undefined ? { brief: readStr(p.brief, `workflow.phases[${i}].brief`, filePath) } : {}),
+      ...(p.options !== undefined ? { options: readStrList(p.options, `workflow.phases[${i}].options`, filePath) } : {}),
+      ...(p.allow_free_text !== undefined ? { allowFreeText: p.allow_free_text } : {}),
+      ...(mode !== undefined ? { mode } : {}),
+      ...(p.option_actions !== undefined ? { optionActions: parseOptionActions(p.option_actions, `workflow.phases[${i}].option_actions`, filePath) } : {}),
       ...(typeof p.max_attempts === "number" ? { maxAttempts: p.max_attempts } : {}),
       ...(p.fallback_models !== undefined ? { fallbackModels: readStrList(p.fallback_models, `workflow.phases[${i}].fallback_models`, filePath) } : {}),
     });
@@ -139,6 +177,7 @@ export function serializeRoleWorkflowYaml(workflow: RoleWorkflowSpec): string[] 
     if (ph.writable !== undefined) lines.push(`      writable: ${arr(ph.writable)}`);
     if (ph.lockProtected !== undefined) lines.push(`      lock_protected: ${arr(ph.lockProtected)}`);
     if (ph.exitArtifacts !== undefined) lines.push(`      exit_artifacts: ${arr(ph.exitArtifacts)}`);
+    if (ph.requiredChecks !== undefined) lines.push(`      required_checks: ${arr(ph.requiredChecks)}`);
     if (ph.exitGate) {
       lines.push("      exit_gate:", `        command: ${JSON.stringify(ph.exitGate.command)}`);
       if (ph.exitGate.timeoutSec !== undefined) lines.push(`        timeout_sec: ${ph.exitGate.timeoutSec}`);
@@ -147,6 +186,15 @@ export function serializeRoleWorkflowYaml(workflow: RoleWorkflowSpec): string[] 
     }
     if (ph.prompt !== undefined) lines.push(`      prompt: ${JSON.stringify(ph.prompt)}`);
     if (ph.brief !== undefined) lines.push(`      brief: ${JSON.stringify(ph.brief)}`);
+    if (ph.options !== undefined) lines.push(`      options: ${arr(ph.options)}`);
+    if (ph.allowFreeText !== undefined) lines.push(`      allow_free_text: ${ph.allowFreeText}`);
+    if (ph.mode !== undefined) lines.push(`      mode: ${ph.mode}`);
+    if (ph.optionActions && Object.keys(ph.optionActions).length > 0) {
+      lines.push("      option_actions:");
+      for (const [k, v] of Object.entries(ph.optionActions)) {
+        lines.push(`        ${JSON.stringify(k)}: ${v}`);
+      }
+    }
     if (ph.maxAttempts !== undefined) lines.push(`      max_attempts: ${ph.maxAttempts}`);
     if (ph.fallbackModels !== undefined) lines.push(`      fallback_models: ${arr(ph.fallbackModels)}`);
   }

@@ -5,7 +5,7 @@ import { isInternalRole } from "../core/policy.ts";
 import type { RoleSpec } from "../core/types.ts";
 import {
   compileContractParallelVerify, compileExperimentLoop, compileFanOutJoin, compileLinearChain,
-  normalizePolicies, validateFlowGraph, validateGraphPatch, type FanOutShardInput,
+  normalizePolicies, validateFlowGraph, type FanOutShardInput,
 } from "../flow/graph.ts";
 import { isGitRepo } from "../flow/worktree.ts";
 
@@ -29,6 +29,7 @@ export function parseNodeSpecs(rawNodes: unknown): FlowNodeSpec[] {
     const dependsOn = Array.isArray(r.dependsOn) ? r.dependsOn.filter((d): d is string => typeof d === "string" && Boolean(d.trim())).map((d) => d.trim()) : [];
     const tools = asStrArr(r.tools);
     const writableScope = asStrArr(r.writableScope);
+    const requiredChecks = asStrArr(r.requiredChecks);
     const fallbackModels = asStrArr(r.fallbackModels);
     return {
       id,
@@ -40,10 +41,10 @@ export function parseNodeSpecs(rawNodes: unknown): FlowNodeSpec[] {
       ...(r.brief !== undefined ? { brief: r.brief as FlowNodeSpec["brief"] } : {}),
       ...(tools ? { tools } : {}),
       ...(writableScope ? { writableScope } : {}),
+      ...(requiredChecks ? { requiredChecks } : {}),
       ...(r.workspace === "inherit" || r.workspace === "worktree" ? { workspace: r.workspace } : {}),
-      ...(r.sessionMode === "fresh" || r.sessionMode === "reuse" || r.sessionMode === "fork" ? { sessionMode: r.sessionMode } : {}),
+      ...(r.sessionMode === "fresh" || r.sessionMode === "reuse" ? { sessionMode: r.sessionMode } : {}),
       ...(asStr(r.sessionGroup) ? { sessionGroup: asStr(r.sessionGroup) } : {}),
-      ...(asStr(r.forkFromNodeId) ? { forkFromNodeId: asStr(r.forkFromNodeId) } : {}),
       ...(fallbackModels ? { fallbackModels } : {}),
       ...(asStr(r.repairTargetNodeId) ? { repairTargetNodeId: asStr(r.repairTargetNodeId) } : {}),
       ...(typeof r.maxAttempts === "number" ? { maxAttempts: r.maxAttempts } : {}),
@@ -146,28 +147,14 @@ export function formatGraphWavesSummary(spec: FlowGraphSpec, validation: GraphVa
     .join(" → ");
 }
 
-export function parseAndValidatePatch(input: {
-  rawPatch: unknown;
-  currentSpec: FlowGraphSpec;
-  nodeStatuses: Readonly<Record<string, string>>;
-  rolesMap: ReadonlyMap<string, RoleSpec>;
-  cwd: string;
-}): { patch: FlowGraphPatch; validation: GraphValidationResult } {
-  if (!input.rawPatch || typeof input.rawPatch !== "object" || Array.isArray(input.rawPatch)) {
+export function parsePatchObject(rawPatch: unknown): FlowGraphPatch {
+  if (!rawPatch || typeof rawPatch !== "object" || Array.isArray(rawPatch)) {
     throw new Error("enhance_flow patch requires a patch object with addNodes, skipNodeIds, or rewireDeps.");
   }
-  const r = input.rawPatch as Record<string, unknown>;
-  const patch: FlowGraphPatch = {
+  const r = rawPatch as Record<string, unknown>;
+  return {
     ...(Array.isArray(r.addNodes) && r.addNodes.length > 0 ? { addNodes: parseNodeSpecs(r.addNodes) } : {}),
     ...(asStrArr(r.skipNodeIds) ? { skipNodeIds: asStrArr(r.skipNodeIds) } : {}),
     ...(Array.isArray(r.rewireDeps) ? { rewireDeps: r.rewireDeps as FlowGraphPatch["rewireDeps"] } : {}),
   };
-  const validation = validateGraphPatch({
-    currentSpec: input.currentSpec,
-    nodeStatuses: input.nodeStatuses,
-    patch,
-    roles: input.rolesMap,
-    isGitRepo: isGitRepo(input.cwd),
-  });
-  return { patch, validation };
 }

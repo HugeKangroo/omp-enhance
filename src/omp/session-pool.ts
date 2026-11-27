@@ -66,12 +66,6 @@ export class FlowSessionPool implements RoleSessionPoolLike {
     this.handles.set(handle.key, handle);
   }
 
-  getForkMessages(flowId: string, fromNodeId: string): any[] | null {
-    const src = this.getWarm(flowId, fromNodeId);
-    const msgs = src?.session?.messages;
-    return Array.isArray(msgs) && msgs.length > 0 ? msgs.map((m: any) => ({ ...m })) : null;
-  }
-
   async switchModelInPlace(
     flowId: string,
     nodeId: string,

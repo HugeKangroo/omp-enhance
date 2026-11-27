@@ -22,8 +22,13 @@ export interface RolePermissions {
 }
 
 export interface RoleExitSpec {
-  requireToolEvidence: boolean; requiredTools?: string[]; requiredArtifacts?: string[];
-  requireTestExecution?: boolean; requireAlgoDeliverables?: boolean; criteria: string[];
+  requireToolEvidence: boolean;
+  requiredTools?: string[];
+  requiredArtifacts?: string[];
+  requiredChecks?: string[];
+  requireTestExecution?: boolean;
+  requireAlgoDeliverables?: boolean;
+  criteria: string[];
 }
 
 export interface RoleSpec {

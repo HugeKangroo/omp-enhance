@@ -226,6 +226,10 @@ export function applyPhasePermissions(
   const mergedArtifacts = isFinalPhase
     ? [...new Set([...(baseRole.exit.requiredArtifacts ?? []), ...phaseArtifacts])]
     : phaseArtifacts;
+  const phaseChecks = phase.requiredChecks?.length ? [...phase.requiredChecks] : [];
+  const mergedChecks = isFinalPhase
+    ? [...new Set([...(baseRole.exit.requiredChecks ?? []), ...phaseChecks])]
+    : phaseChecks;
   const phaseRole: RoleSpec = {
     ...baseRole,
     workflow: undefined,
@@ -239,6 +243,7 @@ export function applyPhasePermissions(
       requireToolEvidence: baseRole.exit.requireToolEvidence,
       ...(isFinalPhase && baseRole.exit.requiredTools ? { requiredTools: [...baseRole.exit.requiredTools] } : {}),
       ...(mergedArtifacts.length > 0 ? { requiredArtifacts: mergedArtifacts } : {}),
+      ...(mergedChecks.length > 0 ? { requiredChecks: mergedChecks } : {}),
       ...(isFinalPhase && baseRole.exit.requireTestExecution ? { requireTestExecution: true } : {}),
       ...(isFinalPhase && baseRole.exit.requireAlgoDeliverables ? { requireAlgoDeliverables: true } : {}),
       criteria: phase.brief ? [phase.brief, ...baseRole.exit.criteria] : [...baseRole.exit.criteria],
@@ -267,7 +272,15 @@ export function resolveNodeEffectiveRole(
 ): { ok: true; role: RoleSpec } | { ok: false; reason: string } {
   const tooled = narrowRoleTools(baseRole, nodeSpec.tools);
   if (!tooled.ok) return tooled;
-  if (!nodeSpec.isWorkflowPhase) return narrowRolePermissions(tooled.role, nodeSpec.writableScope);
+  const attachNodeChecks = (role: RoleSpec): RoleSpec => {
+    if (!nodeSpec.requiredChecks?.length) return role;
+    const merged = [...new Set([...(role.exit.requiredChecks ?? []), ...nodeSpec.requiredChecks])];
+    return { ...role, exit: { ...role.exit, requiredChecks: merged } };
+  };
+  if (!nodeSpec.isWorkflowPhase) {
+    const narrowed = narrowRolePermissions(tooled.role, nodeSpec.writableScope);
+    return narrowed.ok ? { ok: true, role: attachNodeChecks(narrowed.role) } : narrowed;
+  }
   const res = applyPhasePermissions(
     tooled.role,
     {
@@ -276,6 +289,7 @@ export function resolveNodeEffectiveRole(
       ...(nodeSpec.writableScope ? { writable: nodeSpec.writableScope } : {}),
       ...(nodeSpec.lockedProtected ? { lockProtected: nodeSpec.lockedProtected } : {}),
       ...(nodeSpec.requiredArtifacts ? { exitArtifacts: nodeSpec.requiredArtifacts } : {}),
+      ...(nodeSpec.requiredChecks ? { requiredChecks: nodeSpec.requiredChecks } : {}),
       ...(typeof nodeSpec.brief === "string" ? { brief: nodeSpec.brief } : {}),
     },
     [],

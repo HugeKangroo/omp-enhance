@@ -77,11 +77,8 @@ export class FlowRoomManager {
     try { return JSON.parse(this.machineStateJson) as FlowMachineState; } catch { return null; }
   }
   isRunning(): boolean { return this.status === "running"; }
-  getLastHandoffId(): string | null { return this.lastHandoffId; }
-  getMandateId(): string { return this.mandateId; }
   getUserSteers(): readonly FlowUserSteer[] { return this.userSteers; }
   getAbortSignal(): AbortSignal | undefined { return this.flowAbortController?.signal; }
-  getLeaseToken(): string | null { return this.leaseToken; }
   hasActiveLeaseOwnership(): boolean {
     if (this.status !== "running" || !this.flowId) return false;
     if (!this.store || this.store.isClosed()) return true;

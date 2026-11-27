@@ -42,6 +42,11 @@ export function formatRuntimeVisionHint(
   return null;
 }
 
+export interface TrustedPeerRoleGroup {
+  cwd: string;
+  roles: readonly { id: string; name: string; description: string }[];
+}
+
 export interface RenderConditioningBlockInput {
   role: RoleSpec;
   mandate?: Mandate | null;
@@ -50,6 +55,7 @@ export interface RenderConditioningBlockInput {
   visionCapable?: boolean | null;
   userSteers?: readonly FlowUserSteer[];
   availableRoles?: readonly RoleSpec[];
+  trustedPeerRoles?: readonly TrustedPeerRoleGroup[];
   activeWorkloads?: readonly string[];
   maxEpistemicItems?: number;
 }
@@ -63,6 +69,7 @@ export function renderConditioningBlock(input: RenderConditioningBlockInput): st
     visionCapable,
     userSteers = [],
     availableRoles = [],
+    trustedPeerRoles = [],
     activeWorkloads = [],
     maxEpistemicItems = DEFAULT_MAX_EPISTEMIC_ITEMS,
   } = input;
@@ -114,6 +121,20 @@ export function renderConditioningBlock(input: RenderConditioningBlockInput): st
       "- algo: ground-truth empirical tuning in isolated algo_work/ with visual & human-alignment gates",
       "- vision: objective pixel/coordinate evidence from plots, sample overlays & curves",
       "- DAG presets (fan_out_join / contract_parallel_verify / experiment_loop / nodes): use for genuinely independent multi-module work (disjoint writableScope + auto git worktree + merge + zero-token gate + fresh reviewer); keep small/coupled tasks on a simple linear chain",
+      ...(trustedPeerRoles.length > 0
+        ? [
+            "",
+            "## Trusted Peer Project Roles",
+            "Note: Project-local specialists discovered in other trusted managed projects (specify their `cwd` when dispatching):",
+            ...trustedPeerRoles.flatMap((group) => [
+              `- Project ${sanitizeConditioningText(group.cwd)}:`,
+              ...group.roles.map(
+                (r) =>
+                  `  - ${r.id} (${sanitizeConditioningText(r.name)}): ${sanitizeConditioningText(r.description)}`,
+              ),
+            ]),
+          ]
+        : []),
       "",
       "## Coordinator Safety Gate & Human-Language Surface",
       'Host Advisor Note: Pre-dispatch conversational confirmation with the user before calling enhance_flow(action="start") is a mandatory user-configured safety gate — do NOT skip confirmation unless the user already explicitly told you to execute immediately.',

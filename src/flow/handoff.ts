@@ -137,8 +137,16 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
   }
 
   let verificationEvidence: VerificationEvidenceRecord[] | undefined;
-  if (input.verdict === "ready" && !input.isConsultation && input.role.exit.requireTestExecution) {
-    verificationEvidence = verifyQaTestExecution(input.role.id, observedCalls, after, input.store, input.stageId);
+  const hasRequiredChecks = (input.role.exit.requiredChecks?.length ?? 0) > 0;
+  if (input.verdict === "ready" && !input.isConsultation && (input.role.exit.requireTestExecution || hasRequiredChecks)) {
+    verificationEvidence = verifyQaTestExecution(
+      input.role.id,
+      observedCalls,
+      after,
+      input.store,
+      input.stageId,
+      input.role.exit.requiredChecks,
+    );
   }
 
   const existingMandate = input.mandate ?? input.store.getActiveMandate({

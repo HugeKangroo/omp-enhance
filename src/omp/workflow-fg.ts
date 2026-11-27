@@ -3,22 +3,17 @@ import type { FlowMachineState, RoleWorkflowPhaseSpec } from "../core/graph-type
 import { MUTATING_HOST_TOOLS } from "../core/policy.ts";
 import type { HandoffEnvelope, RoleSpec } from "../core/types.ts";
 import { validateFlowGraph } from "../flow/graph.ts";
+import {
+  evaluateHumanReply,
+  inferHumanNodeMode,
+  isStatusOrProgressQuery,
+} from "../flow/human-policy.ts";
 import { createInitialFlowState, transitionFlow } from "../flow/machine.ts";
 import { compileRoleWorkflow, type CompiledRoleWorkflow } from "../flow/workflow.ts";
 
-const MUTATING_SET = new Set<string>(MUTATING_HOST_TOOLS);
-const NEGATION_OR_DEFER_RE = /(?:不要|先不|先别|别[再继续批准同意通过放行]|暂缓|暂停|稍等|等等|再看看|再看|还没|尚未|不批准|不同意|不确认|不通过|拒绝|取消|算了|先看|先确认|等我|还要看|还需|hold\s*on|wait\b|not\s+yet|don'?t|do\s+not|cancel|reject|defer|later|stop\b)/i;
-const STATUS_QUERY_RE = /(?:进度|进展|状态|情况|到哪|卡在哪|卡在|怎么样|如何|还要多久|做完了吗|跑完了吗|为什么|什么意思|status|progress|update|how'?s|where are we|what'?s)/i;
-const QUESTION_END_RE = /(?:[?？]|(?:吗|呢|么)[？?。!！\s]*)$/;
+export { isStatusOrProgressQuery };
 
-export function isStatusOrProgressQuery(text: string): boolean {
-  const clean = text.trim();
-  if (!clean) return true;
-  if (NEGATION_OR_DEFER_RE.test(clean)) return true;
-  if (QUESTION_END_RE.test(clean)) return true;
-  if (STATUS_QUERY_RE.test(clean)) return true;
-  return false;
-}
+const MUTATING_SET = new Set<string>(MUTATING_HOST_TOOLS);
 
 interface ForegroundWorkflowEntry {
   roleId: string; roleSha: string; compiled: CompiledRoleWorkflow; state: FlowMachineState;
@@ -84,8 +79,13 @@ export class ForegroundWorkflowController {
           exit: { requireToolEvidence: false, criteria: [waitingHumanPrompt] },
         }
       : { ...phaseRole, id: role.id, name: role.name };
+    const humanCfg = spec.kind === "human" ? spec.human : undefined;
+    const humanMode = humanCfg ? inferHumanNodeMode(humanCfg) : "approval";
+    const optionsHint = humanCfg?.options?.length ? humanCfg.options.join(" / ") : "同意 / 暂缓";
     const promptNote = waitingHumanPrompt
-      ? `[Active Workflow Phase ${idx + 1}/${total}: ${shortPhaseId} (HUMAN GATE — AWAITING EXPLICIT USER CONFIRMATION)]\nQuestion awaiting user decision: ${waitingHumanPrompt}\nOffer clear options (同意 / 暂缓) alongside natural-language reply. Stay read-only on questions, status checks, or deferrals; only after explicit user confirmation in a new message, call enhance_handoff(verdict="ready", summary=...) to unlock the next phase.`
+      ? humanMode === "input"
+        ? `[Active Workflow Phase ${idx + 1}/${total}: ${shortPhaseId} (HUMAN GATE · INPUT — AWAITING USER SPECIFICATION)]\nQuestion awaiting user input: ${waitingHumanPrompt}\nStay read-only on questions, status checks, or deferrals; once the user supplies concrete parameters/preferences in a new message, call enhance_handoff(verdict="ready", summary=...) to unlock the next phase.`
+        : `[Active Workflow Phase ${idx + 1}/${total}: ${shortPhaseId} (HUMAN GATE — AWAITING EXPLICIT USER CONFIRMATION)]\nQuestion awaiting user decision: ${waitingHumanPrompt}\nOffer clear options (${optionsHint})${humanCfg?.allowFreeText === false ? " (must select one of the declared options)" : " alongside natural-language reply"}. Stay read-only on questions, status checks, or deferrals; only after explicit user confirmation in a new message, call enhance_handoff(verdict="ready", summary=...) to unlock the next phase.`
       : `[Active Workflow Phase ${idx + 1}/${total}: ${shortPhaseId}${spec.title ? ` — ${spec.title}` : ""}]\n${typeof spec.brief === "string" ? spec.brief : ""}\n${lockedProtected.length > 0 ? `Locked protected paths (DO NOT modify): ${lockedProtected.join(", ")}\n` : ""}Call enhance_handoff(verdict="ready", summary=...) when this phase's exit criteria are met to unlock the next phase.`;
     return {
       effectiveRole, phaseId: shortPhaseId, phaseIndex: idx, totalPhases: total,
@@ -108,8 +108,13 @@ export class ForegroundWorkflowController {
       if (!effTurnKey || effTurnKey === entry.pausedAtUserTurnKey || effTurnKey === entry.lastConsumedUserTurnKey) {
         return { advanced: false, gateError: "Human gate requires a new explicit user reply before advancing (same-turn or duplicate approvals are blocked)." };
       }
-      if (!effUserText || isStatusOrProgressQuery(effUserText)) {
-        return { advanced: false, gateError: "User's latest message is empty or a status/progress query rather than confirmation; human gate remains paused." };
+      const humanCfg = entry.state.spec.nodes.find((s) => s.id === waitingHumanId)?.human ?? { prompt: "" };
+      const evalRes = evaluateHumanReply(humanCfg, effUserText);
+      if (evalRes.decision !== "proceed") {
+        return {
+          advanced: false,
+          gateError: evalRes.reason ?? "User's latest message did not satisfy this human gate; phase remains paused.",
+        };
       }
       entry.lastConsumedUserTurnKey = effTurnKey;
       recordedReply = effUserText;
@@ -144,12 +149,5 @@ export class ForegroundWorkflowController {
     if (humanPrompt) entry.pausedAtUserTurnKey = entry.latestUserTurnKey ?? "__paused__";
     const shortNext = nextId && nextId.startsWith(`${input.role.id}__`) ? nextId.slice(input.role.id.length + 2) : nextId;
     return { advanced: true, ...(shortNext ? { nextPhaseId: shortNext } : {}), ...(humanPrompt ? { humanPrompt } : {}), ...(recordedReply ? { userReply: recordedReply } : {}) };
-  }
-
-  getPhaseSpec(sessionId: string): RoleWorkflowPhaseSpec | null {
-    const entry = this.bySession.get(sessionId);
-    if (!entry) return null;
-    const activeId = entry.state.nodeOrder.find((id) => entry.state.nodes[id]!.status === "running");
-    return activeId ? (entry.compiled.spec.nodes.find((n) => n.id === activeId) as unknown as RoleWorkflowPhaseSpec) ?? null : null;
   }
 }

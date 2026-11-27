@@ -2,7 +2,7 @@ import type { HandoffEnvelope, RoleSpec, VerificationEvidenceRecord } from "./ty
 
 export type NodeKind = "role" | "gate" | "merge" | "human";
 export type WorkspaceMode = "inherit" | "worktree";
-export type SessionReuseMode = "fresh" | "reuse" | "fork";
+export type SessionReuseMode = "fresh" | "reuse";
 export type JoinStrategy = "all" | "any";
 export type FlowLeaseMode = "read" | "write_main" | "write_worktree";
 export type FlowPreset = "linear" | "fan_out_join" | "contract_parallel_verify" | "experiment_loop" | "custom";
@@ -31,8 +31,15 @@ export interface MergeNodeConfig {
   conflictPolicy?: "spawn_resolver" | "ask_human" | "fail"; resolverRoleId?: string;
 }
 
+export type HumanNodeMode = "approval" | "input";
+export type HumanOptionAction = "proceed" | "hold" | "cancel";
+
 export interface HumanNodeConfig {
-  prompt: string; options?: string[]; allowFreeText?: boolean;
+  prompt: string;
+  options?: string[];
+  allowFreeText?: boolean;
+  mode?: HumanNodeMode;
+  optionActions?: Record<string, HumanOptionAction>;
 }
 
 export interface FlowNodeSpec {
@@ -40,9 +47,9 @@ export interface FlowNodeSpec {
   join?: JoinStrategy; brief?: NodeBrief | string; tools?: string[]; writableScope?: string[];
   workspace?: WorkspaceMode; worktreeGroup?: string;
   sessionMode?: SessionReuseMode; sessionGroup?: string; parentGroupId?: string;
-  phaseTools?: string[]; lockedProtected?: string[]; requiredArtifacts?: string[];
+  phaseTools?: string[]; lockedProtected?: string[]; requiredArtifacts?: string[]; requiredChecks?: string[];
   isWorkflowPhase?: boolean; isFinalWorkflowPhase?: boolean; localRepairBudget?: number;
-  forkFromNodeId?: string; fallbackModels?: string[]; repairTargetNodeId?: string;
+  fallbackModels?: string[]; repairTargetNodeId?: string;
   maxAttempts?: number; stallTimeoutSec?: number; skipOnUpstreamFail?: boolean;
   gate?: GateNodeConfig; merge?: MergeNodeConfig; human?: HumanNodeConfig;
 }
@@ -71,7 +78,7 @@ export interface FlowGraphPatch {
 export type GraphValidationIssueCode =
   | "empty_graph" | "invalid_node_id" | "duplicate_node_id" | "missing_dep"
   | "cycle_detected" | "invalid_node_config" | "unknown_role" | "internal_role_forbidden"
-  | "scope_violation" | "write_collision" | "invalid_repair_target" | "invalid_fork_source"
+  | "scope_violation" | "write_collision" | "invalid_repair_target"
   | "invalid_merge_source" | "worktree_requires_git" | "missing_merge_delivery";
 
 export interface GraphValidationIssue {
@@ -101,8 +108,9 @@ export interface RoleWorkflowExitGateSpec {
 
 export interface RoleWorkflowPhaseSpec {
   id: string; title?: string; kind?: "role" | "gate" | "human"; dependsOn?: string[];
-  tools?: string[]; writable?: string[]; lockProtected?: string[]; exitArtifacts?: string[];
+  tools?: string[]; writable?: string[]; lockProtected?: string[]; exitArtifacts?: string[]; requiredChecks?: string[];
   exitGate?: RoleWorkflowExitGateSpec; prompt?: string; brief?: string;
+  options?: string[]; allowFreeText?: boolean; mode?: HumanNodeMode; optionActions?: Record<string, HumanOptionAction>;
   maxAttempts?: number; fallbackModels?: string[];
 }
 
@@ -158,7 +166,7 @@ export type FlowCommand =
   | { type: "PREPARE_WORKTREE"; nodeId: string; worktreeGroup?: string; baseCommitSha?: string; dependsOn: string[] }
   | {
       type: "DISPATCH_ROLE_NODE"; nodeId: string; stageId: string; attempt: number; repairRound: number;
-      reuseSession: boolean; sessionGroup?: string; forkFromNodeId?: string; worktreePath?: string;
+      reuseSession: boolean; sessionGroup?: string; worktreePath?: string;
       targetCommitRef?: string; targetCommitSha?: string; modelOverride?: string;
       repairFeedback?: string; replyText?: string;
     }

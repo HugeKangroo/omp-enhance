@@ -85,7 +85,11 @@ export default function ompEnhance(pi: any, options: EnhanceOptions = {}): void 
         upstreamHandoff: mandate ? ws.store.getLatestHandoff(mandate.id) : null,
         visionCapable: modelSupportsVision(effectiveModel),
         ...(canRoleDispatch(effectiveRole)
-          ? { availableRoles: [...ws.roles.values()], activeWorkloads: hub.collectActiveWorkloads() }
+          ? {
+              availableRoles: [...ws.roles.values()],
+              trustedPeerRoles: hub.collectTrustedPeerRoles(ws, ctx),
+              activeWorkloads: hub.collectActiveWorkloads(),
+            }
           : {}),
       });
       const block = fgPhase ? `${baseBlock}\n\n${fgPhase.promptNote}` : baseBlock;

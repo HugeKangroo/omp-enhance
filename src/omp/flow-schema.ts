@@ -5,6 +5,7 @@ export interface SchemaKitLike {
   arr: (item: unknown) => unknown;
   en: (values: readonly string[]) => unknown;
   anyOf?: (variants: readonly unknown[]) => unknown;
+  rec?: (value: unknown) => unknown;
   obj: (props: Record<string, unknown>, req: string[]) => unknown;
 }
 
@@ -27,15 +28,23 @@ export function buildFlowToolParameters(kit: SchemaKitLike): unknown {
   };
   const nodeMergeCfg = kit.obj(mergeProps, ["sourceNodeIds"]);
   const presetMergeCfg = kit.obj(mergeProps, []);
-  const humanCfg = kit.obj({ prompt: kit.str(), options: kit.arr(kit.str()), allowFreeText: kit.bool() }, ["prompt"]);
+  const humanActionEnum = kit.en(["proceed", "hold", "cancel"]);
+  const humanCfg = kit.obj({
+    prompt: kit.str(),
+    options: kit.arr(kit.str()),
+    allowFreeText: kit.bool(),
+    mode: kit.en(["approval", "input"]),
+    ...(kit.rec ? { optionActions: kit.rec(humanActionEnum) } : {}),
+  }, ["prompt"]);
 
   const nodeSchema = kit.obj({
     id: kit.str(), title: kit.str(), kind: kit.en(["role", "gate", "merge", "human"]),
     role: kit.str(), dependsOn: kit.arr(kit.str()), join: kit.en(["all", "any"]), brief,
-    tools: kit.arr(kit.str()), writableScope: kit.arr(kit.str()), workspace: wsEnum,
-    sessionMode: kit.en(["fresh", "reuse"]), sessionGroup: kit.str(), fallbackModels: kit.arr(kit.str()),
-    repairTargetNodeId: kit.str(), maxAttempts: kit.num(), stallTimeoutSec: kit.num(),
-    skipOnUpstreamFail: kit.bool(), gate: gateCfg, merge: nodeMergeCfg, human: humanCfg,
+    tools: kit.arr(kit.str()), writableScope: kit.arr(kit.str()), requiredChecks: kit.arr(kit.str()),
+    workspace: wsEnum, sessionMode: kit.en(["fresh", "reuse"]), sessionGroup: kit.str(),
+    fallbackModels: kit.arr(kit.str()), repairTargetNodeId: kit.str(), maxAttempts: kit.num(),
+    stallTimeoutSec: kit.num(), skipOnUpstreamFail: kit.bool(),
+    gate: gateCfg, merge: nodeMergeCfg, human: humanCfg,
   }, ["id"]);
 
   const shardSchema = kit.obj({

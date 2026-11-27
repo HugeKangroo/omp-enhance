@@ -109,25 +109,46 @@ export function emitTerminalCleanup(next: FlowMachineState, commands: FlowComman
   commands.push({ type: "WAKE_COORDINATOR", kind, summary: next.reason ?? next.spec.goal });
 }
 
-function findUpstreamPreviewMerge(state: FlowMachineState, nodeId: string): { commitRef: string; commitSha?: string } | null {
+function findUpstreamCommitBase(state: FlowMachineState, nodeId: string): { commitRef: string; commitSha?: string } | null {
   const ancestors = computeAncestorMap(state.spec.nodes).get(nodeId);
   if (!ancestors || ancestors.size === 0) return null;
   const specById = new Map(state.spec.nodes.map((n) => [n.id, n]));
-  const previewMerges = [...ancestors]
+  const allMerges = [...ancestors]
     .map((id) => ({ id, spec: specById.get(id), rt: state.nodes[id] }))
-    .filter((c) => c.spec?.kind === "merge" && c.spec.merge?.landingMode === "branch_preview" && Boolean(c.rt?.commitRef || c.rt?.commitSha));
-  if (previewMerges.length === 0) return null;
+    .filter((c) => c.spec?.kind === "merge" && c.rt?.status === "succeeded" && Boolean(c.rt?.commitSha || c.rt?.commitRef))
+    .sort((a, b) => b.rt!.waveIndex - a.rt!.waveIndex);
+  if (allMerges.length === 0) return null;
+  const latestMerge = allMerges[0]!;
+  const latestMergeWave = latestMerge.rt!.waveIndex;
+  const isLatestPreview = latestMerge.spec!.merge?.landingMode === "branch_preview";
+  if (!isLatestPreview) {
+    const sha = latestMerge.rt!.commitSha ?? undefined;
+    return sha ? { commitRef: sha, commitSha: sha } : null;
+  }
   const previewCommits = [...ancestors]
     .map((id) => ({ id, spec: specById.get(id), rt: state.nodes[id] }))
     .filter((c) => {
-      if (c.spec?.kind === "merge" && c.spec.merge?.landingMode === "branch_preview") return Boolean(c.rt?.commitRef || c.rt?.commitSha);
-      return c.spec?.kind === "role" && Boolean(c.rt?.commitSha);
+      if (!c.rt || c.rt.waveIndex < latestMergeWave) return false;
+      if (c.spec?.kind === "merge" && c.spec.merge?.landingMode === "branch_preview") return Boolean(c.rt.commitRef || c.rt.commitSha);
+      return c.spec?.kind === "role" && Boolean(c.rt.commitSha);
     })
-    .sort((a, b) => (b.rt!.waveIndex - a.rt!.waveIndex));
+    .sort((a, b) => b.rt!.waveIndex - a.rt!.waveIndex);
   const hit = previewCommits[0]?.rt;
   if (!hit) return null;
   const ref = hit.commitRef ?? state.mergedRef ?? hit.commitSha!;
   return { commitRef: ref, ...(hit.commitSha ? { commitSha: hit.commitSha } : {}) };
+}
+
+function findUpstreamPreviewMerge(state: FlowMachineState, nodeId: string): { commitRef: string; commitSha?: string } | null {
+  const ancestors = computeAncestorMap(state.spec.nodes).get(nodeId);
+  if (!ancestors || ancestors.size === 0) return null;
+  const specById = new Map(state.spec.nodes.map((n) => [n.id, n]));
+  const allMerges = [...ancestors]
+    .map((id) => ({ id, spec: specById.get(id), rt: state.nodes[id] }))
+    .filter((c) => c.spec?.kind === "merge" && c.rt?.status === "succeeded" && Boolean(c.rt?.commitSha || c.rt?.commitRef))
+    .sort((a, b) => b.rt!.waveIndex - a.rt!.waveIndex);
+  if (allMerges.length === 0 || allMerges[0]!.spec!.merge?.landingMode !== "branch_preview") return null;
+  return findUpstreamCommitBase(state, nodeId);
 }
 
 export function dispatchSingleNode(
@@ -147,10 +168,10 @@ export function dispatchSingleNode(
     } else {
       rt.status = "running";
       if (!rt.startedAt) rt.startedAt = nowIso;
-      const preview = findUpstreamPreviewMerge(next, nodeId);
+      const base = findUpstreamCommitBase(next, nodeId);
       commands.push({
         type: "PREPARE_WORKTREE", nodeId, ...(spec.worktreeGroup ? { worktreeGroup: spec.worktreeGroup } : {}),
-        ...(preview?.commitSha ? { baseCommitSha: preview.commitSha } : {}), dependsOn: [...spec.dependsOn],
+        ...(base?.commitSha ? { baseCommitSha: base.commitSha } : {}), dependsOn: [...spec.dependsOn],
       });
       return;
     }
@@ -176,7 +197,6 @@ export function dispatchSingleNode(
     commands.push({
       type: "DISPATCH_ROLE_NODE", nodeId, stageId, attempt: rt.attempt, repairRound: rt.repairRound, reuseSession,
       ...(spec.sessionGroup ? { sessionGroup: spec.sessionGroup } : {}),
-      ...(spec.sessionMode === "fork" && spec.forkFromNodeId ? { forkFromNodeId: spec.forkFromNodeId } : {}),
       ...(rt.worktreePath ? { worktreePath: rt.worktreePath } : {}),
       ...(preview ? { targetCommitRef: preview.commitRef, ...(preview.commitSha ? { targetCommitSha: preview.commitSha } : {}) } : {}),
       ...(extra?.modelOverride ? { modelOverride: extra.modelOverride } : {}),
@@ -194,10 +214,10 @@ export function dispatchSingleNode(
   } else if (spec.kind === "merge") {
     const sourceRefs: Record<string, string> = {};
     for (const srcId of spec.merge!.sourceNodeIds) { const ref = next.nodes[srcId]?.commitRef; if (ref) sourceRefs[srcId] = ref; }
-    const preview = findUpstreamPreviewMerge(next, nodeId);
+    const base = findUpstreamCommitBase(next, nodeId);
     commands.push({
       type: "RUN_MERGE_NODE", nodeId, stageId, attempt: rt.attempt, sourceNodeIds: [...spec.merge!.sourceNodeIds], sourceRefs,
-      ...(preview?.commitSha ? { baseCommitSha: preview.commitSha } : {}), config: spec.merge!,
+      ...(base?.commitSha ? { baseCommitSha: base.commitSha } : {}), config: spec.merge!,
     });
   }
 }
@@ -277,10 +297,11 @@ export function evaluateFlowSettlement(
   }
   if (active) return;
   const pick = (st: NodeStatus) => next.nodeOrder.find((id) => next.nodes[id]!.status === st);
-  const viol = pick("violation"), blocked = pick("blocked"), failed = pick("failed");
+  const viol = pick("violation"), blocked = pick("blocked"), failed = pick("failed"), cancelled = pick("cancelled");
   if (viol) { next.status = "violation"; next.endedAt = nowIso; next.reason = next.nodes[viol]!.lastError ?? `Node "${viol}" violated boundaries.`; emitTerminalCleanup(next, commands); return; }
   if (blocked) { next.status = "blocked"; next.endedAt = nowIso; next.reason = next.nodes[blocked]!.lastError ?? next.nodes[blocked]!.lastHandoff?.summary ?? `Node "${blocked}" blocked.`; emitTerminalCleanup(next, commands); return; }
   if (failed) { next.status = "failed"; next.endedAt = nowIso; next.reason = next.nodes[failed]!.lastError ?? `Node "${failed}" failed.`; emitTerminalCleanup(next, commands); return; }
+  if (cancelled) { next.status = "cancelled"; next.endedAt = nowIso; next.reason = next.nodes[cancelled]!.lastError ?? `Node "${cancelled}" cancelled by user.`; emitTerminalCleanup(next, commands); return; }
   if (statuses.every((s) => s === "succeeded" || s === "skipped")) {
     const succeededMerges = next.spec.nodes.filter((n) => n.kind === "merge" && next.nodes[n.id]!.status === "succeeded");
     const deliveredSources = new Set(succeededMerges.flatMap((n) => n.merge?.sourceNodeIds ?? []));

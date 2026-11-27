@@ -10,7 +10,11 @@ const repoRoot = path.resolve(import.meta.dir, "..");
 const defaultOmp = path.join(homedir(), ".local", "bin", "omp");
 const ompBin = process.env.OMP_BIN ?? process.env.OMP_COMMAND ?? (existsSync(defaultOmp) ? defaultOmp : "omp");
 
-export type EvalArm = "vanilla-omp" | "single-planner" | "coord-planner-reviewer";
+export type EvalArm =
+  | "vanilla-omp"
+  | "single-planner"
+  | "coord-planner-reviewer"
+  | "coord-autonomous";
 
 export interface CiPilotCaseSpec {
   id: string;
@@ -19,6 +23,8 @@ export interface CiPilotCaseSpec {
   expectedAbstain: boolean;
   rootCauseFile?: string;
   mechanismKeywords: string[];
+  contradictionPatterns?: RegExp[];
+  nonAnswerPatterns?: RegExp[];
   requiredEvidenceFiles: string[];
   nextStepKeywords: string[];
   setup(caseDir: string): { baseCommit: string; headCommit: string };
@@ -32,6 +38,7 @@ export interface CitationCheckResult {
 export interface RubricScore {
   passed: boolean;
   rootCauseOrAbstentionOk: boolean;
+  noContradictionOrNonAnswer: boolean;
   citationsValid: boolean;
   citedRequiredEvidence: boolean;
   actionableStepOk: boolean;
@@ -51,8 +58,13 @@ export interface PilotTrialRecord {
   costUsd: number;
   failed: boolean;
   error?: string;
+  /** Pure user-visible final reply (used for primary scoring and blind review). */
   responseText: string;
+  /** Internal specialist handoff trace (scored separately; NEVER concatenated into responseText or blind bundle). */
+  internalTraceSummary?: string;
+  executedRoles?: string[];
   score: RubricScore;
+  traceScore?: RubricScore;
 }
 
 export interface BlindReviewItem {
@@ -101,6 +113,11 @@ export const PILOT_CASES: readonly CiPilotCaseSpec[] = [
     expectedAbstain: false,
     rootCauseFile: "src/settlement/window.ts",
     mechanismKeywords: ["utc", "timezone", "时区", "t00:00:00", "los_angeles"],
+    contradictionPatterns: [
+      /(?:已?排除|并非|不是|与.{0,8}无关|not caused by|ruled out|unrelated to).{0,28}(?:时区|timezone|utc|window\.ts|date\b)/i,
+      /(?:时区|timezone|utc|window\.ts).{0,20}(?:已?排除|不是根因|并非根因|无关|ruled out|not the root cause)/i,
+      /(?:根因|真正原因|主因|root cause).{0,12}(?:是|在于|为|is)\s*(?:连接池|数据库|网络|内存泄漏|并发竞争|connection pool|database|oom|race condition)/i,
+    ],
     requiredEvidenceFiles: ["src/settlement/window.ts", "ci/failing-build-418.log"],
     nextStepKeywords: ["tz=", "utc", "settlement.test", "window.ts"],
     setup(caseDir) {
@@ -204,6 +221,11 @@ export const PILOT_CASES: readonly CiPilotCaseSpec[] = [
     expectedAbstain: false,
     rootCauseFile: "src/config/loader.ts",
     mechanismKeywords: ["string", "number", "webhook_max_retries", "01", "字符串", "类型"],
+    contradictionPatterns: [
+      /(?:已?排除|并非|不是|与.{0,8}无关|not caused by|ruled out|unrelated to).{0,28}(?:字符串|类型|webhook_max_retries|loader\.ts|coercion|string)/i,
+      /(?:字符串|类型|webhook_max_retries|loader\.ts).{0,20}(?:已?排除|不是根因|并非根因|无关|ruled out|not the root cause)/i,
+      /(?:根因|真正原因|主因|root cause).{0,12}(?:是|在于|为|is)\s*(?:连接池|时区|数据库|网络|内存泄漏|connection pool|timezone|database|oom)/i,
+    ],
     requiredEvidenceFiles: ["src/config/loader.ts", "ci/failing-build-502.log"],
     nextStepKeywords: ["webhook_max_retries", "loader.ts", "number", "retry"],
     setup(caseDir) {
@@ -366,6 +388,27 @@ export function verifyCitations(caseDir: string, text: string): CitationCheckRes
   return { validCitations, invalidCitations };
 }
 
+const DEFAULT_NON_ANSWER_PATTERNS: readonly RegExp[] = [
+  /(?:下轮再(?:调查|分析|排查|定位)|下一轮再(?:查|调查|分析|排查)|稍后再(?:调查|分析|排查)|暂未(?:调查|排查|定位)|还没来得及(?:查|调查|分析)|will investigate (?:in the )?next turn|investigate later)/i,
+];
+
+const BLIND_REVIEW_LEAK_PATTERNS: readonly RegExp[] = [
+  /\[(?:planner|reviewer|dev|qa|algo|vision|coordinator)\s+handoff\]/i,
+  /\b(?:vanilla-omp|single-planner|coord-planner-reviewer|coord-autonomous)\b/i,
+  /\benhance_(?:flow|handoff|mandate|job)\b/i,
+];
+
+export function detectBlindReviewLeaks(item: BlindReviewItem): string[] {
+  const leaks: string[] = [];
+  if ("arm" in (item as unknown as Record<string, unknown>)) leaks.push("field:arm");
+  if ("internalTraceSummary" in (item as unknown as Record<string, unknown>)) leaks.push("field:internalTraceSummary");
+  for (const re of BLIND_REVIEW_LEAK_PATTERNS) {
+    const m = re.exec(item.responseText);
+    if (m) leaks.push(m[0]);
+  }
+  return leaks;
+}
+
 export function scoreCaseOutput(spec: CiPilotCaseSpec, caseDir: string, responseText: string): RubricScore {
   const lower = responseText.toLowerCase();
   const citations = verifyCitations(caseDir, responseText);
@@ -374,19 +417,26 @@ export function scoreCaseOutput(spec: CiPilotCaseSpec, caseDir: string, response
   const actionableStepOk = spec.nextStepKeywords.some((kw) => lower.includes(kw.toLowerCase()));
   const notes: string[] = [];
 
+  const nonAnswerMatchers = [...DEFAULT_NON_ANSWER_PATTERNS, ...(spec.nonAnswerPatterns ?? [])];
+  const hitNonAnswer = nonAnswerMatchers.some((re) => re.test(responseText));
+  const hitContradiction = (spec.contradictionPatterns ?? []).some((re) => re.test(responseText));
+  const noContradictionOrNonAnswer = !hitNonAnswer && !hitContradiction;
+  if (hitNonAnswer) notes.push("Response deferred investigation (non-answer) instead of delivering a diagnosis.");
+  if (hitContradiction) notes.push("Response contradicted the true root cause or blamed an unrelated culprit.");
+
   let rootCauseOrAbstentionOk = false;
   if (spec.expectedAbstain) {
     const statedInsufficient = spec.mechanismKeywords.some((kw) => lower.includes(kw.toLowerCase()));
     const fabricatedCertainCulprit =
-      /(?:唯一根因是|根因已确认为|root cause is definitely|caused by a bug in)\s*`?src\//i.test(responseText);
-    rootCauseOrAbstentionOk = statedInsufficient && !fabricatedCertainCulprit;
+      /(?:唯一根因是|根因已确认为|已经?确定根因|肯定是因为|root cause is definitely|caused by a bug in)\s*`?src\//i.test(responseText);
+    rootCauseOrAbstentionOk = statedInsufficient && !fabricatedCertainCulprit && noContradictionOrNonAnswer;
     if (!statedInsufficient) notes.push("Did not explicitly state that log evidence is insufficient.");
     if (fabricatedCertainCulprit) notes.push("Fabricated a definitive source-file bug despite truncated log.");
   } else {
     const hitFile = Boolean(spec.rootCauseFile && responseText.includes(spec.rootCauseFile));
     const hitMechanism = spec.mechanismKeywords.some((kw) => lower.includes(kw.toLowerCase()));
     const wronglyAbstained = /(?:证据不足以确定|无法定位根因|insufficient evidence to identify)/.test(lower) && !hitFile;
-    rootCauseOrAbstentionOk = hitFile && hitMechanism && !wronglyAbstained;
+    rootCauseOrAbstentionOk = hitFile && hitMechanism && !wronglyAbstained && noContradictionOrNonAnswer;
     if (!hitFile) notes.push(`Missing root cause file ${spec.rootCauseFile}.`);
     if (!hitMechanism) notes.push("Missing causal mechanism explanation.");
   }
@@ -395,8 +445,9 @@ export function scoreCaseOutput(spec: CiPilotCaseSpec, caseDir: string, response
   if (!actionableStepOk) notes.push("Missing discriminating verification or evidence-collection step.");
 
   return {
-    passed: rootCauseOrAbstentionOk && citationsValid && citedRequiredEvidence && actionableStepOk,
+    passed: rootCauseOrAbstentionOk && noContradictionOrNonAnswer && citationsValid && citedRequiredEvidence && actionableStepOk,
     rootCauseOrAbstentionOk,
+    noContradictionOrNonAnswer,
     citationsValid,
     citedRequiredEvidence,
     actionableStepOk,
@@ -467,6 +518,28 @@ function runDryRunSelfCheck(sandboxRoot: string): void {
   );
   assert(!c1BadLine.passed && !c1BadLine.citationsValid, "Expected out-of-bounds line citation (window.ts:999) to fail.");
 
+  // 1b) Contradiction negative check: mentions real keywords/files yet rules out timezone and blames connection pool
+  const c1Contradiction = scoreCaseOutput(
+    PILOT_CASES[0]!,
+    c1Dir,
+    "查看 src/settlement/window.ts:10 和 ci/failing-build-418.log:1 后，已排除时区和 UTC 解析问题，真正根因是连接池太小导致超时。建议运行 TZ=UTC bun test test/settlement.test.ts 复验。",
+  );
+  assert(
+    !c1Contradiction.passed && !c1Contradiction.noContradictionOrNonAnswer,
+    `Expected opposite-conclusion contradiction to fail: ${JSON.stringify(c1Contradiction)}`,
+  );
+
+  // 1c) Non-answer / deferred investigation negative check
+  const c1Deferred = scoreCaseOutput(
+    PILOT_CASES[0]!,
+    c1Dir,
+    "已读取 ci/failing-build-418.log:1 与 src/settlement/window.ts:10（UTC 时区相关），下轮再调查具体原因并运行 TZ=UTC bun test test/settlement.test.ts。",
+  );
+  assert(
+    !c1Deferred.passed && !c1Deferred.noContradictionOrNonAnswer,
+    `Expected deferred non-answer to fail: ${JSON.stringify(c1Deferred)}`,
+  );
+
   // 2) Case 2 positive check
   const c2Dir = path.join(sandboxRoot, "case-2-env-schema-coercion");
   const c2Good = scoreCaseOutput(
@@ -501,7 +574,15 @@ function runDryRunSelfCheck(sandboxRoot: string): void {
     {
       trialId: randomUUID(), caseId: PILOT_CASES[0]!.id, arm: "coord-planner-reviewer", model: "dry-run",
       durationMs: 0, inputTokens: 0, outputTokens: 0, costUsd: 0, failed: false,
-      responseText: "Case 1 sample B", score: c1Good,
+      responseText: "Case 1 sample B",
+      internalTraceSummary: "[planner handoff]: internal only, must never appear in blind review",
+      score: c1Good,
+    },
+    {
+      trialId: randomUUID(), caseId: PILOT_CASES[0]!.id, arm: "coord-autonomous", model: "dry-run",
+      durationMs: 0, inputTokens: 0, outputTokens: 0, costUsd: 0, failed: false,
+      responseText: "Case 1 autonomous sample",
+      score: c1Good,
     },
     {
       trialId: randomUUID(), caseId: PILOT_CASES[2]!.id, arm: "single-planner", model: "dry-run",
@@ -511,9 +592,10 @@ function runDryRunSelfCheck(sandboxRoot: string): void {
   );
 
   const bundle = buildBlindReviewBundle(syntheticTrials);
-  assert(bundle.blindItems.length === 3, "Expected 3 blind review items.");
+  assert(bundle.blindItems.length === 4, "Expected 4 blind review items.");
   for (const item of bundle.blindItems) {
-    assert(!("arm" in item), "Blind review item must not leak arm identity.");
+    const leaks = detectBlindReviewLeaks(item);
+    assert(leaks.length === 0, `Blind review item leaked arm/internal markers: ${leaks.join(", ")}`);
     assert(Boolean(bundle.answerKey[item.candidateId]), `Missing answerKey entry for ${item.candidateId}`);
   }
 
@@ -523,7 +605,7 @@ function runDryRunSelfCheck(sandboxRoot: string): void {
         ok: true,
         mode: "dry-run",
         casesVerified: PILOT_CASES.map((c) => c.id),
-        rubricChecksPassed: 5,
+        rubricChecksPassed: 8,
         blindCandidatesGenerated: bundle.blindItems.length,
       },
       null,
@@ -672,17 +754,20 @@ async function runLiveArmTrial(options: {
       await waitUntil(() => responseIds.has("c1"), 20_000);
     }
 
+    const isFixedChainArm = options.arm === "single-planner" || options.arm === "coord-planner-reviewer";
     const rolesChain = options.arm === "single-planner" ? '["planner"]' : '["planner", "reviewer"]';
     const promptMsg = options.arm === "vanilla-omp"
       ? diagnosisPrompt
-      : `无需询问确认，我已授权立即执行：请直接调用 enhance_flow(action="start", roles=${rolesChain}, goal=${JSON.stringify(diagnosisPrompt)}, wait=true)，完成后将专员核实的根因/证据不足结论、精确文件行号引用与下一步复验/取证动作完整汇报给我。`;
+      : options.arm === "coord-autonomous"
+        ? `无需询问确认，我已授权立即执行（严格只读，严禁修改工作区文件）。请根据任务复杂度自行判断是否直接诊断或委派给合适的只读专员协作，并最终直接给我完整、可核验的结论：\n\n${diagnosisPrompt}`
+        : `无需询问确认，我已授权立即执行：请直接调用 enhance_flow(action="start", roles=${rolesChain}, goal=${JSON.stringify(diagnosisPrompt)}, wait=true)，完成后将专员核实的根因/证据不足结论、精确文件行号引用与下一步复验/取证动作完整汇报给我。`;
 
     const beforeEnds = agentEnds;
     proc.stdin.write(`${JSON.stringify({ id: "diag", type: "prompt", message: promptMsg })}\n`);
     await proc.stdin.flush();
     let ok = await waitUntil(() => agentEnds > beforeEnds, 240_000);
 
-    if (ok && options.arm !== "vanilla-omp" && countRecordedHandoffs() === 0 && proc.exitCode === null) {
+    if (ok && isFixedChainArm && countRecordedHandoffs() === 0 && proc.exitCode === null) {
       const retryEnds = agentEnds;
       const confirmMsg = `好，确认立即执行！请现在直接调用 enhance_flow(action="start", roles=${rolesChain}, goal=${JSON.stringify(diagnosisPrompt)}, wait=true) 并将核实后的完整结论与精确行号汇报给我。`;
       proc.stdin.write(`${JSON.stringify({ id: "diag2", type: "prompt", message: confirmMsg })}\n`);
@@ -713,8 +798,9 @@ async function runLiveArmTrial(options: {
     }
   }
 
-  // Include specialist handoff usage (all stages/rounds) + latest ready handoff per role from state.sqlite.
-  let combinedText = assistantTexts.at(-1) ?? "";
+  // Keep primary responseText strictly user-visible; score internal specialist handoff trace separately.
+  const userVisibleResponse = assistantTexts.at(-1) ?? "";
+  const traceSections: string[] = [];
   const executedRoles = new Set<string>();
   if (existsSync(dbPath)) {
     const store = new EnhanceStore(dbPath);
@@ -730,13 +816,14 @@ async function runLiveArmTrial(options: {
         if (h.fromRole !== "user" && h.verdict === "ready" && !seenReadyRole.has(h.fromRole)) {
           seenReadyRole.add(h.fromRole);
           const factLines = h.verifiedFacts.map((f) => `- ${f.claim} (${f.evidenceRef})`).join("\n");
-          combinedText += `\n\n[${h.fromRole} handoff]: ${h.summary}\n${factLines}`;
+          traceSections.push(`[${h.fromRole} handoff]: ${h.summary}${factLines ? `\n${factLines}` : ""}`);
         }
       }
     } finally {
       store.close();
     }
   }
+  const internalTraceSummary = traceSections.length > 0 ? traceSections.join("\n\n") : undefined;
 
   if (!failed && options.arm === "single-planner" && !executedRoles.has("planner")) {
     failed = true;
@@ -755,7 +842,8 @@ async function runLiveArmTrial(options: {
     errorMsg = "Read-only diagnosis trial mutated workspace files.";
   }
 
-  const score = scoreCaseOutput(options.spec, caseDir, combinedText);
+  const score = scoreCaseOutput(options.spec, caseDir, userVisibleResponse);
+  const traceScore = internalTraceSummary ? scoreCaseOutput(options.spec, caseDir, internalTraceSummary) : undefined;
   return {
     trialId,
     caseId: options.spec.id,
@@ -767,8 +855,11 @@ async function runLiveArmTrial(options: {
     costUsd: Math.round(costUsd * 1_000_000) / 1_000_000,
     failed,
     ...(errorMsg ? { error: errorMsg } : {}),
-    responseText: combinedText,
+    responseText: userVisibleResponse,
+    ...(internalTraceSummary ? { internalTraceSummary } : {}),
+    ...(executedRoles.size > 0 ? { executedRoles: [...executedRoles].sort() } : {}),
     score,
+    ...(traceScore ? { traceScore } : {}),
   };
 }
 
@@ -788,7 +879,16 @@ async function main(): Promise<void> {
     }
 
     assert(existsSync(ompBin), `omp binary not found at ${ompBin}`);
-    const arms: EvalArm[] = ["vanilla-omp", "single-planner", "coord-planner-reviewer"];
+    const armsIdx = argv.indexOf("--arms");
+    const defaultArms: EvalArm[] = ["vanilla-omp", "single-planner", "coord-planner-reviewer", "coord-autonomous"];
+    const validArmSet = new Set<EvalArm>(defaultArms);
+    const arms: EvalArm[] = armsIdx >= 0 && argv[armsIdx + 1]
+      ? argv[armsIdx + 1]!
+          .split(",")
+          .map((s) => s.trim() as EvalArm)
+          .filter((a) => validArmSet.has(a))
+      : defaultArms;
+    assert(arms.length > 0, "At least one valid --arms value is required.");
     const trials: PilotTrialRecord[] = [];
 
     for (const spec of PILOT_CASES) {

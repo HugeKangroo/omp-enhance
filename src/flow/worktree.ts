@@ -221,13 +221,17 @@ export function createGitWorktreeManager(): WorktreeManagerLike {
       const entries = Object.entries(sourceRefs).filter(([, ref]) => Boolean(ref));
       if (entries.length === 0) return { ok: true, mergedRef: null, mergedCommitSha: null, summary: "No changes to merge across parallel worktrees." };
       const { gitRoot } = resolveGitLayout(cwd);
-      const baseRef = baseCommitSha ?? captureOrGetBaseRef(gitRoot, flowId);
+      const workspaceBaseRef = captureOrGetBaseRef(gitRoot, flowId);
+      const mergeCheckoutRef = baseCommitSha ?? workspaceBaseRef;
+      const landedRefName = `${flowRefPrefix(flowId)}/landed`;
+      const landedExisting = runGit(gitRoot, ["rev-parse", "--verify", landedRefName]);
+      const landingBaseRef = landedExisting.ok && landedExisting.stdout ? landedExisting.stdout : workspaceBaseRef;
       const root = worktreeRoot(gitRoot, flowId);
       mkdirSync(root, { recursive: true });
       const mergeWt = path.join(root, `_merge-${safeToken(nodeId)}`);
       if (existsSync(mergeWt)) removeWorktreeSafe(gitRoot, mergeWt);
       runGit(gitRoot, ["worktree", "prune"]);
-      const addWt = runGit(gitRoot, ["worktree", "add", "--detach", mergeWt, baseRef]);
+      const addWt = runGit(gitRoot, ["worktree", "add", "--detach", mergeWt, mergeCheckoutRef]);
       if (!addWt.ok) return { ok: false, summary: `Failed to create merge worktree: ${addWt.stderr}` };
 
       try {
@@ -241,10 +245,8 @@ export function createGitWorktreeManager(): WorktreeManagerLike {
           }
         }
         const mergedSha = runGit(mergeWt, ["rev-parse", "HEAD"]).stdout;
-        const mergedRef = `${flowRefPrefix(flowId)}/merged`;
-        runGit(gitRoot, ["update-ref", mergedRef, mergedSha]);
+        const stat = runGit(gitRoot, ["diff", "--stat", landingBaseRef, mergedSha]).stdout;
 
-        const stat = runGit(gitRoot, ["diff", "--stat", baseRef, mergedSha]).stdout;
         if (landingMode === "branch_preview") {
           const br = createOrUpdatePreviewBranch(gitRoot, flowId, mergedSha);
           if (!br.ok) return { ok: false, mergedCommitSha: mergedSha, summary: br.error };
@@ -254,13 +256,13 @@ export function createGitWorktreeManager(): WorktreeManagerLike {
           };
         }
 
-        const touchedRes = runGit(gitRoot, ["diff", "--name-only", baseRef, mergedSha]);
+        const touchedRes = runGit(gitRoot, ["diff", "--name-only", landingBaseRef, mergedSha]);
         const touchedFiles = touchedRes.ok && touchedRes.stdout ? touchedRes.stdout.split("\n").map((s) => s.trim()).filter(Boolean) : [];
-        const patchRes = runGitBuf(gitRoot, ["diff", "--binary", baseRef, mergedSha]);
+        const patchRes = runGitBuf(gitRoot, ["diff", "--binary", landingBaseRef, mergedSha]);
         if (!patchRes.ok) return { ok: false, summary: `Failed to compute merged diff: ${patchRes.stderr}` };
         const patchBuf = patchRes.stdout;
         if (patchBuf.length > 0) {
-          const driftReasons = checkTouchedFilesDrift(gitRoot, flowId, baseRef, touchedFiles);
+          const driftReasons = checkTouchedFilesDrift(gitRoot, flowId, landingBaseRef, touchedFiles);
           const dryRun = driftReasons.length === 0
             ? spawnSync("git", ["apply", "--check", "--whitespace=nowarn"], { cwd: gitRoot, input: patchBuf })
             : { status: 1, stderr: "" };
@@ -283,9 +285,10 @@ export function createGitWorktreeManager(): WorktreeManagerLike {
             };
           }
         }
+        runGit(gitRoot, ["update-ref", landedRefName, mergedSha]);
         return {
-          ok: true, mergedRef, mergedCommitSha: mergedSha,
-          summary: `Merged and landed ${entries.length} parallel worktree(s) cleanly.${stat ? ` (${stat.split("\n").at(-1)?.trim() ?? ""})` : ""}`,
+          ok: true, mergedRef: null, mergedCommitSha: mergedSha,
+          summary: `Merged and applied ${entries.length} parallel worktree(s) cleanly to main workspace.${stat ? ` (${stat.split("\n").at(-1)?.trim() ?? ""})` : ""}`,
         };
       } finally {
         removeWorktreeSafe(gitRoot, mergeWt);

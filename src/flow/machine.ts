@@ -6,6 +6,7 @@ import type {
   FlowNodeRuntime,
   GraphValidationResult,
 } from "../core/graph-types.ts";
+import { evaluateHumanReply } from "./human-policy.ts";
 import {
   buildFlowGraphSnapshot,
   cloneState,
@@ -109,7 +110,6 @@ export function transitionFlow(
         }
       }
       const prevStatus = next.status;
-      next.status = "running"; next.endedAt = null; next.reason = undefined;
       const replyByNode = new Map<string, string>();
       const targets = event.targetNodeId
         ? [event.targetNodeId]
@@ -119,19 +119,59 @@ export function transitionFlow(
               const st = next.nodes[id]!.status;
               return st === "ready" || st === "running" || st === "failed" || st === "retrying" || st === "cancelled";
             });
+
+      const appendHumanReply = (id: string, prompt: string | null | undefined, decision: string) => {
+        commands.push({
+          type: "APPEND_BOARD",
+          entry: {
+            nodeId: id, kind: "user_steer", speaker: "user", target: id, text: trimmedReply!,
+            metadata: { ...(prompt ? { question: prompt } : {}), nodeId: id, decision },
+          },
+        });
+      };
+
+      const humanDecisions = new Map<string, ReturnType<typeof evaluateHumanReply>>();
+      for (const id of targets) {
+        const rt = next.nodes[id]!, spec = getNodeSpec(next, id)!;
+        if (spec.kind !== "human" || rt.status !== "waiting_input") continue;
+        const evalRes = evaluateHumanReply(spec.human ?? { prompt: rt.questionPrompt ?? "" }, trimmedReply ?? "");
+        if (evalRes.decision === "invalid") {
+          next.status = prevStatus;
+          next.reason = evalRes.reason ?? formatWaitingNodesReason(next, waitingNodes);
+          return finish();
+        }
+        if (evalRes.decision === "hold") {
+          rt.lastReply = trimmedReply!;
+          appendHumanReply(id, rt.questionPrompt, "hold");
+          next.status = prevStatus;
+          next.reason = evalRes.reason ?? formatWaitingNodesReason(next, waitingNodes);
+          return finish();
+        }
+        humanDecisions.set(id, evalRes);
+      }
+
+      next.status = "running";
+      next.endedAt = null;
+      next.reason = undefined;
       for (const id of targets) {
         const rt = next.nodes[id]!, spec = getNodeSpec(next, id)!;
         if (spec.kind === "human" && rt.status === "waiting_input") {
-          rt.status = "succeeded"; rt.endedAt = nowIso; rt.questionsForUser = []; rt.lastReply = trimmedReply!;
-          commands.push({
-            type: "APPEND_BOARD",
-            entry: {
-              nodeId: id, kind: "user_steer", speaker: "user", target: id, text: trimmedReply!,
-              metadata: { ...(rt.questionPrompt ? { question: rt.questionPrompt } : {}), nodeId: id },
-            },
-          });
+          const evalRes = humanDecisions.get(id)!;
+          rt.questionsForUser = [];
+          rt.lastReply = trimmedReply!;
+          rt.endedAt = nowIso;
+          if (evalRes.decision === "cancel") {
+            rt.status = "cancelled";
+            rt.lastError = evalRes.reason ?? `Cancelled by user (${trimmedReply!}).`;
+          } else {
+            rt.status = "succeeded";
+          }
+          appendHumanReply(id, rt.questionPrompt, evalRes.decision);
         } else {
-          rt.status = "ready"; rt.activeStageId = null; rt.lastError = null; rt.questionsForUser = [];
+          rt.status = "ready";
+          rt.activeStageId = null;
+          rt.lastError = null;
+          rt.questionsForUser = [];
           if (trimmedReply) {
             rt.lastReply = trimmedReply;
             replyByNode.set(id, trimmedReply);

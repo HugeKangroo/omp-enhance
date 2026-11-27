@@ -67,9 +67,6 @@ function validateNodeConfigs(
     if (node.repairTargetNodeId && !byId.has(node.repairTargetNodeId)) {
       issues.push({ code: "invalid_repair_target", nodeId: node.id, message: `Node "${node.id}" references unknown repairTargetNodeId "${node.repairTargetNodeId}".` });
     }
-    if (node.forkFromNodeId && !byId.has(node.forkFromNodeId)) {
-      issues.push({ code: "invalid_fork_source", nodeId: node.id, message: `Node "${node.id}" references unknown forkFromNodeId "${node.forkFromNodeId}".` });
-    }
     if (node.kind === "role") {
       const role = node.role ? roles.get(node.role) : undefined;
       if (!node.role) issues.push({ code: "invalid_node_config", nodeId: node.id, message: `Role node "${node.id}" requires a role id.` });
@@ -158,9 +155,6 @@ export function validateFlowGraph(input: {
 
   const ancestors = computeAncestorMap(spec.nodes);
   for (const node of spec.nodes) {
-    if (node.forkFromNodeId && byId.has(node.forkFromNodeId) && !ancestors.get(node.id)?.has(node.forkFromNodeId)) {
-      issues.push({ code: "invalid_fork_source", nodeId: node.id, message: `Node "${node.id}" forkFromNodeId "${node.forkFromNodeId}" must be a transitive ancestor.` });
-    }
     if (node.kind === "merge" && node.merge?.sourceNodeIds) {
       for (const src of node.merge.sourceNodeIds) {
         if (byId.has(src) && !ancestors.get(node.id)?.has(src)) {

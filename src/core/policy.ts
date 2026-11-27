@@ -397,7 +397,6 @@ export class TurnTracker {
   }
   markTurnFailed(): void { this.turnFailed = true; this.inFlightTool = null; }
   completeTurn(): void { this.turnOpen = false; this.turnFailed = false; this.inFlightTool = null; }
-  isTurnFailed(): boolean { return this.turnFailed; }
   checkToolCallAllowed(
     cwd: string, role: RoleSpec | null, event: { toolName: string; input?: unknown },
     rolesMap?: ReadonlyMap<string, RoleSpec>, mode: "foreground" | "stage" = "foreground",

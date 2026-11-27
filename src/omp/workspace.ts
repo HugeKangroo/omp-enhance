@@ -1,4 +1,3 @@
-import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { isCompanionTool, isInternalRole, resolveRoleActiveTools } from "../core/policy.ts";
 import {
@@ -6,8 +5,8 @@ import {
 } from "../core/settings.ts";
 import { EnhanceStore } from "../core/store.ts";
 import { markMachineStateInterrupted } from "../core/store-schema.ts";
-import type { EnhanceSettings, FlowGraphSpec, FlowRunResult, GraphValidationResult, HandoffEnvelope, Mandate, RoleSpec } from "../core/types.ts";
-import { executeFlowGraph } from "../flow/executor.ts";
+import type { EnhanceSettings, FlowGraphPatch, FlowGraphSpec, FlowRunResult, GraphValidationResult, HandoffEnvelope, Mandate, RoleSpec } from "../core/types.ts";
+import { executeFlowGraph, type LivePatchHandler, type LivePatchResult } from "../flow/executor.ts";
 import { validateFlowGraph } from "../flow/graph.ts";
 import { executeRoleFlow, type RoleSessionRunner, type RoleSupervisorConfig } from "../flow/orchestrator.ts";
 import { FlowRoomManager, isCheckpointResumable, snapshotFromCheckpoint } from "../flow/state.ts";
@@ -16,6 +15,7 @@ import { migrateLegacySubStateMachine } from "../flow/workflow.ts";
 import { createGitWorktreeManager, isGitRepo } from "../flow/worktree.ts";
 import { discoverRolesWithDiagnostics } from "../roles/loader.ts";
 import { createFlowRoomUiAdapter, type FlowMonitorTarget } from "../ui/flow-room.ts";
+import { emitWorkspaceMessage } from "./hub-helpers.ts";
 import { createOmpRoleSessionRunner, createOmpSupervisorInspector } from "./session.ts";
 import { FlowSessionPool } from "./session-pool.ts";
 import type { TrustEvaluation } from "./trust.ts";
@@ -29,7 +29,7 @@ export interface WorkspaceRuntime {
   refresh(ctx?: any): Map<string, RoleSpec>; syncStatusBar(ctx: any): void;
   runnerFor(ctx: any): RoleSessionRunner; supervisorFor(ctx: any): RoleSupervisorConfig | undefined;
   emitMessage(ctx: any, text: string, options?: EmitMessageOptions): void;
-  patchActiveFlow?(expectedFlowId: string, patch: import("../core/graph-types.ts").FlowGraphPatch, validated: GraphValidationResult): boolean;
+  patchActiveFlow?(expectedFlowId: string, patch: FlowGraphPatch, patchRoles?: ReadonlyMap<string, RoleSpec>): Promise<LivePatchResult>;
   startManagedFlow(input: {
     ctx: any; originWs?: ManagedWorkspace; flowId?: string; roles: RoleSpec[]; mandate: Mandate;
     initialHandoff: HandoffEnvelope | null; maxRepairRounds: number; background: boolean; initiatorText?: string;
@@ -206,28 +206,7 @@ export class SessionBaselineManager {
   }
 }
 
-export function emitMessage(pi: any, ctx: any, text: string, options?: EmitMessageOptions): void {
-  const outPath = process.env.OMP_ENHANCE_CMD_OUT;
-  if (outPath) {
-    const outPayload = options?.cmdOutText ?? text;
-    try {
-      mkdirSync(path.dirname(path.resolve(outPath)), { recursive: true });
-      appendFileSync(outPath, outPayload.endsWith("\n") ? outPayload : `${outPayload}\n`, "utf8");
-    } catch {}
-  }
-  try {
-    const excludeFromContext = options?.excludeFromContext ?? true;
-    const opts = { triggerTurn: false, ...(ctx?.isIdle?.() === false ? { deliverAs: "followUp" } : {}) };
-    if (typeof pi?.sendMessage === "function") {
-      pi.sendMessage({
-        customType: "omp-enhance", content: text, display: true,
-        ...(excludeFromContext ? { excludeFromContext: true } : {}),
-      }, opts);
-    } else {
-      ctx?.ui?.notify?.(text, "info");
-    }
-  } catch {}
-}
+export { emitWorkspaceMessage as emitMessage };
 
 export interface ManagedWorkspace extends WorkspaceRuntime {
   rolesBySession: Map<string, string | null>;
@@ -262,7 +241,7 @@ export function createManagedWorkspace(
 
   const sessionPool = new FlowSessionPool(pi, { cwd });
   const worktreeManager = createGitWorktreeManager();
-  let activePatchTarget: { flowId: string; handler: (patch: import("../core/graph-types.ts").FlowGraphPatch, validated: GraphValidationResult) => boolean } | null = null;
+  let activePatchTarget: { flowId: string; handler: LivePatchHandler } | null = null;
 
   const runFlowTask = (fCtx: any, originWs: ManagedWorkspace, background: boolean, flowId: string, execInput: {
     roles: RoleSpec[]; mandate: Mandate; initialHandoff: HandoffEnvelope | null; maxRepairRounds: number;
@@ -380,9 +359,13 @@ export function createManagedWorkspace(
       if (!sup) return undefined;
       return { role: sup, inspector: createOmpSupervisorInspector(pi, bindCtxToCwd(c, cwd), ws.settings), initialDelayMs: ws.settings.supervisorInitialDelaySec * 1000 };
     },
-    emitMessage: (c, text, emitOpts) => emitMessage(pi, c, text, emitOpts),
-    patchActiveFlow: (expectedFlowId, patch, validated) =>
-      Boolean(activePatchTarget && activePatchTarget.flowId === expectedFlowId && activePatchTarget.handler(patch, validated)),
+    emitMessage: (c, text, emitOpts) => emitWorkspaceMessage(pi, c, text, emitOpts),
+    patchActiveFlow: async (expectedFlowId, patch, patchRoles) => {
+      if (!activePatchTarget || activePatchTarget.flowId !== expectedFlowId) {
+        return { patched: false, error: `Flow "${expectedFlowId}" is no longer active and could not be patched.` };
+      }
+      return await activePatchTarget.handler(patch, patchRoles ?? ws.roles);
+    },
     startManagedFlow: async ({ ctx: c, originWs, flowId: explicitId, roles: rList, mandate, initialHandoff, maxRepairRounds, background, initiatorText, signal, graphSpec, graphValidation }) => {
       const roleChain = graphSpec ? graphSpec.nodes.map((n) => n.id) : rList.map((r) => r.id);
       const roleSnapshots: Record<string, RoleSpec> = {};

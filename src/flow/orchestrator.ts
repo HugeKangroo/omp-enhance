@@ -40,7 +40,7 @@ export interface RoleStepContext {
   signal?: AbortSignal;
   beforeSnapshot?: ReadonlyMap<string, SnapshotEntry>;
   beforeConfigSnapshot?: ReadonlyMap<string, SnapshotEntry>;
-  reuseSession?: boolean; keepSessionWarm?: boolean; forkFromNodeId?: string;
+  reuseSession?: boolean; keepSessionWarm?: boolean;
   modelOverride?: string; repairFeedback?: string; replyText?: string;
   nodeBrief?: string; boardContext?: string; stallTimeoutMs?: number;
   sessionPool?: RoleSessionPoolLike;
@@ -66,7 +66,7 @@ export interface ExecuteRoleStepInput {
   toTarget: string; repairTargetRoleId?: string; flowId?: string | null; nodeId?: string; sessionSlotId?: string;
   runner: RoleSessionRunner; stageId?: string; round?: number; modelLabel?: string;
   observer?: FlowObserver; supervisor?: RoleSupervisorConfig; signal?: AbortSignal;
-  reuseSession?: boolean; keepSessionWarm?: boolean; forkFromNodeId?: string;
+  reuseSession?: boolean; keepSessionWarm?: boolean;
   modelOverride?: string; repairFeedback?: string; replyText?: string;
   nodeBrief?: string; boardContext?: string; stallTimeoutMs?: number;
   sessionPool?: RoleSessionPoolLike;
@@ -158,7 +158,6 @@ export async function executeRoleStep(input: ExecuteRoleStepInput): Promise<Exec
     ...(input.supervisor ? { supervisor: input.supervisor } : {}), ...(input.signal ? { signal: input.signal } : {}),
     ...(input.reuseSession ? { reuseSession: true } : {}),
     ...(input.keepSessionWarm ? { keepSessionWarm: true } : {}),
-    ...(input.forkFromNodeId ? { forkFromNodeId: input.forkFromNodeId } : {}),
     ...(input.modelOverride ? { modelOverride: input.modelOverride } : {}),
     ...(input.repairFeedback ? { repairFeedback: input.repairFeedback } : {}),
     ...(input.replyText ? { replyText: input.replyText } : {}),

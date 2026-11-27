@@ -1,29 +1,32 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, statSync } from "node:fs";
 import path from "node:path";
 import { diffSnapshots, snapshotWorkspace } from "../core/fs.ts";
 import { canRoleDispatch, isInternalRole } from "../core/policy.ts";
-import { loadEnhanceSettings } from "../core/settings.ts";
-import type { BackgroundJob, FlowRoomStatus, HandoffEnvelope, Mandate } from "../core/types.ts";
+import { loadEnhanceSettings, resolveDefaultGlobalRolesDir } from "../core/settings.ts";
+import type { BackgroundJob, HandoffEnvelope, Mandate } from "../core/types.ts";
 import { createAndVerifyHandoff } from "../flow/handoff.ts";
 import type { RoleSessionRunner } from "../flow/orchestrator.ts";
 import { isCheckpointResumable, snapshotFromCheckpoint, type FlowRoomSnapshot } from "../flow/state.ts";
 import { reconcileJobs } from "../jobs/runner.ts";
+import type { TrustedPeerRoleGroup } from "../roles/conditioning.ts";
 import type { FlowMonitorTarget } from "../ui/flow-room.ts";
+import {
+  collectTrustedPeerProjectRoles,
+  formatFlowEventReport,
+  persistSecondaryProject,
+  readHubProjectsMap,
+  resolveHubProjectsFilePath,
+  toFlowSummary,
+  type HubFlowSummary,
+} from "./hub-helpers.ts";
 import { evaluateWorkspaceTrust, grantProjectTrust, resolveTrustedProjectsFilePath, revokeProjectTrust } from "./trust.ts";
 import { createManagedWorkspace, type BackgroundFlowSettlement, type ManagedWorkspace } from "./workspace.ts";
+
+export { resolveHubProjectsFilePath, type HubFlowSummary };
 
 export interface HubOptions {
   globalRolesDir?: string; builtinRolesDir?: string; pluginLockPath?: string;
   runnerFactory?: (pi: any, ctx: any) => RoleSessionRunner;
-}
-
-export interface HubFlowSummary {
-  cwd: string; flowId: string | null; status: FlowRoomStatus; resumable: boolean;
-  roleChain: string[]; currentIndex: number; repairRound: number; goal: string;
-  reason?: string; questionsForUser?: string[]; waitingNodes?: Array<{ nodeId: string; questions: string[] }>;
-  mergedRef?: string | null; mergedCommitSha?: string | null; graphProgress?: { done: number; total: number };
-  remoteOwnerPid?: number | null; updatedAt?: string;
 }
 
 export interface PendingWakeup { flowId: string; settlementKey: string; originWs: ManagedWorkspace; ctx: any; report: string; }
@@ -43,6 +46,8 @@ export interface WorkspaceHub {
   setForegroundTurnActive(active: boolean): void;
   flushPendingWakeups(ctx?: any): void;
   isSelfResumeBlockedDuringWakeup(flowId: string, ctx?: any): boolean;
+  hydrateTrackedWorkspaces(originWs: ManagedWorkspace, ctx?: any): ManagedWorkspace[];
+  collectTrustedPeerRoles(originWs: ManagedWorkspace, ctx?: any): TrustedPeerRoleGroup[];
   listWorkspaces(): ManagedWorkspace[];
   getEffectiveSnapshot(ws: ManagedWorkspace): FlowRoomSnapshot;
   getMonitorTargets(primaryWs?: ManagedWorkspace): FlowMonitorTarget[];
@@ -54,45 +59,6 @@ export interface WorkspaceHub {
   disposeAll(): void;
 }
 
-const MAX_TRACKED_SUBPROJECTS = 24;
-
-export function resolveHubProjectsFilePath(options: HubOptions = {}): string {
-  const envHome = process.env.OMP_ENHANCE_HOME?.trim();
-  if (envHome) return path.join(path.resolve(envHome), ".omp", "enhance", "hub-projects.json");
-  if (options.globalRolesDir) {
-    const defaultRoles = path.join(homedir(), ".omp", "enhance", "roles");
-    const resolvedRoles = path.resolve(options.globalRolesDir);
-    if (resolvedRoles !== path.resolve(defaultRoles)) return path.join(path.dirname(resolvedRoles), "hub-projects.json");
-  }
-  return path.join(homedir(), ".omp", "enhance", "hub-projects.json");
-}
-
-function readHubProjectsMap(filePath: string): Record<string, string[]> {
-  if (!existsSync(filePath)) return {};
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(filePath, "utf8"));
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    const out: Record<string, string[]> = {};
-    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-      if (Array.isArray(v)) out[k] = v.filter((it): it is string => typeof it === "string" && it.trim().length > 0);
-    }
-    return out;
-  } catch { return {}; }
-}
-
-function persistSecondaryProject(filePath: string, primaryCwd: string, targetCwd: string): void {
-  if (primaryCwd === targetCwd) return;
-  try {
-    const map = readHubProjectsMap(filePath);
-    const prev = (map[primaryCwd] ?? []).filter((p) => p !== targetCwd && p !== primaryCwd);
-    map[primaryCwd] = [targetCwd, ...prev].slice(0, MAX_TRACKED_SUBPROJECTS);
-    mkdirSync(path.dirname(filePath), { recursive: true });
-    const tmp = `${filePath}.tmp-${process.pid}-${Date.now().toString(36)}`;
-    writeFileSync(tmp, `${JSON.stringify(map, null, 2)}\n`, "utf8");
-    renameSync(tmp, filePath);
-  } catch {}
-}
-
 export function computeSettlementKey(snap: Pick<FlowRoomSnapshot, "flowId" | "status" | "stages" | "graphSnapshot" | "reason">): string | null {
   if (!snap.flowId || snap.status === "idle" || snap.status === "running") return null;
   const waitSig = snap.status === "waiting_input" && snap.graphSnapshot?.nodes?.length
@@ -102,62 +68,7 @@ export function computeSettlementKey(snap: Pick<FlowRoomSnapshot, "flowId" | "st
   return `${snap.flowId}:${snap.status}:${snap.stages.length}${extra ? `:${extra}` : ""}`;
 }
 
-function collectWaitingNodes(snap: FlowRoomSnapshot): Array<{ nodeId: string; questions: string[] }> {
-  const fromGraph = (snap.graphSnapshot?.nodes ?? []).filter((n) => n.status === "waiting_input")
-    .map((n) => ({ nodeId: n.nodeId, questions: n.questionsForUser?.length ? [...n.questionsForUser] : [n.summary ?? "需要用户确认"] }));
-  if (fromGraph.length > 0) return fromGraph;
-  const env = [...snap.stages].reverse().find((s) => s.envelope?.questionsForUser?.length)?.envelope;
-  return env?.questionsForUser?.length ? [{ nodeId: env.fromRole, questions: [...env.questionsForUser] }] : [];
-}
-
-function toFlowSummary(cwd: string, snap: FlowRoomSnapshot, resumable: boolean): HubFlowSummary {
-  const waitingNodes = snap.status === "waiting_input" ? collectWaitingNodes(snap) : [];
-  const allQuestions = waitingNodes.flatMap((w) => w.questions.map((q) => (waitingNodes.length > 1 ? `[${w.nodeId}] ${q}` : q)));
-  const gNodes = snap.graphSnapshot?.nodes;
-  const graphProgress = gNodes?.length ? { done: gNodes.filter((n) => n.status === "succeeded" || n.status === "skipped").length, total: gNodes.length } : undefined;
-  return {
-    cwd, flowId: snap.flowId, status: snap.status, resumable, roleChain: snap.roleChain,
-    currentIndex: snap.currentIndex ?? 0, repairRound: snap.repairRound ?? 0, goal: snap.goal,
-    ...(snap.reason ? { reason: snap.reason } : {}), ...(allQuestions.length > 0 ? { questionsForUser: allQuestions } : {}),
-    ...(waitingNodes.length > 0 ? { waitingNodes } : {}), ...(snap.graphSnapshot?.mergedRef ? { mergedRef: snap.graphSnapshot.mergedRef } : {}),
-    ...(snap.graphSnapshot?.mergedCommitSha ? { mergedCommitSha: snap.graphSnapshot.mergedCommitSha } : {}),
-    ...(graphProgress ? { graphProgress } : {}),
-    ...(snap.remoteOwnerPid ? { remoteOwnerPid: snap.remoteOwnerPid } : {}),
-    ...(snap.updatedAt ? { updatedAt: snap.updatedAt } : {}),
-  };
-}
-
 const FLOW_PRIORITY: Record<string, number> = { waiting_input: 0, running: 1, interrupted: 2, blocked: 2, failed: 2, violation: 2, completed: 3, cancelled: 3, idle: 4 };
-
-function formatFlowEventReport(settlement: BackgroundFlowSettlement): string {
-  const { targetWs, flowId, mandate, roleChain, result, error } = settlement;
-  const snap = targetWs.room.getSnapshot();
-  const status = error ? "failed" : (result?.status ?? "failed"), env = result?.finalEnvelope ?? null;
-  const summary = error ? (error instanceof Error ? error.message : String(error)) : (env?.summary ?? result?.reason ?? status);
-  const isRejectedAudit = status === "completed" && env?.verdict === "rejected";
-  const lines = [
-    `[Flow Event · ${status}${isRejectedAudit ? " (audit_rejected)" : ""}] flowId=${flowId} · cwd=${targetWs.cwd} · chain=${roleChain.join(" → ")}`,
-    `Goal: ${mandate.goal}`, `Summary: ${summary}`,
-  ];
-  const mergedRef = result?.mergedRef ?? snap.graphSnapshot?.mergedRef;
-  const mergedSha = result?.mergedCommitSha ?? snap.graphSnapshot?.mergedCommitSha;
-  if (mergedRef) lines.push(`Delivery ref: ${mergedRef}${mergedSha ? ` (${mergedSha})` : ""}`);
-  if (isRejectedAudit && env?.feedbackForUpstream) lines.push(`Findings: ${env.feedbackForUpstream}`);
-  else if (result?.reason && result.reason !== summary) lines.push(`Detail: ${result.reason}`);
-  if (env?.artifacts.length) lines.push(`Artifacts: ${env.artifacts.map((a) => `${a.path} [${a.role}]`).join(", ")}`);
-  if (env?.deletedFiles?.length) lines.push(`Deleted files: ${env.deletedFiles.join(", ")}`);
-  if (env?.verifiedFacts.length) lines.push("Verified facts:", ...env.verifiedFacts.map((f) => `- ${f.claim} (evidence: ${f.evidenceRef})`));
-  if (env?.openRisks.length) lines.push("Open risks:", ...env.openRisks.map((r) => `- ${r}`));
-  const waitingNodes = status === "waiting_input" ? collectWaitingNodes(snap) : [];
-  if (waitingNodes.length > 0) {
-    lines.push(
-      "Questions for user:",
-      ...waitingNodes.flatMap((w) => w.questions.map((q) => `- [${w.nodeId}] ${q}`)),
-      `Action required: Relay ALL questions above to the user in plain language and STOP to wait for their reply — do NOT guess or answer on the user's behalf. Resume each answered node individually with enhance_flow(action="resume", flowId="${flowId}", cwd="${targetWs.cwd}", nodeId="<nodeId>", message="<user's exact answer>").`,
-    );
-  }
-  return lines.join("\n");
-}
 
 function assertExistingDir(targetCwd: string): void {
   let isDir = false;
@@ -258,9 +169,6 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
     }
   };
 
-  const wsHasResumableFlow = (ws: ManagedWorkspace): boolean =>
-    ws.room.isResumable() || (!ws.store.isClosed() && ws.store.listFlowCheckpoints(10).some((cp) => isCheckpointResumable(cp)));
-
   const hub: WorkspaceHub = {
     pendingWakeups,
     getWorkspace(ctxOrCwd: any, hostCtx?: any): ManagedWorkspace {
@@ -310,11 +218,15 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
         return found;
       }
       if (params.cwd) return hub.resolveTargetWorkspace(originWs, params.cwd, ctx);
-      const effPredicate = predicate ?? wsHasResumableFlow;
-      if (!predicate || effPredicate(originWs)) return originWs;
-      const matches = [...workspaces.values()].filter(effPredicate);
+      if (!predicate) return originWs;
+      const allWorkspaces = hub.hydrateTrackedWorkspaces(originWs, ctx);
+      const matches = allWorkspaces.filter(predicate);
       if (matches.length === 1) return matches[0]!;
-      if (matches.length > 1) throw new Error(`Multiple project Flows match; specify flowId or cwd: ${matches.map((w) => `${w.room.getSnapshot().flowId ?? "flow"} (${w.cwd})`).join(", ")}`);
+      if (matches.length > 1) {
+        throw new Error(
+          `Multiple project Flows match; specify flowId or cwd: ${matches.map((w) => `${w.room.getSnapshot().flowId ?? "flow"} (${w.cwd})`).join(", ")}`,
+        );
+      }
       return originWs;
     },
     seedLocalChangesHandoff(ws, sid, mandate, firstRoleId): HandoffEnvelope | null {
@@ -361,6 +273,23 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
       const cur = countBranchUserMessages(ctx);
       if (cur === null || cur > recorded) { waitingWakeupUserCounts.delete(flowId); return false; }
       return true;
+    },
+    hydrateTrackedWorkspaces(originWs, ctx): ManagedWorkspace[] {
+      hydrateTrackedProjectsFor(primaryCwd, ctx, true);
+      if (originWs.cwd !== primaryCwd) hydrateTrackedProjectsFor(originWs.cwd, ctx, true);
+      return [...workspaces.values()];
+    },
+    collectTrustedPeerRoles(originWs, ctx): TrustedPeerRoleGroup[] {
+      hub.hydrateTrackedWorkspaces(originWs, ctx);
+      return collectTrustedPeerProjectRoles({
+        workspaces,
+        originWs,
+        trustStorePath,
+        evaluateTrust: evaluateTrustFor,
+        globalRolesDir: options.globalRolesDir ?? resolveDefaultGlobalRolesDir(),
+        builtinRolesDir: options.builtinRolesDir,
+        ctx,
+      });
     },
     listWorkspaces: () => [...workspaces.values()],
     getEffectiveSnapshot: getEffectiveSnapshotFor,

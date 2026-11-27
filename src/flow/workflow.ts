@@ -41,8 +41,18 @@ function expandSingleRoleNode(
 
     if (kind === "human") {
       nodes.push({
-        id, title: ph.title ?? ph.id, kind: "human", dependsOn: deps, parentGroupId: outerNode.id,
-        human: { prompt: ph.prompt ?? ph.brief ?? ph.title ?? `请确认阶段 ${ph.id} 后继续。` },
+        id,
+        title: ph.title ?? ph.id,
+        kind: "human",
+        dependsOn: deps,
+        parentGroupId: outerNode.id,
+        human: {
+          prompt: ph.prompt ?? ph.brief ?? ph.title ?? `请确认阶段 ${ph.id} 后继续。`,
+          ...(ph.options ? { options: [...ph.options] } : {}),
+          ...(ph.allowFreeText !== undefined ? { allowFreeText: ph.allowFreeText } : {}),
+          ...(ph.mode ? { mode: ph.mode } : {}),
+          ...(ph.optionActions ? { optionActions: { ...ph.optionActions } } : {}),
+        },
       });
       exitAlias.set(ph.id, id);
       continue;
@@ -93,6 +103,11 @@ function expandSingleRoleNode(
       ...(effWritable ? { writableScope: effWritable } : {}),
       ...(cumulativeLocks.length > 0 ? { lockedProtected: [...cumulativeLocks] } : {}),
       ...(ph.exitArtifacts?.length ? { requiredArtifacts: [...ph.exitArtifacts] } : {}),
+      ...(ph.requiredChecks?.length
+        ? { requiredChecks: [...ph.requiredChecks] }
+        : isFinal && outerNode.requiredChecks?.length
+          ? { requiredChecks: [...outerNode.requiredChecks] }
+          : {}),
       isWorkflowPhase: true, ...(isFinal ? { isFinalWorkflowPhase: true } : {}),
       ...(ph.maxAttempts !== undefined ? { maxAttempts: ph.maxAttempts } : outerNode.maxAttempts !== undefined ? { maxAttempts: outerNode.maxAttempts } : {}),
       ...(ph.fallbackModels ? { fallbackModels: [...ph.fallbackModels] } : outerNode.fallbackModels ? { fallbackModels: [...outerNode.fallbackModels] } : {}),

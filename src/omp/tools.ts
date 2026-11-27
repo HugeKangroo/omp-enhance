@@ -45,6 +45,7 @@ export function schemaKit(pi: any) {
     arr: (item: unknown): unknown => (T?.Array ? T.Array(item) : { type: "array", items: item }),
     en: (values: readonly string[]): unknown => (T?.Union ? T.Union(values.map((v: string) => T.Literal(v))) : { type: "string", enum: values }),
     anyOf: (variants: readonly unknown[]): unknown => (T?.Union ? T.Union([...variants]) : { anyOf: [...variants] }),
+    rec: (value: unknown): unknown => (T?.Record ? T.Record(T.String(), value) : { type: "object", additionalProperties: value }),
     obj: (props: Record<string, unknown>, req: string[]): unknown =>
       T?.Object
         ? T.Object(Object.fromEntries(Object.entries(props).map(([k, v]) => [k, req.includes(k) ? v : opt(v)])), { additionalProperties: false })

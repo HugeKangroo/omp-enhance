@@ -85,23 +85,6 @@ export function renderChatBubbleLines(
   ];
 }
 
-export function renderLiveWidgetLines(snapshot: FlowRoomSnapshot, width: number, theme?: any): string[] {
-  const inner = Math.max(28, width - 4);
-  const fg = (c: string, s: string): string => (typeof theme?.fg === "function" ? theme.fg(c, s) : s);
-  const proj = snapshot.cwd ? `[${shortProjectLabel(snapshot.cwd)}] ` : "";
-  const head = `⇄ 后台专员协作 · ${proj}${snapshot.roleChain.join(" → ")} [${snapshotStatusBadge(snapshot).text}] (/flow 监控)`;
-  const lines = [fg("border", `╭─ ${padLeftCell(head, inner - 2)} ─╮`)];
-  for (const entry of snapshot.entries.slice(-3)) {
-    for (const row of renderChatBubbleLines(entry, inner, { maxBodyLines: 1, theme })) lines.push(`${fg("border", "│")} ${row} ${fg("border", "│")}`);
-  }
-  const active = snapshot.stages.find((s) => s.stageId === snapshot.activeStageId);
-  const foot = active
-    ? `⚙ ${active.roleId} (${active.modelLabel}) · 工具 ${active.calls.length} 次${active.activeTool ? ` → ${active.activeTool}` : ""}`
-    : `目标: ${snapshot.goal}`;
-  lines.push(fg("border", `╰─ ${padLeftCell(foot, inner - 2)} ─╯`));
-  return lines;
-}
-
 export function renderMultiProjectWidgetLines(
   targets: readonly FlowMonitorTarget[], width: number, theme?: any,
 ): string[] {
