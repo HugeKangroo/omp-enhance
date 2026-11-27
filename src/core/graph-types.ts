@@ -1,4 +1,4 @@
-import type { HandoffEnvelope, VerificationEvidenceRecord } from "./types.ts";
+import type { HandoffEnvelope, RoleSpec, VerificationEvidenceRecord } from "./types.ts";
 
 export type NodeKind = "role" | "gate" | "merge" | "human";
 export type WorkspaceMode = "inherit" | "worktree";
@@ -37,7 +37,7 @@ export interface HumanNodeConfig {
 
 export interface FlowNodeSpec {
   id: string; title?: string; kind: NodeKind; role?: string; dependsOn: string[];
-  join?: JoinStrategy; brief?: NodeBrief | string; writableScope?: string[];
+  join?: JoinStrategy; brief?: NodeBrief | string; tools?: string[]; writableScope?: string[];
   workspace?: WorkspaceMode; worktreeGroup?: string;
   sessionMode?: SessionReuseMode; sessionGroup?: string; parentGroupId?: string;
   phaseTools?: string[]; lockedProtected?: string[]; requiredArtifacts?: string[];
@@ -130,6 +130,7 @@ export interface FlowMachineState {
   repairRound: number; maxRepairRounds: number; lastRejectionSig: string | null;
   nextStageSeq: number; boardSeq: number; initialHandoffId: string | null; lastHandoffId: string | null;
   mergedRef: string | null; mergedCommitSha?: string | null; reason?: string;
+  roleSnapshots?: Record<string, RoleSpec>;
   startedAt: string | null; endedAt: string | null;
 }
 
@@ -154,7 +155,7 @@ export type FlowEvent =
   | { type: "GRAPH_PATCH"; patch: FlowGraphPatch; validated?: GraphValidationResult };
 
 export type FlowCommand =
-  | { type: "PREPARE_WORKTREE"; nodeId: string; worktreeGroup?: string; dependsOn: string[] }
+  | { type: "PREPARE_WORKTREE"; nodeId: string; worktreeGroup?: string; baseCommitSha?: string; dependsOn: string[] }
   | {
       type: "DISPATCH_ROLE_NODE"; nodeId: string; stageId: string; attempt: number; repairRound: number;
       reuseSession: boolean; sessionGroup?: string; forkFromNodeId?: string; worktreePath?: string;
@@ -162,7 +163,7 @@ export type FlowCommand =
       repairFeedback?: string; replyText?: string;
     }
   | { type: "RUN_GATE_NODE"; nodeId: string; stageId: string; attempt: number; worktreePath?: string; targetCommitRef?: string; targetCommitSha?: string; config: GateNodeConfig }
-  | { type: "RUN_MERGE_NODE"; nodeId: string; stageId: string; attempt: number; sourceNodeIds: string[]; sourceRefs: Record<string, string>; config: MergeNodeConfig }
+  | { type: "RUN_MERGE_NODE"; nodeId: string; stageId: string; attempt: number; sourceNodeIds: string[]; sourceRefs: Record<string, string>; baseCommitSha?: string; config: MergeNodeConfig }
   | { type: "RUN_HUMAN_NODE"; nodeId: string; stageId: string; config: HumanNodeConfig }
   | { type: "SWITCH_MODEL_AND_RESUME"; nodeId: string; stageId: string; nextModel: string; reason: string; attempt: number }
   | { type: "DELIVER_STEER"; nodeId: string; steerId: string; text: string }

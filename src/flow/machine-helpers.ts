@@ -36,7 +36,18 @@ export function cloneState(state: FlowMachineState): FlowMachineState {
     nodes,
     nodeOrder: [...state.nodeOrder],
     waves: state.waves.map((w) => [...w]),
+    ...(state.roleSnapshots ? { roleSnapshots: { ...state.roleSnapshots } } : {}),
   };
+}
+
+export function getUnmetResumeDependencies(state: FlowMachineState, nodeId: string): Array<{ nodeId: string; status: NodeStatus }> {
+  const spec = getNodeSpec(state, nodeId);
+  if (!spec || spec.dependsOn.length === 0) return [];
+  const deps = spec.dependsOn.map((d) => ({ nodeId: d, status: (state.nodes[d]?.status ?? "failed") as NodeStatus }));
+  if ((spec.join ?? "all") === "any") {
+    return deps.some((d) => d.status === "succeeded") ? [] : deps;
+  }
+  return deps.filter((d) => d.status !== "succeeded" && d.status !== "skipped");
 }
 
 export const getNodeSpec = (state: FlowMachineState, nodeId: string): FlowNodeSpec | undefined =>
@@ -136,7 +147,11 @@ export function dispatchSingleNode(
     } else {
       rt.status = "running";
       if (!rt.startedAt) rt.startedAt = nowIso;
-      commands.push({ type: "PREPARE_WORKTREE", nodeId, ...(spec.worktreeGroup ? { worktreeGroup: spec.worktreeGroup } : {}), dependsOn: [...spec.dependsOn] });
+      const preview = findUpstreamPreviewMerge(next, nodeId);
+      commands.push({
+        type: "PREPARE_WORKTREE", nodeId, ...(spec.worktreeGroup ? { worktreeGroup: spec.worktreeGroup } : {}),
+        ...(preview?.commitSha ? { baseCommitSha: preview.commitSha } : {}), dependsOn: [...spec.dependsOn],
+      });
       return;
     }
   }
@@ -179,7 +194,11 @@ export function dispatchSingleNode(
   } else if (spec.kind === "merge") {
     const sourceRefs: Record<string, string> = {};
     for (const srcId of spec.merge!.sourceNodeIds) { const ref = next.nodes[srcId]?.commitRef; if (ref) sourceRefs[srcId] = ref; }
-    commands.push({ type: "RUN_MERGE_NODE", nodeId, stageId, attempt: rt.attempt, sourceNodeIds: [...spec.merge!.sourceNodeIds], sourceRefs, config: spec.merge! });
+    const preview = findUpstreamPreviewMerge(next, nodeId);
+    commands.push({
+      type: "RUN_MERGE_NODE", nodeId, stageId, attempt: rt.attempt, sourceNodeIds: [...spec.merge!.sourceNodeIds], sourceRefs,
+      ...(preview?.commitSha ? { baseCommitSha: preview.commitSha } : {}), config: spec.merge!,
+    });
   }
 }
 

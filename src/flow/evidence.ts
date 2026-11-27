@@ -97,50 +97,54 @@ export function hasTestFailureOutput(output?: string | null): boolean {
   return Boolean(output && TEST_OUTPUT_FAILURE_RE.test(output));
 }
 
-function resolveTestCallCommand(call: ObservedToolCall, store: EnhanceStore): { command: string | null; unverifiable: boolean } {
-  if (call.isError || call.isBackgroundLaunch || (typeof call.exitCode === "number" && call.exitCode !== 0)) {
-    return { command: null, unverifiable: false };
-  }
+function normalizeTestCmdKey(cmd: string): string {
+  return cmd.trim().replace(/\s+/g, " ");
+}
+
+function classifyTestCall(
+  call: ObservedToolCall,
+  store: EnhanceStore,
+): { kind: "passed" | "failed" | "unverifiable" | "none"; command?: string; exitCode?: number } {
+  if (call.isBackgroundLaunch) return { kind: "none" };
   if (call.toolName === "bash") {
     const cmd = call.command?.trim() ?? "";
-    if (!cmd) return { command: null, unverifiable: false };
-    if (!isRecognizedTestCommand(cmd)) {
-      const mentionsRunner = cmd.split(/(?:&&|\|\||;|\n|\|)/).some((s) => isTestRunnerSegment(s));
-      return { command: null, unverifiable: mentionsRunner };
-    }
-    if (hasTestFailureOutput(call.outputSnippet)) return { command: null, unverifiable: true };
-    return { command: cmd, unverifiable: false };
+    if (!cmd) return { kind: "none" };
+    const recognized = isRecognizedTestCommand(cmd);
+    const mentionsRunner = recognized || cmd.split(/(?:&&|\|\||;|\n|\|)/).some((s) => isTestRunnerSegment(s));
+    if (!mentionsRunner) return { kind: "none" };
+    if (!recognized) return { kind: "unverifiable", command: cmd };
+    const failed = call.isError || (typeof call.exitCode === "number" && call.exitCode !== 0) || hasTestFailureOutput(call.outputSnippet);
+    if (failed) return { kind: "failed", command: cmd, exitCode: typeof call.exitCode === "number" && call.exitCode !== 0 ? call.exitCode : 1 };
+    return { kind: "passed", command: cmd, exitCode: 0 };
   }
   if (call.toolName === "enhance_job") {
-    let cmd = call.command?.trim() ?? "";
-    let statusOk = true;
+    let cmd = call.command?.trim() ?? "", statusOk = !call.isError && (call.exitCode === undefined || call.exitCode === 0);
+    let ec = typeof call.exitCode === "number" ? call.exitCode : 0;
     if (call.outputSnippet?.trim().startsWith("{")) {
       try {
-        const parsed = JSON.parse(call.outputSnippet) as {
-          status?: unknown; exitCode?: unknown;
-          job?: { jobId?: unknown; command?: unknown; status?: unknown; exitCode?: unknown };
-        };
-        const st = parsed.status ?? parsed.job?.status, ec = parsed.exitCode ?? parsed.job?.exitCode;
-        if ((typeof st === "string" && st !== "completed") || (typeof ec === "number" && ec !== 0)) statusOk = false;
+        const parsed = JSON.parse(call.outputSnippet) as { status?: unknown; exitCode?: unknown; job?: { jobId?: unknown; command?: unknown; status?: unknown; exitCode?: unknown } };
+        const st = parsed.status ?? parsed.job?.status, rawEc = parsed.exitCode ?? parsed.job?.exitCode;
+        if (typeof rawEc === "number") ec = rawEc;
+        if ((typeof st === "string" && st !== "completed") || ec !== 0) statusOk = false;
         if (!cmd && typeof parsed.job?.command === "string") cmd = parsed.job.command.trim();
         if (!cmd && typeof parsed.job?.jobId === "string") {
           const lookedUp = store.getJob(parsed.job.jobId);
           if (lookedUp) {
             cmd = lookedUp.command.trim();
-            if (lookedUp.status !== "completed" || lookedUp.exitCode !== 0) statusOk = false;
+            if (lookedUp.status !== "completed" || lookedUp.exitCode !== 0) { statusOk = false; ec = lookedUp.exitCode ?? 1; }
           }
         }
       } catch {}
     }
-    if (!statusOk || !cmd) return { command: null, unverifiable: false };
-    if (!isRecognizedTestCommand(cmd)) {
-      const mentionsRunner = cmd.split(/(?:&&|\|\||;|\n|\|)/).some((s) => isTestRunnerSegment(s));
-      return { command: null, unverifiable: mentionsRunner };
-    }
-    if (hasTestFailureOutput(call.outputSnippet)) return { command: null, unverifiable: true };
-    return { command: cmd, unverifiable: false };
+    if (!cmd) return { kind: "none" };
+    const recognized = isRecognizedTestCommand(cmd);
+    const mentionsRunner = recognized || cmd.split(/(?:&&|\|\||;|\n|\|)/).some((s) => isTestRunnerSegment(s));
+    if (!mentionsRunner) return { kind: "none" };
+    if (!recognized) return { kind: "unverifiable", command: cmd };
+    if (!statusOk || hasTestFailureOutput(call.outputSnippet)) return { kind: "failed", command: cmd, exitCode: ec !== 0 ? ec : 1 };
+    return { kind: "passed", command: cmd, exitCode: 0 };
   }
-  return { command: null, unverifiable: false };
+  return { kind: "none" };
 }
 
 export function verifyQaTestExecution(
@@ -156,11 +160,27 @@ export function verifyQaTestExecution(
     if (!c.isError && (WRITE_TOOLS[c.toolName] || c.touchedPaths.length > 0)) lastMutationIdx = i;
   });
   let sawPreMutationTest = false, sawStaleTest = false, sawUnverifiableTest = false;
-  const postMutationVerified: Array<{ call: ObservedToolCall; command: string }> = [];
+  const latestByCmd = new Map<string, { passed: boolean; command: string; exitCode: number }>();
+  const evidenceRecords: VerificationEvidenceRecord[] = [];
+  let passedOnCurrentTree = 0;
+
+  const toRecord = (c: ObservedToolCall, command: string, exitCode: number): VerificationEvidenceRecord => ({
+    command, exitCode, outputSnippet: c.outputSnippet ?? c.summary ?? "",
+    testedTreeFingerprint: c.testedTreeFingerprint ?? currentTreeFp, toolCallId: c.toolCallId,
+    ...(c.stageId ?? stageId ? { stageId: c.stageId ?? stageId } : {}),
+  });
+
   observedCalls.forEach((c, i) => {
-    const resolved = resolveTestCallCommand(c, store);
-    if (!resolved.command) {
-      if (resolved.unverifiable) sawUnverifiableTest = true;
+    const cls = classifyTestCall(c, store);
+    if (cls.kind === "none") return;
+    if (cls.kind === "unverifiable") { sawUnverifiableTest = true; return; }
+    const cmd = cls.command!;
+    const key = normalizeTestCmdKey(cmd);
+    if (cls.kind === "failed") {
+      if (!stageId || !c.stageId || c.stageId === stageId) {
+        evidenceRecords.push(toRecord(c, cmd, cls.exitCode ?? 1));
+        latestByCmd.set(key, { passed: false, command: cmd, exitCode: cls.exitCode ?? 1 });
+      }
       return;
     }
     if (i <= lastMutationIdx) { sawPreMutationTest = true; return; }
@@ -168,36 +188,32 @@ export function verifyQaTestExecution(
       sawStaleTest = true;
       return;
     }
-    postMutationVerified.push({ call: c, command: resolved.command });
+    evidenceRecords.push(toRecord(c, cmd, 0));
+    latestByCmd.set(key, { passed: true, command: cmd, exitCode: 0 });
+    passedOnCurrentTree += 1;
   });
-  if (postMutationVerified.length === 0) {
+
+  const stillFailing = [...latestByCmd.values()].filter((v) => !v.passed);
+  if (stillFailing.length > 0) {
+    throw new Error(
+      `Role "${roleId}" cannot submit verdict="ready": failing test command(s) were not re-run to pass: ${stillFailing.map((f) => `"${f.command}" (exit=${f.exitCode})`).join(", ")}.`,
+    );
+  }
+  if (passedOnCurrentTree === 0) {
     if (sawUnverifiableTest) {
       throw new Error(
         `Role "${roleId}" cannot submit verdict="ready": test command exit status was masked or unverifiable (avoid piping tests into tee/tail without "set -o pipefail", avoid "|| true" or trailing commands, and ensure zero failing tests).`,
       );
     }
     if (sawPreMutationTest) {
-      throw new Error(
-        `Role "${roleId}" modified files after the last test execution; re-run tests against the final workspace state before submitting verdict="ready".`,
-      );
+      throw new Error(`Role "${roleId}" modified files after the last test execution; re-run tests against the final workspace state before submitting verdict="ready".`);
     }
     if (sawStaleTest) {
-      throw new Error(
-        `Role "${roleId}" workspace changed after the last verified test execution (or only prior-stage tests were observed); re-run tests against the current workspace state before submitting verdict="ready".`,
-      );
+      throw new Error(`Role "${roleId}" workspace changed after the last verified test execution (or only prior-stage tests were observed); re-run tests against the current workspace state before submitting verdict="ready".`);
     }
-    throw new Error(
-      `Role "${roleId}" cannot submit verdict="ready" without a completed zero-exit test command in this turn (e.g. bun test, pytest, npm test, vitest, go test, cargo test; background launches and non-test shell commands like pwd/ls do not qualify).`,
-    );
+    throw new Error(`Role "${roleId}" cannot submit verdict="ready" without a completed zero-exit test command in this turn (e.g. bun test, pytest, npm test, vitest, go test, cargo test; background launches and non-test shell commands like pwd/ls do not qualify).`);
   }
-  return postMutationVerified.map(({ call, command }) => ({
-    command,
-    exitCode: typeof call.exitCode === "number" ? call.exitCode : 0,
-    outputSnippet: call.outputSnippet ?? call.summary ?? "",
-    testedTreeFingerprint: call.testedTreeFingerprint ?? currentTreeFp,
-    toolCallId: call.toolCallId,
-    ...(call.stageId ?? stageId ? { stageId: call.stageId ?? stageId } : {}),
-  }));
+  return evidenceRecords;
 }
 
 function firstNonEmptyStr(obj: Record<string, unknown>, keys: readonly string[]): string | undefined {

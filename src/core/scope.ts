@@ -247,13 +247,29 @@ export function applyPhasePermissions(
   return { ok: true, role: phaseRole, nextCumulativeProtected: nextLocks };
 }
 
+export function narrowRoleTools(
+  baseRole: RoleSpec,
+  tools?: readonly string[],
+): { ok: true; role: RoleSpec } | { ok: false; reason: string } {
+  if (tools === undefined) return { ok: true, role: baseRole };
+  const baseTools = baseRole.permissions.tools;
+  if (baseTools) {
+    const allowed = new Set(baseTools);
+    const illegal = tools.find((t) => !allowed.has(t));
+    if (illegal) return { ok: false, reason: `Tool "${illegal}" exceeds base permissions of role "${baseRole.id}".` };
+  }
+  return { ok: true, role: { ...baseRole, permissions: { ...baseRole.permissions, tools: [...tools] } } };
+}
+
 export function resolveNodeEffectiveRole(
   baseRole: RoleSpec,
   nodeSpec: FlowNodeSpec,
 ): { ok: true; role: RoleSpec } | { ok: false; reason: string } {
-  if (!nodeSpec.isWorkflowPhase) return narrowRolePermissions(baseRole, nodeSpec.writableScope);
+  const tooled = narrowRoleTools(baseRole, nodeSpec.tools);
+  if (!tooled.ok) return tooled;
+  if (!nodeSpec.isWorkflowPhase) return narrowRolePermissions(tooled.role, nodeSpec.writableScope);
   const res = applyPhasePermissions(
-    baseRole,
+    tooled.role,
     {
       id: nodeSpec.id,
       ...(nodeSpec.phaseTools ? { tools: nodeSpec.phaseTools } : {}),

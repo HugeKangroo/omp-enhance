@@ -164,9 +164,9 @@ export function createGitWorktreeManager(): WorktreeManagerLike {
   return {
     isGitRepo,
 
-    async prepareNodeWorktree({ cwd, flowId, nodeId }) {
+    async prepareNodeWorktree({ cwd, flowId, nodeId, baseCommitSha }) {
       const { gitRoot, relSubdir } = resolveGitLayout(cwd);
-      const baseRef = captureOrGetBaseRef(gitRoot, flowId);
+      const baseRef = baseCommitSha ?? captureOrGetBaseRef(gitRoot, flowId);
       const root = worktreeRoot(gitRoot, flowId);
       mkdirSync(root, { recursive: true });
       const wtPath = path.join(root, safeToken(nodeId));
@@ -194,7 +194,7 @@ export function createGitWorktreeManager(): WorktreeManagerLike {
       return refName;
     },
 
-    async commitAndUpdatePreviewRef({ cwd, worktreePath, flowId, nodeId, targetRef, summary }) {
+    async commitAndUpdatePreviewRef({ cwd, worktreePath, flowId, nodeId, targetRef, expectedParentSha, summary }) {
       const { gitRoot: mainRoot } = resolveGitLayout(cwd);
       const { gitRoot: wtRoot } = resolveGitLayout(worktreePath);
       const staged = stageAllExcludingEnhance(wtRoot);
@@ -206,16 +206,22 @@ export function createGitWorktreeManager(): WorktreeManagerLike {
       const sha = runGit(wtRoot, ["rev-parse", "HEAD"]);
       if (!sha.ok || !sha.stdout) throw new Error(`git rev-parse HEAD failed in preview worktree "${nodeId}"`);
       const preferred = targetRef.startsWith("omp-enhance") ? targetRef : undefined;
+      if (preferred && expectedParentSha) {
+        const curTip = runGit(mainRoot, ["rev-parse", "--verify", `refs/heads/${preferred}`]);
+        if (curTip.ok && curTip.stdout && curTip.stdout !== expectedParentSha) {
+          throw new Error(`Concurrent update detected on preview branch "${preferred}" (expected ${expectedParentSha.slice(0, 12)}, found ${curTip.stdout.slice(0, 12)}); refusing to overwrite.`);
+        }
+      }
       const br = createOrUpdatePreviewBranch(mainRoot, flowId, sha.stdout, preferred);
       if (!br.ok) throw new Error(br.error);
       return { commitRef: br.branch, commitSha: sha.stdout };
     },
 
-    async mergeWorktrees({ cwd, flowId, nodeId, sourceRefs, landingMode }) {
+    async mergeWorktrees({ cwd, flowId, nodeId, sourceRefs, landingMode, baseCommitSha }) {
       const entries = Object.entries(sourceRefs).filter(([, ref]) => Boolean(ref));
       if (entries.length === 0) return { ok: true, mergedRef: null, mergedCommitSha: null, summary: "No changes to merge across parallel worktrees." };
       const { gitRoot } = resolveGitLayout(cwd);
-      const baseRef = captureOrGetBaseRef(gitRoot, flowId);
+      const baseRef = baseCommitSha ?? captureOrGetBaseRef(gitRoot, flowId);
       const root = worktreeRoot(gitRoot, flowId);
       mkdirSync(root, { recursive: true });
       const mergeWt = path.join(root, `_merge-${safeToken(nodeId)}`);

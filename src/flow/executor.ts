@@ -18,16 +18,17 @@ import {
   executeRoleStep, type RoleSessionPoolLike, type RoleSessionRunner, type RoleSupervisorConfig,
 } from "./orchestrator.ts";
 import type { FlowObserver } from "./state.ts";
+import { migrateLegacySubStateMachine } from "./workflow.ts";
 
 export interface WorktreeManagerLike {
   isGitRepo(cwd: string): boolean;
-  prepareNodeWorktree(input: { cwd: string; flowId: string; nodeId: string }): Promise<{ worktreePath: string; baseRef: string }>;
+  prepareNodeWorktree(input: { cwd: string; flowId: string; nodeId: string; baseCommitSha?: string }): Promise<{ worktreePath: string; baseRef: string }>;
   commitNodeWorktree(input: { worktreePath: string; flowId: string; nodeId: string; summary: string }): Promise<string | null>;
   commitAndUpdatePreviewRef?(input: {
-    cwd: string; worktreePath: string; flowId: string; nodeId: string; targetRef: string; summary: string;
+    cwd: string; worktreePath: string; flowId: string; nodeId: string; targetRef: string; expectedParentSha?: string; summary: string;
   }): Promise<{ commitRef: string; commitSha: string } | null>;
   mergeWorktrees(input: {
-    cwd: string; flowId: string; nodeId: string; sourceRefs: Record<string, string>; landingMode: "apply" | "branch_preview";
+    cwd: string; flowId: string; nodeId: string; sourceRefs: Record<string, string>; landingMode: "apply" | "branch_preview"; baseCommitSha?: string;
   }): Promise<{ ok: boolean; mergedRef?: string | null; mergedCommitSha?: string | null; summary: string; conflicts?: string[] }>;
   withCommitWorktree?<T>(
     input: { cwd: string; flowId: string; nodeId: string; commitRef: string },
@@ -114,16 +115,33 @@ function resolveUpstreamHandoff(state: FlowMachineState, node: FlowNodeSpec, ini
   return initialHandoff;
 }
 
+function snapshotReferencedRoles(
+  spec: FlowGraphSpec, roles: ReadonlyMap<string, RoleSpec>, existing?: Record<string, RoleSpec>,
+): Record<string, RoleSpec> {
+  const out: Record<string, RoleSpec> = existing ? { ...existing } : {};
+  for (const n of spec.nodes) {
+    if (n.kind === "role" && n.role && !out[n.role]) {
+      const r = roles.get(n.role);
+      if (r) out[n.role] = structuredClone(r);
+    }
+  }
+  return out;
+}
+
 export async function executeFlowGraph(
   input: ExecuteFlowGraphInput,
 ): Promise<FlowRunResult & { finalState: FlowMachineState }> {
-  const isRo = (roleId: string): boolean => isRoleReadOnly(input.roles.get(roleId));
+  const effectiveSpec = input.validation.normalizedSpec ?? input.spec;
   let state: FlowMachineState = input.initialState
-    ? { ...input.initialState }
+    ? migrateLegacySubStateMachine({ ...input.initialState }, input.roles)
     : createInitialFlowState({
         flowId: input.flowId, mandateId: input.mandate.id, cwd: input.cwd,
-        spec: input.spec, validation: input.validation, initialHandoffId: input.initialHandoff?.id ?? null, nowIso: nowIso(),
+        spec: effectiveSpec, validation: input.validation, initialHandoffId: input.initialHandoff?.id ?? null,
+        roleSnapshots: snapshotReferencedRoles(effectiveSpec, input.roles), nowIso: nowIso(),
       });
+  if (!state.roleSnapshots) state.roleSnapshots = snapshotReferencedRoles(state.spec, input.roles);
+  const roleOf = (roleId: string): RoleSpec | undefined => state.roleSnapshots?.[roleId] ?? input.roles.get(roleId);
+  const isRo = (roleId: string): boolean => isRoleReadOnly(roleOf(roleId));
 
   const queue: FlowEvent[] = [];
   const inFlight = new Map<string, Promise<void>>();
@@ -162,7 +180,7 @@ export async function executeFlowGraph(
     isInternalAbort: () => boolean,
   ): Promise<void> => {
     const spec = state.spec.nodes.find((n) => n.id === cmd.nodeId)!;
-    const baseRole = input.roles.get(spec.role!)!;
+    const baseRole = roleOf(spec.role!)!;
     const effCwd = cmd.worktreePath ?? input.cwd;
     const upstreamHandoff = resolveUpstreamHandoff(state, spec, input.initialHandoff ?? null);
     const narrowed = resolveNodeEffectiveRole(baseRole, spec);
@@ -199,12 +217,12 @@ export async function executeFlowGraph(
     const res = pinnedPreviewTarget && !cmd.worktreePath && input.worktreeManager?.withCommitWorktree
       ? await input.worktreeManager.withCommitWorktree(
           { cwd: input.cwd, flowId: input.flowId, nodeId: cmd.nodeId, commitRef: pinnedPreviewTarget },
-          async ({ worktreePath }) => {
+          async ({ worktreePath, commitSha }) => {
             const stepRes = await runStepInCwd(worktreePath);
             if (stepRes.ok && stepRes.envelope.verdict === "ready" && !isRoleReadOnly(effRole) && input.worktreeManager?.commitAndUpdatePreviewRef) {
               previewUpdated = await input.worktreeManager.commitAndUpdatePreviewRef({
                 cwd: input.cwd, worktreePath, flowId: input.flowId, nodeId: cmd.nodeId,
-                targetRef: cmd.targetCommitRef ?? state.mergedRef ?? pinnedPreviewTarget, summary: stepRes.envelope.summary,
+                targetRef: cmd.targetCommitRef ?? state.mergedRef ?? pinnedPreviewTarget, expectedParentSha: commitSha, summary: stepRes.envelope.summary,
               });
             }
             return stepRes;
@@ -270,7 +288,10 @@ export async function executeFlowGraph(
         case "PREPARE_WORKTREE":
           launchAsync(cmd.nodeId, async () => {
             if (!input.worktreeManager) throw new Error(`Worktree manager unavailable for node "${cmd.nodeId}".`);
-            const wt = await input.worktreeManager.prepareNodeWorktree({ cwd: input.cwd, flowId: input.flowId, nodeId: cmd.worktreeGroup ?? cmd.nodeId });
+            const wt = await input.worktreeManager.prepareNodeWorktree({
+              cwd: input.cwd, flowId: input.flowId, nodeId: cmd.worktreeGroup ?? cmd.nodeId,
+              ...(cmd.baseCommitSha ? { baseCommitSha: cmd.baseCommitSha } : {}),
+            });
             pushEvent({ type: "NODE_WORKTREE_READY", nodeId: cmd.nodeId, worktreePath: wt.worktreePath });
           });
           break;
@@ -327,6 +348,7 @@ export async function executeFlowGraph(
             const m = await input.worktreeManager.mergeWorktrees({
               cwd: input.cwd, flowId: input.flowId, nodeId: cmd.nodeId,
               sourceRefs: cmd.sourceRefs, landingMode: cmd.config.landingMode ?? "apply",
+              ...(cmd.baseCommitSha ? { baseCommitSha: cmd.baseCommitSha } : {}),
             });
             if (isInternalAbort()) return;
             const handoff: HandoffEnvelope = {
@@ -363,6 +385,7 @@ export async function executeFlowGraph(
   try {
     input.registerLivePatchHandler?.((patch, validated) => {
       if (isFlowTerminal(state.status)) return false;
+      if (validated.normalizedSpec) state.roleSnapshots = snapshotReferencedRoles(validated.normalizedSpec, input.roles, state.roleSnapshots);
       pushEvent({ type: "GRAPH_PATCH", patch, validated });
       return true;
     });

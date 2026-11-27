@@ -20,19 +20,24 @@ function splitHeadAndRest(raw: string): { head: string; rest: string } {
   return idx < 0 ? { head: trimmed, rest: "" } : { head: trimmed.slice(0, idx), rest: trimmed.slice(idx).trim() };
 }
 
+function nextActionHint(s: { status: string; resumable: boolean; questionsForUser?: string[]; remoteOwnerPid?: number | null }): string {
+  if (s.status === "waiting_input") return `待你答复: ${s.questionsForUser?.[0] ?? "请在 /coord 中回复确认"}`;
+  if (s.status === "running") return s.remoteOwnerPid ? `在另一窗口运行 (pid=${s.remoteOwnerPid})` : "后台执行中 (/flow 查看详情)";
+  if (s.resumable) return "需介入: 可在 /coord 续跑或 /flow cancel 取消";
+  if (s.status === "completed") return "已完成";
+  return "待命";
+}
+
 function renderMultiProjectFlowStatus(hub: WorkspaceHub, primaryWs: ManagedWorkspace): string {
   hub.getMonitorTargets(primaryWs);
   const summaries = hub.getAllFlowSummaries();
   const lines = ["跨项目后台专员监控 (/flow status)"];
   for (const s of summaries) {
     const chain = s.roleChain.length > 0 ? s.roleChain.join(" → ") : "待命";
-    const stageInfo = s.graphProgress
-      ? ` · 节点 ${s.graphProgress.done}/${s.graphProgress.total}`
-      : (s.roleChain.length > 0 ? ` · 阶段 ${s.currentIndex + 1}/${s.roleChain.length}` : "");
-    lines.push(`• ${s.cwd}`);
-    lines.push(`  状态: ${s.status}${s.resumable ? " (可续跑)" : ""} · Flow: ${s.flowId ?? "无"} · 专员链: ${chain}${stageInfo}`);
+    const stageInfo = s.graphProgress ? ` · 节点 ${s.graphProgress.done}/${s.graphProgress.total}` : (s.roleChain.length > 0 ? ` · 阶段 ${s.currentIndex + 1}/${s.roleChain.length}` : "");
+    lines.push(`• ${s.cwd}${s.goal ? ` · ${s.goal}` : ""}｜${nextActionHint(s)}`);
+    lines.push(`  状态: ${s.status}${s.resumable ? " (可续跑)" : ""}${s.remoteOwnerPid ? ` [另一窗口 pid=${s.remoteOwnerPid}]` : ""} · Flow: ${s.flowId ?? "无"} · 专员链: ${chain}${stageInfo}${s.updatedAt ? ` · 更新: ${s.updatedAt}` : ""}`);
     if (s.mergedRef) lines.push(`  交付引用: ${s.mergedRef}${s.mergedCommitSha ? ` (${s.mergedCommitSha.slice(0, 12)})` : ""}`);
-    if (s.goal) lines.push(`  目标: ${s.goal}`);
     if (s.reason) lines.push(`  说明: ${s.reason}`);
   }
   lines.push("提示: 派发或续跑任务请敲 /coord 用自然语言吩咐总秘书 · 紧急停止敲 /flow cancel [flowId]");
@@ -51,16 +56,15 @@ function renderCoordStatusCard(
 
   for (const t of targets) {
     const w = hub.getWorkspace(t.cwd, ctx);
-    if (!w.store.isClosed()) {
-      try { reconcileJobs(w.store); } catch {}
-    }
-    const snap = w.room.getSnapshot();
+    if (!w.store.isClosed()) { try { reconcileJobs(w.store); } catch {} }
+    const snap = hub.getEffectiveSnapshot(w);
     const jobs = !w.store.isClosed() ? w.store.listJobs() : [];
     const runningJobs = jobs.filter((j) => j.status === "running").length;
-    const flowDetail = snap.flowId ? `${snap.status} (${snap.roleChain.join(" → ")})` : snap.status;
+    const remoteTag = snap.remoteOwnerPid ? ` · 另一窗口 pid=${snap.remoteOwnerPid}` : "";
+    const flowDetail = snap.flowId ? `${snap.status}${remoteTag} (${snap.roleChain.join(" → ")})${snap.goal ? ` · ${snap.goal}` : ""}` : snap.status;
     const trustTag = w.isTrusted ? "trusted" : "untrusted";
-    uiProjects.push(`  - ${w.cwd} [${w.isTrusted ? "已信任" : "待信任"}] · 协作流=${flowDetail} · 后台任务=${runningJobs}/${jobs.length}`);
-    metaProjects.push(`- ${w.cwd} [${trustTag}] · flow=${snap.flowId ? `${snap.status} (${snap.flowId}: ${snap.roleChain.join("→")})` : snap.status} · jobs=${runningJobs}/${jobs.length}`);
+    uiProjects.push(`  - ${w.cwd} [${w.isTrusted ? "已信任" : "待信任"}] · 协作流=${flowDetail}${snap.updatedAt ? ` · 更新=${snap.updatedAt}` : ""} · 后台任务=${runningJobs}/${jobs.length}`);
+    metaProjects.push(`- ${w.cwd} [${trustTag}] · flow=${snap.flowId ? `${snap.status} (${snap.flowId}: ${snap.roleChain.join("→")})` : snap.status}${snap.remoteOwnerPid ? ` remotePid=${snap.remoteOwnerPid}` : ""} · jobs=${runningJobs}/${jobs.length}`);
   }
 
   const modeDesc = activeId === "coordinator"
@@ -290,14 +294,18 @@ export function registerEnhanceCommands(
           }
         }
         if (head === "delete") {
-          if (!rest) return ws.emitMessage(ctx, "Usage: /role delete <customRoleId>");
+          const toks = rest.split(/\s+/).filter(Boolean);
+          const delScope: "project" | "global" | undefined = toks.includes("--project") ? "project" : toks.includes("--global") ? "global" : undefined;
+          const delId = toks.find((t) => !t.startsWith("--")) ?? "";
+          if (!delId) return ws.emitMessage(ctx, "Usage: /role delete [--project|--global] <customRoleId>");
           try {
-            deleteCustomRole({ id: rest, cwd: ws.cwd, globalRolesDir: ws.globalRolesDir, builtinRolesDir: ws.builtinRolesDir });
+            const removed = deleteCustomRole({ id: delId, cwd: ws.cwd, globalRolesDir: ws.globalRolesDir, builtinRolesDir: ws.builtinRolesDir, ...(delScope ? { scope: delScope } : {}) });
             ws.refresh(ctx);
-            if (ws.getSessionRoleId(ctx) === rest) {
+            if (ws.getSessionRoleId(ctx) === delId && !ws.roles.has(delId)) {
               await ws.applyActiveRole(defaultRoleId(ws.roles, ws.settings), ctx, true);
             }
-            return ws.emitMessage(ctx, `Deleted custom role "${rest}".`);
+            const fb = ws.roles.get(delId);
+            return ws.emitMessage(ctx, `Deleted custom role "${delId}" (${removed.join(", ")})${fb ? `; now using [${fb.source}]` : ""}.`);
           } catch (err) {
             return ws.emitMessage(ctx, err instanceof Error ? err.message : String(err));
           }

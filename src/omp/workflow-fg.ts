@@ -7,12 +7,17 @@ import { createInitialFlowState, transitionFlow } from "../flow/machine.ts";
 import { compileRoleWorkflow, type CompiledRoleWorkflow } from "../flow/workflow.ts";
 
 const MUTATING_SET = new Set<string>(MUTATING_HOST_TOOLS);
-const STATUS_QUERY_RE = /(?:进度|进展|状态|情况|到哪|卡在哪|卡在|怎么样|如何|还要多久|做完了吗|跑完了吗|status|progress|update|how'?s it going|where are we|what'?s the status)/i;
-const EXPLICIT_APPROVAL_RE = /(?:同意|批准|确认|可以|继续|采用|通过|放行|没问题|好的|行|开始吧|用这个|按这个|approve|confirm|proceed|continue|go ahead|yes|ok|lgtm)/i;
+const NEGATION_OR_DEFER_RE = /(?:不要|先不|先别|别[再继续批准同意通过放行]|暂缓|暂停|稍等|等等|再看看|再看|还没|尚未|不批准|不同意|不确认|不通过|拒绝|取消|算了|先看|先确认|等我|还要看|还需|hold\s*on|wait\b|not\s+yet|don'?t|do\s+not|cancel|reject|defer|later|stop\b)/i;
+const STATUS_QUERY_RE = /(?:进度|进展|状态|情况|到哪|卡在哪|卡在|怎么样|如何|还要多久|做完了吗|跑完了吗|为什么|什么意思|status|progress|update|how'?s|where are we|what'?s)/i;
+const QUESTION_END_RE = /(?:[?？]|(?:吗|呢|么)[？?。!！\s]*)$/;
 
 export function isStatusOrProgressQuery(text: string): boolean {
   const clean = text.trim();
-  return !clean || (STATUS_QUERY_RE.test(clean) && !EXPLICIT_APPROVAL_RE.test(clean));
+  if (!clean) return true;
+  if (NEGATION_OR_DEFER_RE.test(clean)) return true;
+  if (QUESTION_END_RE.test(clean)) return true;
+  if (STATUS_QUERY_RE.test(clean)) return true;
+  return false;
 }
 
 interface ForegroundWorkflowEntry {
@@ -80,7 +85,7 @@ export class ForegroundWorkflowController {
         }
       : { ...phaseRole, id: role.id, name: role.name };
     const promptNote = waitingHumanPrompt
-      ? `[Active Workflow Phase ${idx + 1}/${total}: ${shortPhaseId} (HUMAN GATE — AWAITING EXPLICIT USER CONFIRMATION)]\nQuestion awaiting user decision: ${waitingHumanPrompt}\nStay read-only on status/clarification queries; only after explicit user confirmation in a new message, call enhance_handoff(verdict="ready", summary=...) to unlock the next phase.`
+      ? `[Active Workflow Phase ${idx + 1}/${total}: ${shortPhaseId} (HUMAN GATE — AWAITING EXPLICIT USER CONFIRMATION)]\nQuestion awaiting user decision: ${waitingHumanPrompt}\nOffer clear options (同意 / 暂缓) alongside natural-language reply. Stay read-only on questions, status checks, or deferrals; only after explicit user confirmation in a new message, call enhance_handoff(verdict="ready", summary=...) to unlock the next phase.`
       : `[Active Workflow Phase ${idx + 1}/${total}: ${shortPhaseId}${spec.title ? ` — ${spec.title}` : ""}]\n${typeof spec.brief === "string" ? spec.brief : ""}\n${lockedProtected.length > 0 ? `Locked protected paths (DO NOT modify): ${lockedProtected.join(", ")}\n` : ""}Call enhance_handoff(verdict="ready", summary=...) when this phase's exit criteria are met to unlock the next phase.`;
     return {
       effectiveRole, phaseId: shortPhaseId, phaseIndex: idx, totalPhases: total,

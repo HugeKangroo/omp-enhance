@@ -16,26 +16,18 @@ export {
 };
 
 export type MonitorInputEvent =
-  | { kind: "escape" }
-  | { kind: "next_project" }
-  | { kind: "prev_project" }
-  | { kind: "up" }
-  | { kind: "down" }
-  | { kind: "scroll_up" }
-  | { kind: "scroll_down" }
-  | { kind: "cancel_flow" };
+  | { kind: "escape" } | { kind: "next_project" } | { kind: "prev_project" }
+  | { kind: "up" } | { kind: "down" } | { kind: "scroll_up" } | { kind: "scroll_down" } | { kind: "cancel_flow" };
 
-export interface FlowMonitorTarget {
-  cwd: string;
-  room: FlowRoomManager;
-}
+export interface FlowMonitorTarget { cwd: string; room: FlowRoomManager; getSnapshot?: () => FlowRoomSnapshot; }
 
 export interface FlowRoomOverlayDeps {
-  ctx: any;
-  room?: FlowRoomManager;
-  targets?: readonly FlowMonitorTarget[];
-  getTargets?: () => readonly FlowMonitorTarget[];
+  ctx: any; room?: FlowRoomManager; targets?: readonly FlowMonitorTarget[]; getTargets?: () => readonly FlowMonitorTarget[];
 }
+
+const targetSnap = (t?: FlowMonitorTarget): FlowRoomSnapshot =>
+  t ? (t.getSnapshot ? t.getSnapshot() : t.room.getSnapshot())
+    : { flowId: null, goal: "", roleChain: [], status: "idle", startedAt: null, endedAt: null, activeStageId: null, entries: [], stages: [] };
 
 const toneColor = (t: RoomEntry["tone"]): string =>
   t === "success" ? "success" : t === "warning" ? "warning" : t === "error" ? "error" : "accent";
@@ -274,7 +266,9 @@ function buildInspectorLines(snap: FlowRoomSnapshot, selected: RoomEntry | undef
   if (!stage) {
     const lines = [
       ...(cwd ? [`目录: ${cwd}`] : []),
-      `Flow: ${snap.flowId ?? "(空闲)"}`, `状态: ${snapshotStatusBadge(snap).text}`,
+      `Flow: ${snap.flowId ?? "(空闲)"}`,
+      `状态: ${snapshotStatusBadge(snap).text}${snap.remoteOwnerPid ? ` (在另一窗口运行 pid=${snap.remoteOwnerPid})` : ""}`,
+      ...(snap.updatedAt ? [`更新时间: ${snap.updatedAt}`] : []),
       `专员链: ${snap.roleChain.length > 0 ? snap.roleChain.join(" → ") : "(无)"}`, "─".repeat(Math.min(28, rightW)),
       selected ? `发言者: ${selected.speaker} (${selected.badge ?? "消息"})` : "说明: 只读监控窗；任务派发与补充回答请在 /coord 聊天框进行",
     ];
@@ -322,15 +316,9 @@ function buildInspectorLines(snap: FlowRoomSnapshot, selected: RoomEntry | undef
 }
 
 function pickInitialProjectIdx(targets: readonly FlowMonitorTarget[]): number {
-  const activeIdx = targets.findIndex((t) => {
-    const st = t.room.getSnapshot().status;
-    return st === "running" || st === "waiting_input";
-  });
+  const activeIdx = targets.findIndex((t) => { const st = targetSnap(t).status; return st === "running" || st === "waiting_input"; });
   if (activeIdx >= 0) return activeIdx;
-  const nonIdleIdx = targets.findIndex((t) => {
-    const snap = t.room.getSnapshot();
-    return snap.status !== "idle" || snap.stages.length > 0 || snap.entries.length > 0;
-  });
+  const nonIdleIdx = targets.findIndex((t) => { const snap = targetSnap(t); return snap.status !== "idle" || snap.stages.length > 0 || snap.entries.length > 0; });
   return nonIdleIdx >= 0 ? nonIdleIdx : 0;
 }
 
@@ -347,14 +335,14 @@ export async function openFlowRoomOverlay(deps: FlowRoomOverlayDeps): Promise<vo
     const fg = (c: string, s: string): string => (typeof theme?.fg === "function" ? theme.fg(c, s) : s);
     const initialTargets = resolveTargets();
     let focused = true, projectIdx = pickInitialProjectIdx(initialTargets), followTail = true, rightScroll = 0, statusNote = "";
-    let cursor = Math.max(0, (initialTargets[projectIdx]?.room.getSnapshot().entries.length ?? 1) - 1);
+    let cursor = Math.max(0, (targetSnap(initialTargets[projectIdx]).entries.length || 1) - 1);
     const unsubs = new Map<FlowRoomManager, () => void>();
     const syncSubs = () => {
       for (const t of resolveTargets()) {
         if (unsubs.has(t.room)) continue;
         unsubs.set(t.room, t.room.subscribe(() => {
           const cur = resolveTargets()[projectIdx];
-          if (followTail && cur?.room === t.room) cursor = Math.max(0, cur.room.getSnapshot().entries.length - 1);
+          if (followTail && cur?.room === t.room) cursor = Math.max(0, targetSnap(cur).entries.length - 1);
           tui?.requestRender?.();
         }));
       }
@@ -362,7 +350,7 @@ export async function openFlowRoomOverlay(deps: FlowRoomOverlayDeps): Promise<vo
     syncSubs();
     const timer = setInterval(() => {
       syncSubs();
-      if (resolveTargets().some((t) => t.room.isRunning())) tui?.requestRender?.();
+      if (resolveTargets().some((t) => targetSnap(t).status === "running")) tui?.requestRender?.();
     }, 400);
     const cleanup = () => { clearInterval(timer); for (const u of unsubs.values()) u(); unsubs.clear(); };
 
@@ -376,13 +364,13 @@ export async function openFlowRoomOverlay(deps: FlowRoomOverlayDeps): Promise<vo
         if (ev.kind === "escape") { cleanup(); done(undefined); return; }
         if ((ev.kind === "next_project" || ev.kind === "prev_project") && targets.length > 0) {
           projectIdx = ev.kind === "next_project" ? (projectIdx + 1) % targets.length : (projectIdx - 1 + targets.length) % targets.length;
-          const snap = targets[projectIdx]!.room.getSnapshot();
+          const snap = targetSnap(targets[projectIdx]);
           cursor = Math.max(0, snap.entries.length - 1); followTail = true; rightScroll = 0; statusNote = "";
           tui?.requestRender?.(); return;
         }
         const activeTarget = targets[Math.min(projectIdx, Math.max(0, targets.length - 1))];
         if (!activeTarget) return;
-        const snap = activeTarget.room.getSnapshot();
+        const snap = targetSnap(activeTarget);
         if (ev.kind === "up" || ev.kind === "down") {
           const last = Math.max(0, snap.entries.length - 1);
           cursor = ev.kind === "up" ? Math.max(0, cursor - 1) : Math.min(last, cursor + 1);
@@ -400,17 +388,15 @@ export async function openFlowRoomOverlay(deps: FlowRoomOverlayDeps): Promise<vo
       render(width: number): string[] {
         const targets = resolveTargets();
         projectIdx = Math.min(projectIdx, Math.max(0, targets.length - 1));
-        const activeTarget = targets[projectIdx];
-        const snap: FlowRoomSnapshot = activeTarget?.room.getSnapshot() ?? {
-          flowId: null, goal: "", roleChain: [], status: "idle", startedAt: null, endedAt: null, activeStageId: null, entries: [], stages: [],
-        };
+        const activeTarget = targets[projectIdx], snap = targetSnap(activeTarget);
         if (cursor >= snap.entries.length) cursor = Math.max(0, snap.entries.length - 1);
         const inner = Math.max(46, width - 4), bodyRows = 14;
         const leftW = Math.max(22, Math.floor(inner * 0.5)), rightW = Math.max(20, inner - leftW - 3);
-        const title = `⇄ Flow 跨项目只读监控窗 · ${snap.roleChain.join(" → ") || "待命"} [${snapshotStatusBadge(snap).text}]`;
+        const remoteTag = snap.remoteOwnerPid ? ` · 另一窗口(pid=${snap.remoteOwnerPid})` : "";
+        const title = `⇄ Flow 跨项目只读监控窗 · ${snap.roleChain.join(" → ") || "待命"} [${snapshotStatusBadge(snap).text}${remoteTag}]`;
         const out = [fg("border", `╭─ ${padLeftCell(title, inner - 2)} ─╮`)];
         const tabs = targets.map((t, i) => {
-          const icon = flowStatusIcon(t.room.getSnapshot().status);
+          const icon = flowStatusIcon(targetSnap(t).status);
           const label = `[${i + 1}/${targets.length} ${icon} ${shortProjectLabel(t.cwd)}]`;
           return i === projectIdx ? fg("accent", `▸${label}`) : fg("muted", ` ${label}`);
         }).join(" ");

@@ -14,12 +14,14 @@ import {
   evaluateFlowSettlement,
   formatWaitingNodesReason,
   getNodeSpec,
+  getUnmetResumeDependencies,
   handleRejection,
   handleResilienceRecovery,
   makeNodeRuntime,
   scheduleReadyNodes,
   type MachineTransitionOptions,
 } from "./machine-helpers.ts";
+import type { RoleSpec } from "../core/types.ts";
 
 export { buildFlowGraphSnapshot, type MachineTransitionOptions };
 
@@ -37,6 +39,7 @@ export function createInitialFlowState(input: {
   spec: FlowGraphSpec;
   validation: GraphValidationResult;
   initialHandoffId?: string | null;
+  roleSnapshots?: Record<string, RoleSpec>;
   nowIso: string;
 }): FlowMachineState {
   const effectiveSpec = input.validation.normalizedSpec ?? input.spec;
@@ -53,7 +56,9 @@ export function createInitialFlowState(input: {
     nodes, nodeOrder: effectiveSpec.nodes.map((n) => n.id), waves: input.validation.waves.map((w) => [...w]),
     repairRound: 0, maxRepairRounds: effectiveSpec.policies.maxRepairRounds, lastRejectionSig: null,
     nextStageSeq: 0, boardSeq: 0, initialHandoffId: input.initialHandoffId ?? null,
-    lastHandoffId: input.initialHandoffId ?? null, mergedRef: null, startedAt: null, endedAt: null,
+    lastHandoffId: input.initialHandoffId ?? null, mergedRef: null,
+    ...(input.roleSnapshots ? { roleSnapshots: { ...input.roleSnapshots } } : {}),
+    startedAt: null, endedAt: null,
   };
 }
 
@@ -90,8 +95,18 @@ export function transitionFlow(
         next.reason = formatWaitingNodesReason(next, waitingNodes);
         return finish();
       }
-      if (event.targetNodeId && !next.nodes[event.targetNodeId]) {
-        return { state: next, commands };
+      if (event.targetNodeId) {
+        const tRt = next.nodes[event.targetNodeId];
+        if (!tRt) return { state: next, commands };
+        const unmet = getUnmetResumeDependencies(next, event.targetNodeId);
+        const eligible = tRt.status === "waiting_input" || (
+          (tRt.status === "ready" || tRt.status === "running" || tRt.status === "failed" || tRt.status === "retrying" || tRt.status === "cancelled") &&
+          unmet.length === 0
+        );
+        if (!eligible) {
+          next.reason = `Node "${event.targetNodeId}" is not ready to resume (status=${tRt.status}${unmet.length ? `; unmet dependencies: ${unmet.map((u) => `${u.nodeId} (${u.status})`).join(", ")}` : ""}).`;
+          return finish();
+        }
       }
       const prevStatus = next.status;
       next.status = "running"; next.endedAt = null; next.reason = undefined;
@@ -292,18 +307,33 @@ export function transitionFlow(
         const rt = next.nodes[skipId];
         if (rt && (rt.status === "pending" || rt.status === "ready")) { rt.status = "skipped"; rt.endedAt = nowIso; }
       }
-      for (const rw of patch.rewireDeps ?? []) { const spec = getNodeSpec(next, rw.nodeId); if (spec) spec.dependsOn = [...rw.dependsOn]; }
-      for (const add of patch.addNodes ?? []) {
-        const norm = validated?.normalizedSpec?.nodes.find((n) => n.id === add.id) ?? add;
-        next.spec.nodes.push({ ...norm, dependsOn: [...norm.dependsOn] });
-        next.nodeOrder.push(norm.id);
-        next.nodes[norm.id] = makeNodeRuntime(norm, validated?.waveByNode[norm.id] ?? 0, validated?.effectiveWorkspaceByNode[norm.id] ?? norm.workspace ?? "inherit");
+      let addedCount = 0;
+      if (validated?.normalizedSpec) {
+        next.spec = {
+          ...validated.normalizedSpec,
+          nodes: validated.normalizedSpec.nodes.map((n) => ({ ...n, dependsOn: [...n.dependsOn] })),
+          policies: { ...validated.normalizedSpec.policies },
+        };
+        for (const norm of next.spec.nodes) {
+          if (next.nodes[norm.id]) continue;
+          next.nodeOrder.push(norm.id);
+          next.nodes[norm.id] = makeNodeRuntime(norm, validated.waveByNode[norm.id] ?? 0, validated.effectiveWorkspaceByNode[norm.id] ?? norm.workspace ?? "inherit");
+          addedCount += 1;
+        }
+      } else {
+        for (const rw of patch.rewireDeps ?? []) { const spec = getNodeSpec(next, rw.nodeId); if (spec) spec.dependsOn = [...rw.dependsOn]; }
+        for (const add of patch.addNodes ?? []) {
+          next.spec.nodes.push({ ...add, dependsOn: [...add.dependsOn] });
+          next.nodeOrder.push(add.id);
+          next.nodes[add.id] = makeNodeRuntime(add, 0, add.workspace ?? "inherit");
+          addedCount += 1;
+        }
       }
       if (validated) {
         next.waves = validated.waves.map((w) => [...w]);
         for (const [id, w] of Object.entries(validated.waveByNode)) if (next.nodes[id]) next.nodes[id]!.waveIndex = w;
       }
-      commands.push({ type: "APPEND_BOARD", entry: { kind: "system", speaker: "coordinator", target: "all", text: `动态更新任务图 (+${patch.addNodes?.length ?? 0} 节点, 跳过 ${patch.skipNodeIds?.length ?? 0} 节点)` } });
+      commands.push({ type: "APPEND_BOARD", entry: { kind: "system", speaker: "coordinator", target: "all", text: `动态更新任务图 (+${addedCount} 节点, 跳过 ${patch.skipNodeIds?.length ?? 0} 节点)` } });
       scheduleReadyNodes(next, commands, nowIso);
       evaluateFlowSettlement(next, commands, nowIso);
       return finish();

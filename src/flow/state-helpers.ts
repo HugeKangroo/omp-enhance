@@ -44,6 +44,9 @@ export function snapshotFromCheckpoint(cp: PersistedFlowCheckpoint, fallbackCwd?
       : [],
     userSteers: steers,
     ...(snap.graphSnapshot ? { graphSnapshot: snap.graphSnapshot } : {}),
+    ...(snap.roleSnapshots ? { roleSnapshots: snap.roleSnapshots } : {}),
+    ...(cp.status === "running" && cp.ownerPid && cp.ownerPid !== process.pid ? { remoteOwnerPid: cp.ownerPid } : {}),
+    ...(cp.updatedAt ? { updatedAt: cp.updatedAt } : {}),
   };
 }
 

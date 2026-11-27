@@ -286,20 +286,21 @@ export function deleteCustomRole(input: {
   globalRolesDir?: string;
   builtinRolesDir?: string;
   profile?: string;
+  scope?: "project" | "global";
 }): string[] {
   if (hasBuiltinRole(input.id, input.builtinRolesDir)) {
     throw new Error(`Built-in role "${input.id}" cannot be deleted.`);
   }
   const globalDir = input.globalRolesDir ?? resolveDefaultGlobalRolesDir(input.profile);
   const projectDir = path.join(input.cwd, ".omp", "roles");
+  const dirs = input.scope === "project" ? [projectDir] : input.scope === "global" ? [globalDir] : [projectDir, globalDir];
   const deleted: string[] = [];
-  for (const dir of [projectDir, globalDir]) {
-    for (const candidate of findExactRoleFiles(dir, input.id)) {
-      rmSync(candidate, { force: true });
-      deleted.push(candidate);
-    }
+  for (const dir of dirs) {
+    const matches = findExactRoleFiles(dir, input.id);
+    for (const candidate of matches) { rmSync(candidate, { force: true }); deleted.push(candidate); }
+    if (!input.scope && deleted.length > 0) break;
   }
-  if (deleted.length === 0) throw new Error(`Custom role "${input.id}" not found.`);
+  if (deleted.length === 0) throw new Error(`Custom role "${input.id}" not found${input.scope ? ` in ${input.scope} scope` : ""}.`);
   return deleted;
 }
 

@@ -36,6 +36,7 @@ export interface FlowRoomSnapshot {
   flowId: string | null; mandateId?: string; goal: string; cwd?: string; roleChain: string[]; status: FlowRoomStatus; reason?: string;
   currentIndex?: number; repairRound?: number; startedAt: string | null; endedAt: string | null; activeStageId: string | null;
   entries: RoomEntry[]; stages: FlowStageTrace[]; userSteers?: FlowUserSteer[]; graphSnapshot?: FlowGraphSnapshot | null;
+  roleSnapshots?: Record<string, RoleSpec>; remoteOwnerPid?: number | null; updatedAt?: string;
 }
 export interface FlowRoomUiAdapter {
   mountWidget?: (room: FlowRoomManager, ctx?: any) => void; clearWidget?: (ctx?: any) => void;
@@ -50,6 +51,7 @@ export class FlowRoomManager {
   private lastRejectionSig: string | null = null; private userSteers: FlowUserSteer[] = [];
   private graphSnapshot: FlowGraphSnapshot | null = null; private graphSpecJson: string | null = null;
   private machineStateJson: string | null = null; private leaseMode: FlowLeaseMode = "write_main";
+  private roleSnapshots: Record<string, RoleSpec> | null = null;
   private reason: string | undefined; private startedAt: string | null = null; private endedAt: string | null = null;
   private activeStageId: string | null = null; private entries: RoomEntry[] = []; private stages: FlowStageTrace[] = [];
   private controlStack: Array<{ stageId: string; controls: ActiveStageControls }> = [];
@@ -121,6 +123,7 @@ export class FlowRoomManager {
         ...(this.reason ? { reason: this.reason } : {}), startedAt: this.startedAt, endedAt: this.endedAt,
         activeStageId: this.activeStageId, entries: this.entries, stages: this.stages, userSteers: this.userSteers,
         ...(this.graphSnapshot ? { graphSnapshot: this.graphSnapshot } : {}),
+        ...(this.roleSnapshots ? { roleSnapshots: this.roleSnapshots } : {}),
       });
       const saved = this.store.saveFlowCheckpoint({
         flowId: this.flowId, mandateId: this.mandateId, goal: this.goal, ...(this.cwd ? { cwd: this.cwd } : {}),
@@ -149,7 +152,7 @@ export class FlowRoomManager {
     this.lastHandoffId = cp.lastHandoffId; this.maxRepairRounds = cp.maxRepairRounds; this.stateVersion = cp.stateVersion ?? 0;
     this.startedAt = snap.startedAt; this.endedAt = snap.endedAt; this.reason = snap.reason;
     this.entries = snap.entries; this.stages = snap.stages; this.userSteers = snap.userSteers ?? [];
-    this.graphSnapshot = snap.graphSnapshot ?? null; this.graphSpecJson = cp.graphSpecJson ?? null;
+    this.graphSnapshot = snap.graphSnapshot ?? null; this.roleSnapshots = snap.roleSnapshots ?? null; this.graphSpecJson = cp.graphSpecJson ?? null;
     this.machineStateJson = cp.machineStateJson ?? null; this.leaseMode = cp.leaseMode ?? "write_main";
     this.lastRejectionSig = cp.lastRejectionSig ?? null;
     this.seq = Math.max(this.entries.length, computeMaxIdSeq(this.entries, this.stages)) + 1;
@@ -201,6 +204,7 @@ export class FlowRoomManager {
       stages: this.stages.map((s) => ({ ...s, calls: s.calls.map((c) => ({ ...c, touchedPaths: [...c.touchedPaths] })), notes: [...s.notes] })),
       userSteers: this.userSteers.map((u) => ({ ...u })),
       ...(this.graphSnapshot ? { graphSnapshot: this.graphSnapshot } : {}),
+      ...(this.roleSnapshots ? { roleSnapshots: this.roleSnapshots } : {}),
     };
   }
 
@@ -225,7 +229,7 @@ export class FlowRoomManager {
 
   beginFlow(input: {
     flowId?: string; mandateId?: string; goal: string; roleChain: string[]; leaseMode?: FlowLeaseMode;
-    maxRepairRounds?: number; lastHandoffId?: string | null; initiatorText?: string; ctx?: any;
+    maxRepairRounds?: number; lastHandoffId?: string | null; initiatorText?: string; roleSnapshots?: Record<string, RoleSpec>; ctx?: any;
   }): string {
     if (this.status === "running") throw new Error("已有正在运行的协作 Flow；可通过 steer 插话、/flow 查看或 cancel 取消。");
     const nextFlowId = input.flowId ?? `flow-${Date.now().toString(36)}-${this.seq + 1}`;
@@ -237,6 +241,7 @@ export class FlowRoomManager {
       this.leaseToken = acq.leaseToken; this.stateVersion = acq.stateVersion;
     } else { this.leaseToken = null; this.stateVersion = 0; }
     this.disposed = false; this.seq += 1; this.flowId = nextFlowId; this.graphSnapshot = null; this.graphSpecJson = null; this.machineStateJson = null;
+    this.roleSnapshots = input.roleSnapshots ? { ...input.roleSnapshots } : null;
     this.mandateId = input.mandateId ?? ""; this.goal = input.goal; this.roleChain = [...input.roleChain];
     this.currentIndex = 0; this.repairRound = 0; this.lastHandoffId = input.lastHandoffId ?? null;
     this.maxRepairRounds = input.maxRepairRounds ?? 2; this.nextStageSeq = 0; this.lastRejectionSig = null;

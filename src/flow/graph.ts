@@ -170,24 +170,31 @@ export function validateFlowGraph(input: {
     }
   }
 
+  const previewMergeIds = new Set(
+    spec.nodes.filter((n) => n.kind === "merge" && n.merge?.landingMode === "branch_preview" && !input.skippedNodeIds?.has(n.id)).map((n) => n.id),
+  );
+  const afterPreview = (id: string): boolean => [...(ancestors.get(id) ?? [])].some((a) => previewMergeIds.has(a));
   const writableIds = [...writableRoleByNode.keys()];
   for (let i = 0; i < writableIds.length; i++) {
     for (let j = i + 1; j < writableIds.length; j++) {
       const aId = writableIds[i]!, bId = writableIds[j]!;
       if (ancestors.get(aId)?.has(bId) || ancestors.get(bId)?.has(aId)) continue;
       const nodeA = byId.get(aId)!, nodeB = byId.get(bId)!;
-      const overlaps = globScopesMayOverlap(
+      const bothAfterPreview = afterPreview(aId) && afterPreview(bId);
+      const overlaps = bothAfterPreview || globScopesMayOverlap(
         resolveEffectiveWritableScope(writableRoleByNode.get(aId)!, nodeA.writableScope),
         resolveEffectiveWritableScope(writableRoleByNode.get(bId)!, nodeB.writableScope),
       );
       if (policies.workspaceStrategy === "auto_worktree" && isGitRepo) {
-        if (nodeA.workspace !== "inherit") effectiveWorkspaceByNode[aId] = "worktree";
-        if (nodeB.workspace !== "inherit") effectiveWorkspaceByNode[bId] = "worktree";
+        if (nodeA.workspace !== "inherit" || bothAfterPreview) effectiveWorkspaceByNode[aId] = "worktree";
+        if (nodeB.workspace !== "inherit" || bothAfterPreview) effectiveWorkspaceByNode[bId] = "worktree";
       }
       if (effectiveWorkspaceByNode[aId] === "inherit" && effectiveWorkspaceByNode[bId] === "inherit" && overlaps) {
         issues.push({
           code: "write_collision", nodeId: aId, otherNodeId: bId,
-          message: `Concurrent write nodes "${aId}" and "${bId}" have overlapping writable scopes (${isGitRepo ? 'set workspace="worktree", narrow writableScope, or serialize via dependsOn' : "non-Git repo requires disjoint writableScope or sequential dependsOn"}).`,
+          message: bothAfterPreview
+            ? `Concurrent writable nodes "${aId}" and "${bId}" after branch_preview merge would overwrite each other's preview commits (add a downstream merge node with workspace="worktree" or serialize via dependsOn).`
+            : `Concurrent write nodes "${aId}" and "${bId}" have overlapping writable scopes (${isGitRepo ? 'set workspace="worktree", narrow writableScope, or serialize via dependsOn' : "non-Git repo requires disjoint writableScope or sequential dependsOn"}).`,
         });
       }
     }

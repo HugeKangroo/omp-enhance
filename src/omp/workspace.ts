@@ -10,8 +10,9 @@ import type { EnhanceSettings, FlowGraphSpec, FlowRunResult, GraphValidationResu
 import { executeFlowGraph } from "../flow/executor.ts";
 import { validateFlowGraph } from "../flow/graph.ts";
 import { executeRoleFlow, type RoleSessionRunner, type RoleSupervisorConfig } from "../flow/orchestrator.ts";
-import { FlowRoomManager, isCheckpointResumable } from "../flow/state.ts";
+import { FlowRoomManager, isCheckpointResumable, snapshotFromCheckpoint } from "../flow/state.ts";
 import { SessionTrackerRegistry } from "../flow/tracker.ts";
+import { migrateLegacySubStateMachine } from "../flow/workflow.ts";
 import { createGitWorktreeManager, isGitRepo } from "../flow/worktree.ts";
 import { discoverRolesWithDiagnostics } from "../roles/loader.ts";
 import { createFlowRoomUiAdapter, type FlowMonitorTarget } from "../ui/flow-room.ts";
@@ -274,14 +275,18 @@ export function createManagedWorkspace(
       try {
         let res: FlowRunResult;
         if (execInput.graphSpec) {
-          const val = execInput.graphValidation ?? validateFlowGraph({ spec: execInput.graphSpec, roles: ws.roles, isGitRepo: isGitRepo(cwd) });
           const rawPersisted = execInput.resumeGraph ? room.getPersistedMachineState() : null;
-          const persistedState = rawPersisted?.status === "running"
-            ? markMachineStateInterrupted(rawPersisted, new Date().toISOString())
-            : rawPersisted;
+          const effRoles = new Map(ws.roles);
+          for (const [k, v] of Object.entries(rawPersisted?.roleSnapshots ?? {})) effRoles.set(k, v);
+          const migratedPersisted = rawPersisted ? migrateLegacySubStateMachine(rawPersisted, effRoles) : null;
+          const persistedState = migratedPersisted?.status === "running"
+            ? markMachineStateInterrupted(migratedPersisted, new Date().toISOString())
+            : migratedPersisted;
+          const effSpec = persistedState?.spec ?? execInput.graphSpec;
+          const val = execInput.graphValidation ?? validateFlowGraph({ spec: effSpec, roles: effRoles, isGitRepo: isGitRepo(cwd) });
           res = await executeFlowGraph({
-            cwd, store, flowId, mandate: execInput.mandate, spec: execInput.graphSpec, validation: val,
-            initialState: persistedState, roles: ws.roles, runner: ws.runnerFor(fCtx),
+            cwd, store, flowId, mandate: execInput.mandate, spec: effSpec, validation: val,
+            initialState: persistedState, roles: effRoles, runner: ws.runnerFor(fCtx),
             ...(execInput.resumeTargetNodeId ? { resumeTargetNodeId: execInput.resumeTargetNodeId } : {}),
             ...(execInput.resumeReplyText ? { resumeReplyText: execInput.resumeReplyText } : {}),
             initialHandoff: execInput.initialHandoff, observer: room.createObserver(fCtx), supervisor: ws.supervisorFor(fCtx),
@@ -380,9 +385,11 @@ export function createManagedWorkspace(
       Boolean(activePatchTarget && activePatchTarget.flowId === expectedFlowId && activePatchTarget.handler(patch, validated)),
     startManagedFlow: async ({ ctx: c, originWs, flowId: explicitId, roles: rList, mandate, initialHandoff, maxRepairRounds, background, initiatorText, signal, graphSpec, graphValidation }) => {
       const roleChain = graphSpec ? graphSpec.nodes.map((n) => n.id) : rList.map((r) => r.id);
+      const roleSnapshots: Record<string, RoleSpec> = {};
+      for (const r of rList) roleSnapshots[r.id] = structuredClone(r);
       const flowId = room.beginFlow({
         flowId: explicitId, mandateId: mandate.id, goal: mandate.goal, roleChain, maxRepairRounds,
-        lastHandoffId: initialHandoff?.id ?? null, initiatorText, ctx: c,
+        lastHandoffId: initialHandoff?.id ?? null, initiatorText, roleSnapshots, ctx: c,
         ...(graphValidation ? { leaseMode: graphValidation.leaseMode } : {}),
       });
       const effSignal = combineAbortSignals(signal, room.getAbortSignal());
@@ -405,14 +412,15 @@ export function createManagedWorkspace(
       }
       let persistedSpec: FlowGraphSpec | undefined;
       if (cp?.graphSpecJson) { try { persistedSpec = JSON.parse(cp.graphSpecJson) as FlowGraphSpec; } catch {} }
+      const snapRoles = cp ? snapshotFromCheckpoint(cp, cwd).roleSnapshots : room.getSnapshot().roleSnapshots;
       const chainToValidate = persistedSpec
         ? persistedSpec.nodes.filter((n) => n.kind === "role" && n.role).map((n) => n.role!)
         : (cp ? cp.roleChain : room.getSnapshot().roleChain);
       const rList = chainToValidate.map((id) => {
-        const r = ws.roles.get(id);
-        if (id === "supervisor" || (r && isInternalRole(r))) throw new Error(`Role "${id}" is an internal monitor and cannot run as a Flow stage.`);
-        if (!r) throw new Error(`Unknown role "${id}" in Flow "${effectiveFlowId ?? "flow"}". Restore the role before resuming.`);
-        return r;
+        const live = ws.roles.get(id);
+        if (id === "supervisor" || (live && isInternalRole(live))) throw new Error(`Role "${id}" is an internal monitor and cannot run as a Flow stage.`);
+        if (!live) throw new Error(`Unknown role "${id}" in Flow "${effectiveFlowId ?? "flow"}". Restore the role before resuming.`);
+        return snapRoles?.[id] ?? live;
       });
       const plan = room.resumeFlow(c, targetFlowId);
       let mandate: Mandate, initialHandoff: HandoffEnvelope | null;

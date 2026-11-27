@@ -49,6 +49,7 @@ function stripRoleDraft(role: RoleSpec): Omit<RoleSpec, "source" | "filePath" | 
       ...(role.exit.requireAlgoDeliverables !== undefined ? { requireAlgoDeliverables: role.exit.requireAlgoDeliverables } : {}),
       criteria: [...role.exit.criteria],
     },
+    ...(role.workflow ? { workflow: structuredClone(role.workflow) } : {}),
   };
 }
 
@@ -186,14 +187,19 @@ async function confirmAndDeleteRole(roleId: string, deps: RoleStudioDeps): Promi
     ui.notify?.(`内置默认角色 "${roleId}" 不可删除（若修改过可在配置页选择「恢复内置默认」）`, "warning");
     return false;
   }
-  if ((await ui.confirm?.("删除自定义角色", `确定永久删除自定义角色 "${roleId}" 吗？`)) !== true) return false;
-  deleteCustomRole({ id: roleId, cwd: deps.cwd, globalRolesDir: deps.globalRolesDir, builtinRolesDir: deps.builtinRolesDir });
+  const role = deps.getRoles().get(roleId);
+  const delScope: "project" | "global" = role?.source === "project" ? "project" : "global";
+  const hasGlobalFallback = delScope === "project" && (existsSync(path.join(deps.globalRolesDir, `${roleId}.yaml`)) || existsSync(path.join(deps.globalRolesDir, `${roleId}.yml`)));
+  const fallbackNote = hasGlobalFallback ? `删除后将回退到全局定义 (${path.join(deps.globalRolesDir, `${roleId}.yaml`)})。` : "删除后该自定义角色将被永久移除。";
+  const msg = `范围: [${delScope}]\n路径: ${role?.filePath ?? path.join(targetDirFor(deps, delScope), `${roleId}.yaml`)}\n${fallbackNote}`;
+  if ((await ui.confirm?.(`删除 [${delScope}] 自定义角色 "${roleId}"`, msg)) !== true) return false;
+  deleteCustomRole({ id: roleId, cwd: deps.cwd, globalRolesDir: deps.globalRolesDir, builtinRolesDir: deps.builtinRolesDir, scope: delScope });
   const roles = deps.refreshRoles();
-  if (deps.getActiveRoleId() === roleId) {
+  if (deps.getActiveRoleId() === roleId && !roles.has(roleId)) {
     const pref = (deps.getSettings?.() ?? DEFAULT_ENHANCE_SETTINGS).defaultRole;
     await deps.activateRole(pref && roles.has(pref) && !isInternalRole(roles.get(pref)) ? pref : null);
   }
-  ui.notify?.(`已删除自定义角色 "${roleId}"`, "info");
+  ui.notify?.(`已删除 [${delScope}] 自定义角色 "${roleId}"${roles.has(roleId) ? `（已回退为 [${roles.get(roleId)!.source}]）` : ""}`, "info");
   return true;
 }
 

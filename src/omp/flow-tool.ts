@@ -1,7 +1,9 @@
 import { canRoleUseCompanionTool } from "../core/policy.ts";
 import { ProjectBusyError } from "../core/store.ts";
 import type { FlowMachineState, HandoffEnvelope } from "../core/types.ts";
+import { getUnmetResumeDependencies } from "../flow/machine-helpers.ts";
 import { isCheckpointResumable, parseDirectedSteer, snapshotFromCheckpoint } from "../flow/state.ts";
+import { migrateLegacySubStateMachine, resolveLegacyTargetNodeId } from "../flow/workflow.ts";
 import { buildFlowToolParameters, type SchemaKitLike } from "./flow-schema.ts";
 import { buildAndValidateStartGraph, formatGraphWavesSummary, parseAndValidatePatch } from "./graph-dispatch.ts";
 import type { WorkspaceHub } from "./hub.ts";
@@ -24,37 +26,22 @@ const toolError = (error: unknown) =>
   toolResult({ error: error instanceof Error ? error.message : String(error) }, true);
 
 export async function executeCancelFlow(
-  hub: WorkspaceHub,
-  originWs: ManagedWorkspace,
-  params: { flowId?: string; cwd?: string },
-  ctx: any,
+  hub: WorkspaceHub, originWs: ManagedWorkspace, params: { flowId?: string; cwd?: string }, ctx: any,
 ): Promise<{ cancelled: boolean; cwd: string; flowId: string | null; status: string; reason?: string }> {
-  const reqFlowId = params.flowId?.trim() || undefined;
-  const reqCwd = params.cwd?.trim() || undefined;
+  const reqFlowId = params.flowId?.trim() || undefined, reqCwd = params.cwd?.trim() || undefined;
   const targetWs = hub.resolveFlowWorkspace(originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx, (w) => w.room.hasActiveLeaseOwnership());
-
   if (reqFlowId) {
     if (targetWs.room.hasActiveLeaseOwnership() && targetWs.room.getSnapshot().flowId === reqFlowId) {
       const cancelled = await targetWs.room.cancelActiveFlow(ctx);
       hub.syncGlobalUi(ctx, originWs);
-      const snap = targetWs.room.getSnapshot();
-      return { cancelled, cwd: targetWs.cwd, flowId: reqFlowId, status: snap.status };
+      return { cancelled, cwd: targetWs.cwd, flowId: reqFlowId, status: targetWs.room.getSnapshot().status };
     }
     const tx = targetWs.store.cancelFlowCheckpoint(reqFlowId);
     if (!tx.checkpoint) throw new Error(tx.reason ?? `Unknown flowId "${reqFlowId}".`);
-    if (!targetWs.room.isRunning() && targetWs.room.getSnapshot().flowId === reqFlowId) {
-      targetWs.room.syncFromCheckpoint(tx.checkpoint, ctx);
-    }
+    if (!targetWs.room.isRunning() && targetWs.room.getSnapshot().flowId === reqFlowId) targetWs.room.syncFromCheckpoint(tx.checkpoint, ctx);
     hub.syncGlobalUi(ctx, originWs);
-    return {
-      cancelled: tx.cancelled,
-      cwd: targetWs.cwd,
-      flowId: reqFlowId,
-      status: tx.checkpoint.status,
-      ...(tx.reason ? { reason: tx.reason } : {}),
-    };
+    return { cancelled: tx.cancelled, cwd: targetWs.cwd, flowId: reqFlowId, status: tx.checkpoint.status, ...(tx.reason ? { reason: tx.reason } : {}) };
   }
-
   if (targetWs.room.hasActiveLeaseOwnership()) {
     const cancelled = await targetWs.room.cancelActiveFlow(ctx);
     hub.syncGlobalUi(ctx, originWs);
@@ -63,22 +50,10 @@ export async function executeCancelFlow(
   }
   const activeLease = !targetWs.store.isClosed() ? targetWs.store.getProjectFlowLease() : null;
   if (activeLease) {
-    return {
-      cancelled: false,
-      cwd: targetWs.cwd,
-      flowId: activeLease.flowId,
-      status: "running",
-      reason: `Flow "${activeLease.flowId}" is actively running in another OMP window (pid=${activeLease.ownerPid}).`,
-    };
+    return { cancelled: false, cwd: targetWs.cwd, flowId: activeLease.flowId, status: "running", reason: `Flow "${activeLease.flowId}" is actively running in another OMP window (pid=${activeLease.ownerPid}).` };
   }
   const snap = targetWs.room.getSnapshot();
-  return {
-    cancelled: false,
-    cwd: targetWs.cwd,
-    flowId: snap.flowId,
-    status: snap.status,
-    reason: "No running Flow in target workspace.",
-  };
+  return { cancelled: false, cwd: targetWs.cwd, flowId: snap.flowId, status: snap.status, reason: "No running Flow in target workspace." };
 }
 
 export function registerFlowTool(
@@ -117,46 +92,24 @@ export function registerFlowTool(
               return toolResult({ cwd: targetWs.cwd, ...targetWs.room.getSnapshot(), resumable: targetWs.room.isResumable() });
             }
             const cp = !targetWs.store.isClosed() ? targetWs.store.reclaimDeadCheckpoint(reqFlowId) : null;
-            if (cp) {
-              return toolResult({ cwd: targetWs.cwd, ...snapshotFromCheckpoint(cp, targetWs.cwd), resumable: isCheckpointResumable(cp) });
-            }
-            if (targetWs.room.getSnapshot().flowId === reqFlowId) {
-              return toolResult({ cwd: targetWs.cwd, ...targetWs.room.getSnapshot(), resumable: targetWs.room.isResumable() });
-            }
+            if (cp) return toolResult({ cwd: targetWs.cwd, ...snapshotFromCheckpoint(cp, targetWs.cwd), resumable: isCheckpointResumable(cp) });
+            if (targetWs.room.getSnapshot().flowId === reqFlowId) return toolResult({ cwd: targetWs.cwd, ...targetWs.room.getSnapshot(), resumable: targetWs.room.isResumable() });
             throw new Error(`Unknown flowId "${reqFlowId}".`);
           }
           if (reqCwd) {
             const targetWs = hub.resolveTargetWorkspace(originWs, reqCwd, ctx);
             hub.markFlowSnapshotObserved(targetWs);
-            if (!targetWs.room.hasActiveLeaseOwnership() && !targetWs.store.isClosed()) {
-              const latest = targetWs.store.getLatestFlowCheckpoint();
-              if (latest) {
-                return toolResult({
-                  cwd: targetWs.cwd, ...snapshotFromCheckpoint(latest, targetWs.cwd), resumable: isCheckpointResumable(latest),
-                  ...(targetWs.trustNotice ? { trustNotice: targetWs.trustNotice } : {}),
-                });
-              }
-            }
-            return toolResult({
-              cwd: targetWs.cwd, ...targetWs.room.getSnapshot(), resumable: targetWs.room.isResumable(),
-              ...(targetWs.trustNotice ? { trustNotice: targetWs.trustNotice } : {}),
-            });
+            const latest = !targetWs.room.hasActiveLeaseOwnership() && !targetWs.store.isClosed() ? targetWs.store.getLatestFlowCheckpoint() : null;
+            const snap = latest ? snapshotFromCheckpoint(latest, targetWs.cwd) : targetWs.room.getSnapshot();
+            return toolResult({ cwd: targetWs.cwd, ...snap, resumable: latest ? isCheckpointResumable(latest) : targetWs.room.isResumable(), ...(targetWs.trustNotice ? { trustNotice: targetWs.trustNotice } : {}) });
           }
           hub.markAllSettledFlowsObserved();
-          const latestOrigin = !originWs.room.hasActiveLeaseOwnership() && !originWs.store.isClosed()
-            ? originWs.store.getLatestFlowCheckpoint()
-            : null;
+          const latestOrigin = !originWs.room.hasActiveLeaseOwnership() && !originWs.store.isClosed() ? originWs.store.getLatestFlowCheckpoint() : null;
           const baseSnap = latestOrigin ? snapshotFromCheckpoint(latestOrigin, originWs.cwd) : originWs.room.getSnapshot();
-          const baseResumable = latestOrigin ? isCheckpointResumable(latestOrigin) : originWs.room.isResumable();
-          return toolResult({
-            cwd: originWs.cwd, ...baseSnap, resumable: baseResumable,
-            flows: hub.getAllFlowSummaries(), runningJobs: hub.getAllRunningJobs(),
-          });
+          return toolResult({ cwd: originWs.cwd, ...baseSnap, resumable: latestOrigin ? isCheckpointResumable(latestOrigin) : originWs.room.isResumable(), flows: hub.getAllFlowSummaries(), runningJobs: hub.getAllRunningJobs() });
         }
 
-        if (action === "cancel") {
-          return toolResult(await executeCancelFlow(hub, originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx));
-        }
+        if (action === "cancel") return toolResult(await executeCancelFlow(hub, originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx));
 
         if (action === "steer") {
           const perm = canRoleUseCompanionTool(activeRole, "enhance_flow", "steer");
@@ -165,10 +118,8 @@ export function registerFlowTool(
           if (!msg) throw new Error("enhance_flow steer requires a message.");
           const targetWs = hub.resolveFlowWorkspace(
             originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx,
-            (w) => w.room.hasActiveLeaseOwnership() || w.room.isResumable() ||
-              (!w.store.isClosed() && w.store.listFlowCheckpoints(20).some((c) => NON_TERMINAL_FLOW_STATUSES.has(c.status))),
+            (w) => w.room.hasActiveLeaseOwnership() || w.room.isResumable() || (!w.store.isClosed() && w.store.listFlowCheckpoints(20).some((c) => NON_TERMINAL_FLOW_STATUSES.has(c.status))),
           );
-
           let resolvedFlowId = reqFlowId;
           if (!resolvedFlowId && !targetWs.store.isClosed()) {
             const nonTerminal = targetWs.store.listFlowCheckpoints(50).filter((c) => NON_TERMINAL_FLOW_STATUSES.has(c.status));
@@ -184,13 +135,10 @@ export function registerFlowTool(
           }
           if (!resolvedFlowId) resolvedFlowId = targetWs.room.getSnapshot().flowId ?? undefined;
           if (!resolvedFlowId) throw new Error(`No active or resumable Flow found in ${targetWs.cwd}.`);
-
           if (targetWs.room.hasActiveLeaseOwnership() && targetWs.room.getSnapshot().flowId === resolvedFlowId) {
             const res = await targetWs.room.postUserSteer(msg, ctx);
-            const snap = targetWs.room.getSnapshot();
-            return toolResult({ ok: true, cwd: targetWs.cwd, flowId: resolvedFlowId, ...res, status: snap.status });
+            return toolResult({ ok: true, cwd: targetWs.cwd, flowId: resolvedFlowId, ...res, status: targetWs.room.getSnapshot().status });
           }
-
           const { text: steerText, targetRole } = parseDirectedSteer(msg);
           const liveCp = !targetWs.store.isClosed() ? targetWs.store.getFlowCheckpoint(resolvedFlowId) : null;
           if (!liveCp) throw new Error(`Unknown flowId "${resolvedFlowId}".`);
@@ -200,16 +148,8 @@ export function registerFlowTool(
             if (updatedCp) targetWs.room.syncFromCheckpoint(updatedCp, ctx);
           }
           return toolResult({
-            ok: true,
-            deliveryState: "saved_pending_delivery",
-            delivered: false,
-            savedToCheckpoint: true,
-            steerId: appended.steerId,
-            ...(targetRole ? { queuedForRole: targetRole } : {}),
-            cwd: targetWs.cwd,
-            flowId: resolvedFlowId,
-            status: liveCp.status,
-            activeStageId: null,
+            ok: true, deliveryState: "saved_pending_delivery", delivered: false, savedToCheckpoint: true, steerId: appended.steerId,
+            ...(targetRole ? { queuedForRole: targetRole } : {}), cwd: targetWs.cwd, flowId: resolvedFlowId, status: liveCp.status, activeStageId: null,
           });
         }
 
@@ -221,12 +161,27 @@ export function registerFlowTool(
             (w) => (!w.store.isClosed() && w.store.listFlowCheckpoints(10).some((cp) => isCheckpointResumable(cp))) || w.room.isResumable(),
           );
           targetWs.refresh(ctx);
-          const targetFlowId = reqFlowId ?? (
-            !targetWs.store.isClosed()
-              ? (targetWs.store.listFlowCheckpoints(10).find((c) => isCheckpointResumable(c))?.flowId ??
-                  (targetWs.room.isResumable() ? targetWs.room.getSnapshot().flowId : null))
-              : (targetWs.room.isResumable() ? targetWs.room.getSnapshot().flowId : null)
-          );
+          let targetFlowId = reqFlowId;
+          if (!targetFlowId) {
+            const resumables = !targetWs.store.isClosed()
+              ? targetWs.store.listFlowCheckpoints(50)
+                  .map((c) => (c.status === "running" && (!targetWs.room.hasActiveLeaseOwnership() || targetWs.room.getSnapshot().flowId !== c.flowId) ? (targetWs.store.reclaimDeadCheckpoint(c.flowId) ?? c) : c))
+                  .filter((c) => isCheckpointResumable(c))
+              : [];
+            if (resumables.length > 1) {
+              const candidates = resumables.map((c) => {
+                const sn = snapshotFromCheckpoint(c, targetWs.cwd);
+                const wNodes = (sn.graphSnapshot?.nodes ?? []).filter((n) => n.status === "waiting_input").map((n) => ({ nodeId: n.nodeId, questions: n.questionsForUser ?? [] }));
+                return { flowId: c.flowId, status: c.status, goal: c.goal, ...(wNodes.length ? { waitingNodes: wNodes } : {}) };
+              });
+              const choices = candidates.map((c) => `${c.flowId} [${c.status}: ${c.goal}]`).join("; ");
+              return toolResult({
+                started: false, resumed: false, ok: false, ambiguous: true, requiresFlowId: true, cwd: targetWs.cwd, candidates,
+                error: `Multiple waiting/resumable Flows exist in ${targetWs.cwd}; specify flowId (${choices}).`,
+              }, true);
+            }
+            targetFlowId = resumables[0]?.flowId ?? (targetWs.room.isResumable() ? targetWs.room.getSnapshot().flowId ?? undefined : undefined);
+          }
           if (!targetFlowId) throw new Error("当前没有可断点续跑的中断/失败 Flow。");
           const cp = !targetWs.store.isClosed()
             ? (targetWs.room.hasActiveLeaseOwnership() && targetWs.room.getSnapshot().flowId === targetFlowId
@@ -244,10 +199,12 @@ export function registerFlowTool(
           }
 
           const msg = asString(params.message);
-          const reqNodeId = asString(params.nodeId);
+          const rawNodeId = asString(params.nodeId);
           let persistedMachine: FlowMachineState | null = null;
           if (cp?.machineStateJson) { try { persistedMachine = JSON.parse(cp.machineStateJson) as FlowMachineState; } catch {} }
           else if (targetWs.room.getSnapshot().flowId === targetFlowId) persistedMachine = targetWs.room.getPersistedMachineState();
+          if (persistedMachine) persistedMachine = migrateLegacySubStateMachine(persistedMachine, targetWs.roles);
+          const reqNodeId = persistedMachine ? resolveLegacyTargetNodeId(persistedMachine, rawNodeId) : rawNodeId;
           const waitingIds = persistedMachine?.status === "waiting_input"
             ? persistedMachine.nodeOrder.filter((id) => persistedMachine!.nodes[id]?.status === "waiting_input")
             : [];
@@ -274,6 +231,17 @@ export function registerFlowTool(
               return toolResult({
                 started: false, resumed: false, requiresNodeId: true, cwd: targetWs.cwd, flowId: targetFlowId, waitingNodes,
                 error: `Flow "${targetFlowId}" has multiple waiting nodes (${waitingIds.join(", ")}); specify nodeId to bind the user's answer to a single node.`,
+              }, true);
+            }
+          } else if (persistedMachine && reqNodeId) {
+            const tRt = persistedMachine.nodes[reqNodeId];
+            if (!tRt) return toolResult({ started: false, resumed: false, cwd: targetWs.cwd, flowId: targetFlowId, nodeId: reqNodeId, error: `Unknown nodeId "${reqNodeId}" in Flow "${targetFlowId}".` }, true);
+            const unmet = getUnmetResumeDependencies(persistedMachine, reqNodeId);
+            const eligible = (tRt.status === "ready" || tRt.status === "running" || tRt.status === "failed" || tRt.status === "retrying" || tRt.status === "cancelled") && unmet.length === 0;
+            if (!eligible) {
+              return toolResult({
+                started: false, resumed: false, cwd: targetWs.cwd, flowId: targetFlowId, nodeId: reqNodeId, nodeStatus: tRt.status, unmetDependencies: unmet,
+                error: `Node "${reqNodeId}" cannot be resumed yet (status=${tRt.status}${unmet.length ? `; unmet dependencies: ${unmet.map((u) => `${u.nodeId} (${u.status})`).join(", ")}` : ""}).`,
               }, true);
             }
           }
@@ -391,11 +359,18 @@ export function registerFlowTool(
             suggestion: "Automatic Flow dispatch is disabled (flowRoutingMode=manual). Enable auto or ask in /settings → Plugins → omp-enhance.",
           });
         }
-        if (originWs.settings.flowRoutingMode === "ask" && ctx?.hasUI) {
-          if (typeof ctx?.ui?.confirm !== "function") return toolResult({ started: false, declined: true, reason: "Interactive confirmation unavailable under flowRoutingMode=ask." });
+        if (originWs.settings.flowRoutingMode === "ask") {
           const planSummary = isGraphMode ? formatGraphWavesSummary(spec, validation) : roles.map((r) => r.id).join(" → ");
-          const ok = (await ctx.ui.confirm("启动后台专员协作 Flow？", `目录: ${targetWs.cwd}\n编排计划: ${planSummary}\n目标: ${previewGoal}`)) === true;
-          if (!ok) return toolResult({ started: false, declined: true, reason: "User declined multi-role Flow dispatch." });
+          if (ctx?.hasUI) {
+            if (typeof ctx?.ui?.confirm !== "function") return toolResult({ started: false, declined: true, reason: "Interactive confirmation unavailable under flowRoutingMode=ask." });
+            const ok = (await ctx.ui.confirm("启动后台专员协作 Flow？", `目录: ${targetWs.cwd}\n编排计划: ${planSummary}\n目标: ${previewGoal}`)) === true;
+            if (!ok) return toolResult({ started: false, declined: true, reason: "User declined multi-role Flow dispatch." });
+          } else if (params.confirmed !== true) {
+            return toolResult({
+              started: false, requiresConfirmation: true, cwd: targetWs.cwd, goal: previewGoal, planSummary, roles: roles.map((r) => r.id),
+              reason: 'flowRoutingMode is "ask" without interactive UI; confirm the plan and re-call with confirmed=true to start.',
+            });
+          }
         }
 
         const flowId = `flow-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;

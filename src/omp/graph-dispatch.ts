@@ -27,6 +27,7 @@ export function parseNodeSpecs(rawNodes: unknown): FlowNodeSpec[] {
     if (!id) throw new Error(`Node at index ${idx} requires a string id.`);
     const kind = (asStr(r.kind) ?? "role") as FlowNodeSpec["kind"];
     const dependsOn = Array.isArray(r.dependsOn) ? r.dependsOn.filter((d): d is string => typeof d === "string" && Boolean(d.trim())).map((d) => d.trim()) : [];
+    const tools = asStrArr(r.tools);
     const writableScope = asStrArr(r.writableScope);
     const fallbackModels = asStrArr(r.fallbackModels);
     return {
@@ -37,6 +38,7 @@ export function parseNodeSpecs(rawNodes: unknown): FlowNodeSpec[] {
       dependsOn,
       ...(r.join === "any" || r.join === "all" ? { join: r.join } : {}),
       ...(r.brief !== undefined ? { brief: r.brief as FlowNodeSpec["brief"] } : {}),
+      ...(tools ? { tools } : {}),
       ...(writableScope ? { writableScope } : {}),
       ...(r.workspace === "inherit" || r.workspace === "worktree" ? { workspace: r.workspace } : {}),
       ...(r.sessionMode === "fresh" || r.sessionMode === "reuse" || r.sessionMode === "fork" ? { sessionMode: r.sessionMode } : {}),

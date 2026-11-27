@@ -23,6 +23,7 @@ export interface HubFlowSummary {
   roleChain: string[]; currentIndex: number; repairRound: number; goal: string;
   reason?: string; questionsForUser?: string[]; waitingNodes?: Array<{ nodeId: string; questions: string[] }>;
   mergedRef?: string | null; mergedCommitSha?: string | null; graphProgress?: { done: number; total: number };
+  remoteOwnerPid?: number | null; updatedAt?: string;
 }
 
 export interface PendingWakeup { flowId: string; settlementKey: string; originWs: ManagedWorkspace; ctx: any; report: string; }
@@ -43,6 +44,7 @@ export interface WorkspaceHub {
   flushPendingWakeups(ctx?: any): void;
   isSelfResumeBlockedDuringWakeup(flowId: string, ctx?: any): boolean;
   listWorkspaces(): ManagedWorkspace[];
+  getEffectiveSnapshot(ws: ManagedWorkspace): FlowRoomSnapshot;
   getMonitorTargets(primaryWs?: ManagedWorkspace): FlowMonitorTarget[];
   getAllFlowSummaries(): HubFlowSummary[];
   getAllJobs(status?: BackgroundJob["status"]): BackgroundJob[];
@@ -120,8 +122,12 @@ function toFlowSummary(cwd: string, snap: FlowRoomSnapshot, resumable: boolean):
     ...(waitingNodes.length > 0 ? { waitingNodes } : {}), ...(snap.graphSnapshot?.mergedRef ? { mergedRef: snap.graphSnapshot.mergedRef } : {}),
     ...(snap.graphSnapshot?.mergedCommitSha ? { mergedCommitSha: snap.graphSnapshot.mergedCommitSha } : {}),
     ...(graphProgress ? { graphProgress } : {}),
+    ...(snap.remoteOwnerPid ? { remoteOwnerPid: snap.remoteOwnerPid } : {}),
+    ...(snap.updatedAt ? { updatedAt: snap.updatedAt } : {}),
   };
 }
+
+const FLOW_PRIORITY: Record<string, number> = { waiting_input: 0, running: 1, interrupted: 2, blocked: 2, failed: 2, violation: 2, completed: 3, cancelled: 3, idle: 4 };
 
 function formatFlowEventReport(settlement: BackgroundFlowSettlement): string {
   const { targetWs, flowId, mandate, roleChain, result, error } = settlement;
@@ -183,7 +189,20 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
   const reconcileAllStores = (): void => {
     for (const ws of workspaces.values()) if (!ws.store.isClosed()) { try { reconcileJobs(ws.store); } catch {} }
   };
-  const getActiveTargets = (): readonly FlowMonitorTarget[] => [...workspaces.values()].map((w) => ({ cwd: w.cwd, room: w.room }));
+  const getEffectiveSnapshotFor = (ws: ManagedWorkspace): FlowRoomSnapshot => {
+    if (ws.room.hasActiveLeaseOwnership()) return ws.room.getSnapshot();
+    if (!ws.store.isClosed()) {
+      const cps = ws.store.listFlowCheckpoints(12).map((raw) => (raw.status === "running" ? (ws.store.reclaimDeadCheckpoint(raw.flowId) ?? raw) : raw));
+      const picked = cps.find((c) => c.status === "running") ?? cps.find((c) => c.status === "waiting_input") ?? cps[0];
+      if (picked) {
+        const snap = snapshotFromCheckpoint(picked, ws.cwd);
+        return picked.status === "running" ? { ...snap, remoteOwnerPid: picked.ownerPid ?? process.pid } : snap;
+      }
+    }
+    return ws.room.getSnapshot();
+  };
+  const getActiveTargets = (): readonly FlowMonitorTarget[] =>
+    [...workspaces.values()].map((w) => ({ cwd: w.cwd, room: w.room, getSnapshot: () => getEffectiveSnapshotFor(w) }));
 
   const scheduleFallbackFlush = (): void => {
     clearWakeupTimer();
@@ -253,7 +272,7 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
       if (!isDirectCwd) hydrateTrackedProjectsFor(cwd, effectiveCtx);
       return ws;
     },
-    resolveTargetWorkspace(originWs: ManagedWorkspace, rawCwd: string | undefined, ctx: any): ManagedWorkspace {
+    resolveTargetWorkspace(originWs, rawCwd, ctx): ManagedWorkspace {
       if (!rawCwd) return originWs;
       const targetCwd = path.resolve(originWs.cwd, rawCwd);
       assertExistingDir(targetCwd);
@@ -263,34 +282,29 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
     },
     grantProjectTrust(rawCwd, originWs, ctx): ManagedWorkspace {
       const targetCwd = rawCwd ? path.resolve(originWs.cwd, rawCwd) : originWs.cwd;
-      assertExistingDir(targetCwd);
-      grantProjectTrust(trustStorePath, targetCwd);
-      const ws = hub.resolveTargetWorkspace(originWs, targetCwd, ctx);
-      ws.refresh(ctx); return ws;
+      assertExistingDir(targetCwd); grantProjectTrust(trustStorePath, targetCwd);
+      const ws = hub.resolveTargetWorkspace(originWs, targetCwd, ctx); ws.refresh(ctx); return ws;
     },
     revokeProjectTrust(rawCwd, originWs, ctx): ManagedWorkspace {
       const targetCwd = rawCwd ? path.resolve(originWs.cwd, rawCwd) : originWs.cwd;
-      assertExistingDir(targetCwd);
-      revokeProjectTrust(trustStorePath, targetCwd);
-      const ws = hub.resolveTargetWorkspace(originWs, targetCwd, ctx);
-      ws.refresh(ctx); return ws;
+      assertExistingDir(targetCwd); revokeProjectTrust(trustStorePath, targetCwd);
+      const ws = hub.resolveTargetWorkspace(originWs, targetCwd, ctx); ws.refresh(ctx); return ws;
     },
-    findWorkspaceByFlowId(flowId: string, ctx?: any): ManagedWorkspace | undefined {
+    findWorkspaceByFlowId(flowId, ctx): ManagedWorkspace | undefined {
       for (const ws of workspaces.values()) if (ws.room.getSnapshot().flowId === flowId) return ws;
       for (const ws of workspaces.values()) if (!ws.store.isClosed() && ws.store.getFlowCheckpoint(flowId)) return ws;
       hydrateTrackedProjectsFor(primaryCwd, ctx, true);
       for (const ws of workspaces.values()) if (!ws.store.isClosed() && ws.store.getFlowCheckpoint(flowId)) return ws;
       return undefined;
     },
-    findWorkspaceByJobId(jobId: string): ManagedWorkspace | undefined {
+    findWorkspaceByJobId(jobId): ManagedWorkspace | undefined {
       for (const ws of workspaces.values()) if (!ws.store.isClosed() && ws.store.getJob(jobId)) return ws;
       return undefined;
     },
     resolveFlowWorkspace(originWs, params, ctx, predicate): ManagedWorkspace {
       if (params.flowId) {
         const found = params.cwd ? hub.resolveTargetWorkspace(originWs, params.cwd, ctx) : hub.findWorkspaceByFlowId(params.flowId, ctx);
-        if (!found) throw new Error(`Unknown flowId "${params.flowId}".`);
-        if (found.room.getSnapshot().flowId !== params.flowId && (found.store.isClosed() || !found.store.getFlowCheckpoint(params.flowId))) {
+        if (!found || (found.room.getSnapshot().flowId !== params.flowId && (found.store.isClosed() || !found.store.getFlowCheckpoint(params.flowId)))) {
           throw new Error(`Unknown flowId "${params.flowId}".`);
         }
         return found;
@@ -300,10 +314,7 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
       if (!predicate || effPredicate(originWs)) return originWs;
       const matches = [...workspaces.values()].filter(effPredicate);
       if (matches.length === 1) return matches[0]!;
-      if (matches.length > 1) {
-        const choices = matches.map((w) => `${w.room.getSnapshot().flowId ?? "flow"} (${w.cwd})`).join(", ");
-        throw new Error(`Multiple project Flows match; specify flowId or cwd: ${choices}`);
-      }
+      if (matches.length > 1) throw new Error(`Multiple project Flows match; specify flowId or cwd: ${matches.map((w) => `${w.room.getSnapshot().flowId ?? "flow"} (${w.cwd})`).join(", ")}`);
       return originWs;
     },
     seedLocalChangesHandoff(ws, sid, mandate, firstRoleId): HandoffEnvelope | null {
@@ -324,24 +335,18 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
         });
       } catch { return null; }
     },
-    markFlowSnapshotObserved(ws: ManagedWorkspace, flowId?: string): void {
-      const ownsLive = ws.room.hasActiveLeaseOwnership();
-      const targetId = flowId ?? ws.room.getSnapshot().flowId;
-      const cp = targetId && (!ownsLive || ws.room.getSnapshot().flowId !== targetId) && !ws.store.isClosed()
-        ? ws.store.getFlowCheckpoint(targetId)
-        : null;
+    markFlowSnapshotObserved(ws, flowId): void {
+      const ownsLive = ws.room.hasActiveLeaseOwnership(), targetId = flowId ?? ws.room.getSnapshot().flowId;
+      const cp = targetId && (!ownsLive || ws.room.getSnapshot().flowId !== targetId) && !ws.store.isClosed() ? ws.store.getFlowCheckpoint(targetId) : null;
       const snap = cp ? snapshotFromCheckpoint(cp, ws.cwd) : ws.room.getSnapshot();
       const key = computeSettlementKey(snap);
       if (!key || !snap.flowId) return;
       lastReportedKeys.set(snap.flowId, key);
-      if (pendingWakeups.get(snap.flowId)?.settlementKey === key) {
-        pendingWakeups.delete(snap.flowId);
-        if (pendingWakeups.size === 0) clearWakeupTimer();
-      }
+      if (pendingWakeups.get(snap.flowId)?.settlementKey === key) { pendingWakeups.delete(snap.flowId); if (pendingWakeups.size === 0) clearWakeupTimer(); }
     },
     markAllSettledFlowsObserved(): void { for (const ws of workspaces.values()) hub.markFlowSnapshotObserved(ws); },
-    setForegroundTurnActive(active: boolean): void { foregroundTurnActive = active; },
-    flushPendingWakeups(ctx?: any): void {
+    setForegroundTurnActive(active): void { foregroundTurnActive = active; },
+    flushPendingWakeups(ctx): void {
       clearWakeupTimer();
       if (pendingWakeups.size === 0) return;
       const items = [...pendingWakeups.values()].filter((it) => lastReportedKeys.get(it.flowId) !== it.settlementKey);
@@ -350,7 +355,7 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
       for (const item of items) lastReportedKeys.set(item.flowId, item.settlementKey);
       emitEventMessage(items.map((it) => it.report).join("\n\n---\n\n"), items[0]!.originWs, ctx ?? items[0]!.ctx);
     },
-    isSelfResumeBlockedDuringWakeup(flowId: string, ctx?: any): boolean {
+    isSelfResumeBlockedDuringWakeup(flowId, ctx): boolean {
       const recorded = waitingWakeupUserCounts.get(flowId);
       if (recorded === undefined) return false;
       const cur = countBranchUserMessages(ctx);
@@ -358,10 +363,11 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
       return true;
     },
     listWorkspaces: () => [...workspaces.values()],
+    getEffectiveSnapshot: getEffectiveSnapshotFor,
     getMonitorTargets(primaryWs?: ManagedWorkspace): FlowMonitorTarget[] {
       if (primaryWs) hydrateTrackedProjectsFor(primaryWs.cwd, undefined);
       const ordered = primaryWs ? [primaryWs, ...[...workspaces.values()].filter((w) => w.cwd !== primaryWs.cwd)] : [...workspaces.values()];
-      return ordered.map((w) => ({ cwd: w.cwd, room: w.room }));
+      return ordered.map((w) => ({ cwd: w.cwd, room: w.room, getSnapshot: () => getEffectiveSnapshotFor(w) }));
     },
     getAllFlowSummaries(): HubFlowSummary[] {
       const out: HubFlowSummary[] = [], seen = new Set<string>();
@@ -378,13 +384,15 @@ export function createWorkspaceHub(pi: any, options: HubOptions = {}): Workspace
           const cp = rawCp.status === "running" ? (ws.store.reclaimDeadCheckpoint(rawCp.flowId) ?? rawCp) : rawCp;
           const actionable = cp.status === "running" || cp.status === "waiting_input" || cp.status === "interrupted";
           if (emittedForWs === 0 || actionable) {
-            out.push(toFlowSummary(ws.cwd, snapshotFromCheckpoint(cp, ws.cwd), isCheckpointResumable(cp)));
+            const snap = snapshotFromCheckpoint(cp, ws.cwd);
+            const effSnap = cp.status === "running" ? { ...snap, remoteOwnerPid: cp.ownerPid ?? process.pid } : snap;
+            out.push(toFlowSummary(ws.cwd, effSnap, isCheckpointResumable(cp)));
             seen.add(cp.flowId); emittedForWs += 1;
           }
         }
         if (emittedForWs === 0) out.push(toFlowSummary(ws.cwd, roomSnap, ws.room.isResumable()));
       }
-      return out;
+      return out.sort((a, b) => (FLOW_PRIORITY[a.status] ?? 9) - (FLOW_PRIORITY[b.status] ?? 9));
     },
     getAllJobs(status?: BackgroundJob["status"]): BackgroundJob[] {
       reconcileAllStores();

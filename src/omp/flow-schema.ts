@@ -32,14 +32,14 @@ export function buildFlowToolParameters(kit: SchemaKitLike): unknown {
   const nodeSchema = kit.obj({
     id: kit.str(), title: kit.str(), kind: kit.en(["role", "gate", "merge", "human"]),
     role: kit.str(), dependsOn: kit.arr(kit.str()), join: kit.en(["all", "any"]), brief,
-    writableScope: kit.arr(kit.str()), workspace: wsEnum, sessionMode: kit.en(["fresh", "reuse"]),
-    sessionGroup: kit.str(), fallbackModels: kit.arr(kit.str()), repairTargetNodeId: kit.str(),
-    maxAttempts: kit.num(), stallTimeoutSec: kit.num(), skipOnUpstreamFail: kit.bool(),
-    gate: gateCfg, merge: nodeMergeCfg, human: humanCfg,
+    tools: kit.arr(kit.str()), writableScope: kit.arr(kit.str()), workspace: wsEnum,
+    sessionMode: kit.en(["fresh", "reuse"]), sessionGroup: kit.str(), fallbackModels: kit.arr(kit.str()),
+    repairTargetNodeId: kit.str(), maxAttempts: kit.num(), stallTimeoutSec: kit.num(),
+    skipOnUpstreamFail: kit.bool(), gate: gateCfg, merge: nodeMergeCfg, human: humanCfg,
   }, ["id"]);
 
   const shardSchema = kit.obj({
-    id: kit.str(), title: kit.str(), role: kit.str(), brief,
+    id: kit.str(), title: kit.str(), role: kit.str(), brief, tools: kit.arr(kit.str()),
     writableScope: kit.arr(kit.str()), workspace: wsEnum, fallbackModels: kit.arr(kit.str()),
   }, ["role", "brief"]);
 
@@ -66,6 +66,6 @@ export function buildFlowToolParameters(kit: SchemaKitLike): unknown {
     merge: presetMergeCfg, gate: gateCfg, joinRole: joinRoleSchema, landingMode: landingEnum,
     gateCommand: kit.str(), reviewerRole: kit.str(), scorerCommand: kit.str(),
     workerRole: kit.str(), workerBrief: brief, metricsPath: kit.str(),
-    message: kit.str(), maxRepairRounds: kit.num(), initialHandoffId: kit.str(), wait: kit.bool(),
+    message: kit.str(), maxRepairRounds: kit.num(), initialHandoffId: kit.str(), wait: kit.bool(), confirmed: kit.bool(),
   }, []);
 }
