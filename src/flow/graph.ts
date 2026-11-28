@@ -11,6 +11,7 @@ import { isInternalRole, isRoleReadOnly } from "../core/policy.ts";
 import { globScopesMayOverlap, resolveEffectiveWritableScope, resolveNodeEffectiveRole } from "../core/scope.ts";
 import type { RoleSpec } from "../core/types.ts";
 import { normalizePolicies } from "./graph-presets.ts";
+import { findAmbiguousApprovalOptions } from "./human-policy.ts";
 import { expandGraphRoleWorkflows } from "./workflow.ts";
 
 export {
@@ -87,7 +88,18 @@ function validateNodeConfigs(
       if (!node.merge?.sourceNodeIds?.length) issues.push({ code: "invalid_merge_source", nodeId: node.id, message: `Merge node "${node.id}" requires non-empty merge.sourceNodeIds.` });
       else for (const src of node.merge.sourceNodeIds) if (!byId.has(src)) issues.push({ code: "invalid_merge_source", nodeId: node.id, message: `Merge node "${node.id}" references unknown sourceNodeId "${src}".` });
     } else if (node.kind === "human") {
-      if (!node.human?.prompt?.trim()) issues.push({ code: "invalid_node_config", nodeId: node.id, message: `Human node "${node.id}" requires a non-empty human.prompt.` });
+      if (!node.human?.prompt?.trim()) {
+        issues.push({ code: "invalid_node_config", nodeId: node.id, message: `Human node "${node.id}" requires a non-empty human.prompt.` });
+      } else {
+        const ambiguous = findAmbiguousApprovalOptions(node.human);
+        if (ambiguous.length > 0) {
+          issues.push({
+            code: "invalid_node_config",
+            nodeId: node.id,
+            message: `Approval human node "${node.id}" has ambiguous option(s) without optionActions: ${ambiguous.join(", ")} (declare human.optionActions for each option or set human.mode="input").`,
+          });
+        }
+      }
     }
   }
 }

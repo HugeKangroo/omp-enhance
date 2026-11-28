@@ -161,6 +161,20 @@ function removeWorktreeSafe(gitRoot: string, wtPath: string): void {
 }
 
 export function createGitWorktreeManager(): WorktreeManagerLike {
+  const mergeLocks = new Map<string, Promise<void>>();
+  const withRepoMergeLock = async <T>(repoKey: string, fn: () => Promise<T>): Promise<T> => {
+    const prev = mergeLocks.get(repoKey) ?? Promise.resolve();
+    let release!: () => void;
+    const next = new Promise<void>((r) => { release = r; });
+    const tail = prev.then(() => next);
+    mergeLocks.set(repoKey, tail);
+    await prev;
+    try { return await fn(); }
+    finally {
+      release();
+      if (mergeLocks.get(repoKey) === tail) mergeLocks.delete(repoKey);
+    }
+  };
   return {
     isGitRepo,
 
@@ -219,13 +233,17 @@ export function createGitWorktreeManager(): WorktreeManagerLike {
 
     async mergeWorktrees({ cwd, flowId, nodeId, sourceRefs, landingMode, baseCommitSha }) {
       const entries = Object.entries(sourceRefs).filter(([, ref]) => Boolean(ref));
-      if (entries.length === 0) return { ok: true, mergedRef: null, mergedCommitSha: null, summary: "No changes to merge across parallel worktrees." };
+      if (entries.length === 0 && !baseCommitSha) {
+        return { ok: true, mergedRef: null, mergedCommitSha: null, summary: "No changes to merge across parallel worktrees." };
+      }
       const { gitRoot } = resolveGitLayout(cwd);
+      return await withRepoMergeLock(gitRoot, async () => {
       const workspaceBaseRef = captureOrGetBaseRef(gitRoot, flowId);
       const mergeCheckoutRef = baseCommitSha ?? workspaceBaseRef;
       const landedRefName = `${flowRefPrefix(flowId)}/landed`;
       const landedExisting = runGit(gitRoot, ["rev-parse", "--verify", landedRefName]);
-      const landingBaseRef = landedExisting.ok && landedExisting.stdout ? landedExisting.stdout : workspaceBaseRef;
+      const landedSha = landedExisting.ok && landedExisting.stdout ? landedExisting.stdout : null;
+      const landingBaseRef = landedSha ?? workspaceBaseRef;
       const root = worktreeRoot(gitRoot, flowId);
       mkdirSync(root, { recursive: true });
       const mergeWt = path.join(root, `_merge-${safeToken(nodeId)}`);
@@ -244,6 +262,18 @@ export function createGitWorktreeManager(): WorktreeManagerLike {
             return { ok: false, conflicts, summary: `Merge conflict while integrating "${srcNode}" (${conflicts.join(", ") || m.stderr || "conflict"}).` };
           }
         }
+        if (landingMode === "apply" && landedSha) {
+          const isAnc = runGit(mergeWt, ["merge-base", "--is-ancestor", landedSha, "HEAD"]);
+          if (!isAnc.ok) {
+            const m = runGit(mergeWt, ["-c", "user.name=omp-enhance", "-c", "user.email=omp-enhance@local", "merge", "--no-ff", "--no-edit", landedSha]);
+            if (!m.ok) {
+              const conf = runGit(mergeWt, ["diff", "--name-only", "--diff-filter=U"]);
+              const conflicts = conf.stdout ? conf.stdout.split("\n").map((s) => s.trim()).filter(Boolean) : [];
+              runGit(mergeWt, ["merge", "--abort"]);
+              return { ok: false, conflicts, summary: `Merge conflict while integrating already-landed Flow changes (${conflicts.join(", ") || m.stderr || "conflict"}).` };
+            }
+          }
+        }
         const mergedSha = runGit(mergeWt, ["rev-parse", "HEAD"]).stdout;
         const stat = runGit(gitRoot, ["diff", "--stat", landingBaseRef, mergedSha]).stdout;
 
@@ -252,7 +282,9 @@ export function createGitWorktreeManager(): WorktreeManagerLike {
           if (!br.ok) return { ok: false, mergedCommitSha: mergedSha, summary: br.error };
           return {
             ok: true, mergedRef: br.branch, mergedCommitSha: mergedSha,
-            summary: `Merged ${entries.length} branch(es) into preview branch "${br.branch}" (${mergedSha.slice(0, 12)}).${stat ? `\n${stat}` : ""}`,
+            summary: entries.length > 0
+              ? `Merged ${entries.length} branch(es) into preview branch "${br.branch}" (${mergedSha.slice(0, 12)}).${stat ? `\n${stat}` : ""}`
+              : `Preserved verified candidate on preview branch "${br.branch}" (${mergedSha.slice(0, 12)}).`,
           };
         }
 
@@ -288,11 +320,14 @@ export function createGitWorktreeManager(): WorktreeManagerLike {
         runGit(gitRoot, ["update-ref", landedRefName, mergedSha]);
         return {
           ok: true, mergedRef: null, mergedCommitSha: mergedSha,
-          summary: `Merged and applied ${entries.length} parallel worktree(s) cleanly to main workspace.${stat ? ` (${stat.split("\n").at(-1)?.trim() ?? ""})` : ""}`,
+          summary: entries.length > 0
+            ? `Merged and applied ${entries.length} parallel worktree(s) cleanly to main workspace.${stat ? ` (${stat.split("\n").at(-1)?.trim() ?? ""})` : ""}`
+            : `Applied verified candidate (${mergedSha.slice(0, 12)}) cleanly to main workspace.${stat ? ` (${stat.split("\n").at(-1)?.trim() ?? ""})` : ""}`,
         };
       } finally {
         removeWorktreeSafe(gitRoot, mergeWt);
       }
+      });
     },
 
     async withCommitWorktree<T>(

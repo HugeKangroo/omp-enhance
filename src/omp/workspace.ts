@@ -269,7 +269,7 @@ export function createManagedWorkspace(
             ...(execInput.resumeTargetNodeId ? { resumeTargetNodeId: execInput.resumeTargetNodeId } : {}),
             ...(execInput.resumeReplyText ? { resumeReplyText: execInput.resumeReplyText } : {}),
             initialHandoff: execInput.initialHandoff, observer: room.createObserver(fCtx), supervisor: ws.supervisorFor(fCtx),
-            signal: execInput.signal, sessionPool, worktreeManager, onStateChange: (st) => room.setGraphState(st),
+            signal: execInput.signal, sessionPool, worktreeManager, onStateChange: (st, opts) => room.setGraphState(st, opts),
             registerLivePatchHandler: (h) => { activePatchTarget = h ? { flowId, handler: h } : null; },
           });
         } else {
@@ -396,6 +396,9 @@ export function createManagedWorkspace(
       let persistedSpec: FlowGraphSpec | undefined;
       if (cp?.graphSpecJson) { try { persistedSpec = JSON.parse(cp.graphSpecJson) as FlowGraphSpec; } catch {} }
       const snapRoles = cp ? snapshotFromCheckpoint(cp, cwd).roleSnapshots : room.getSnapshot().roleSnapshots;
+      let machineRoleSnaps: Record<string, RoleSpec> | undefined;
+      if (cp?.machineStateJson) { try { machineRoleSnaps = (JSON.parse(cp.machineStateJson) as { roleSnapshots?: Record<string, RoleSpec> }).roleSnapshots; } catch {} }
+      const frozenRoles: Record<string, RoleSpec> = { ...(snapRoles ?? {}), ...(machineRoleSnaps ?? {}) };
       const chainToValidate = persistedSpec
         ? persistedSpec.nodes.filter((n) => n.kind === "role" && n.role).map((n) => n.role!)
         : (cp ? cp.roleChain : room.getSnapshot().roleChain);
@@ -403,7 +406,7 @@ export function createManagedWorkspace(
         const live = ws.roles.get(id);
         if (id === "supervisor" || (live && isInternalRole(live))) throw new Error(`Role "${id}" is an internal monitor and cannot run as a Flow stage.`);
         if (!live) throw new Error(`Unknown role "${id}" in Flow "${effectiveFlowId ?? "flow"}". Restore the role before resuming.`);
-        return snapRoles?.[id] ?? live;
+        return frozenRoles[id] ?? live;
       });
       const plan = room.resumeFlow(c, targetFlowId);
       let mandate: Mandate, initialHandoff: HandoffEnvelope | null;

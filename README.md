@@ -4,7 +4,7 @@
 
 深入文档：[整体架构设计](docs/architecture.md) · [交接协议与 YAML 角色编写指南](docs/protocol-and-roles.md) · [`algo` 实验目录与报告门禁规范](docs/algo-workflow-and-report.md)
 
-工程评审：[2026-11-27 使用体验与交付可靠性](docs/review-2026-11-27.md) · [2026-11-26 交互、任务恢复与交付验收](docs/review-2026-11-26.md) · [2026-11-23 验证结果、已知问题与改进建议](docs/review-2026-11-23.md)
+工程评审：[2026-11-28 审批、落地与验收复核](docs/review-2026-11-28.md) · [2026-11-27 使用体验与交付可靠性](docs/review-2026-11-27.md) · [2026-11-26 交互、任务恢复与交付验收](docs/review-2026-11-26.md) · [2026-11-23 验证结果、已知问题与改进建议](docs/review-2026-11-23.md)
 
 后续建议：[2026-11-24 当前问题、Agent 应用借鉴与试点](docs/agent-patterns-and-next-steps-2026-11-24.md)
 

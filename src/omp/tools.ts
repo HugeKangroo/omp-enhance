@@ -351,7 +351,13 @@ export function registerEnhanceTools(pi: any, hub: WorkspaceHub, fgWorkflow?: Fo
         }
         if (fgPhase && fgWorkflow) {
           const prog = fgWorkflow.onPhaseHandoff({ sessionId: sid, cwd: ws.cwd, role, handoff: envelope });
-          if (prog.gateError) return toolResult({ handoff: envelope, error: prog.gateError, phaseAdvanced: false }, true);
+          if (prog.gateError) {
+            return toolResult({
+              handoff: envelope, error: prog.gateError, phaseAdvanced: false,
+              ...(prog.cancelled ? { cancelled: true } : {}),
+              ...(prog.held ? { held: true } : {}),
+            }, true);
+          }
           return toolResult({ handoff: envelope, workflowProgress: prog });
         }
         return toolResult({ handoff: envelope });

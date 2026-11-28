@@ -261,21 +261,47 @@ export function scoreSimCase(spec: SimCaseSpec, caseDir: string): SimRubricScore
   return { passed: verifierOk && metadataAndUnitsOk, verifierOk, metadataAndUnitsOk, notes };
 }
 
+export function sanitizeSimBlindText(text: string): { sanitized: string; leaksRedacted: string[] } {
+  const leaksRedacted: string[] = [];
+  let sanitized = text;
+  for (const re of SIM_BLIND_LEAK_PATTERNS) {
+    const gRe = new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`);
+    sanitized = sanitized.replace(gRe, (match) => {
+      leaksRedacted.push(match);
+      return "[REDACTED_INTERNAL]";
+    });
+  }
+  return { sanitized, leaksRedacted };
+}
+
 export function buildSimBlindBundle(trials: readonly SimTrialRecord[]): {
   blindItems: SimBlindItem[];
-  answerKey: Record<string, { trialId: string; caseId: string; arm: SimEvalArm; score: SimRubricScore }>;
+  answerKey: Record<string, {
+    trialId: string; caseId: string; arm: SimEvalArm; score: SimRubricScore;
+    rawResponseText: string; leaksRedacted: string[];
+  }>;
 } {
   const sorted = [...trials].sort((a, b) =>
     createHash("sha256").update(`${a.caseId}:${a.trialId}`).digest("hex")
       .localeCompare(createHash("sha256").update(`${b.caseId}:${b.trialId}`).digest("hex")),
   );
   const blindItems: SimBlindItem[] = [];
-  const answerKey: Record<string, { trialId: string; caseId: string; arm: SimEvalArm; score: SimRubricScore }> = {};
+  const answerKey: Record<string, {
+    trialId: string; caseId: string; arm: SimEvalArm; score: SimRubricScore;
+    rawResponseText: string; leaksRedacted: string[];
+  }> = {};
   sorted.forEach((t, i) => {
     const candidateId = `sim-${String(i + 1).padStart(2, "0")}-${t.trialId.slice(0, 6)}`;
     const spec = SIM_CASES.find((c) => c.id === t.caseId)!;
-    blindItems.push({ candidateId, caseId: t.caseId, caseTitle: spec.title, responseText: t.responseText });
-    answerKey[candidateId] = { trialId: t.trialId, caseId: t.caseId, arm: t.arm, score: t.score };
+    const { sanitized, leaksRedacted } = sanitizeSimBlindText(t.responseText);
+    const item: SimBlindItem = { candidateId, caseId: t.caseId, caseTitle: spec.title, responseText: sanitized };
+    const remaining = detectSimBlindLeaks(item);
+    assert(remaining.length === 0, `Sim blind export leak escaped sanitizer: ${remaining.join(", ")}`);
+    blindItems.push(item);
+    answerKey[candidateId] = {
+      trialId: t.trialId, caseId: t.caseId, arm: t.arm, score: t.score,
+      rawResponseText: t.responseText, leaksRedacted,
+    };
   });
   return { blindItems, answerKey };
 }

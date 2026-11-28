@@ -95,6 +95,9 @@ export function renderConditioningBlock(input: RenderConditioningBlockInput): st
       (permissions.dispatch ? "; dispatch=true" : "") +
       (permissions.mcp ? "; mcp=true" : ""),
     `Exit: require_tool_evidence=${role.exit.requireToolEvidence}`,
+    ...(role.exit.requiredChecks?.length
+      ? bullets("Required checks (must run and pass before verdict=ready):", role.exit.requiredChecks)
+      : []),
     ...bullets("Exit criteria:", role.exit.criteria),
   ];
 

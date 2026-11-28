@@ -1,5 +1,7 @@
 import type { EnhanceStore, PersistedFlowCheckpoint } from "../core/store.ts";
-import type { FlowRoomStatus, FlowStageTrace, FlowUserSteer, RoomEntry } from "../core/types.ts";
+import { markMachineStateInterrupted } from "../core/store-schema.ts";
+import type { FlowGraphSnapshot, FlowMachineState, FlowRoomStatus, FlowStageTrace, FlowUserSteer, RoomEntry } from "../core/types.ts";
+import { buildFlowGraphSnapshot } from "./machine.ts";
 import type { ActiveStageControls, FlowRoomSnapshot, StageTurnSummaryLike } from "./state.ts";
 
 const MAX_ASSISTANT_TEXT_CHARS = 16_384;
@@ -183,4 +185,54 @@ export function applyStageEndToRoom(input: {
     }
   }
   return [...stages].reverse().find((s) => s.status === "running")?.stageId ?? null;
+}
+
+export function recoverInterruptedMachineJson(
+  rawJson: string | null,
+  ts: string,
+): { machineStateJson: string; graphSnapshot: FlowGraphSnapshot } | null {
+  if (!rawJson) return null;
+  try {
+    const parsed = JSON.parse(rawJson) as FlowMachineState;
+    if (parsed.status !== "running") return null;
+    const rec = markMachineStateInterrupted(parsed, ts);
+    return { machineStateJson: JSON.stringify(rec), graphSnapshot: buildFlowGraphSnapshot(rec) };
+  } catch {
+    return null;
+  }
+}
+
+export function markInterruptedStagesAndEntries(
+  stages: FlowStageTrace[],
+  entries: RoomEntry[],
+  endedAt: string,
+): void {
+  for (const st of stages) {
+    if (st.status === "running") {
+      st.status = "aborted";
+      st.endedAt = endedAt;
+      st.activeTool = null;
+    }
+  }
+  for (const en of entries) {
+    if (en.badge?.startsWith("●")) {
+      en.badge = "⏸ 中断";
+      en.tone = "warning";
+      en.text = "进程中断，可在总秘书 (/coord) 中从本阶段断点续跑";
+    }
+  }
+}
+
+export function cloneFlowRoomSnapshot(src: FlowRoomSnapshot): FlowRoomSnapshot {
+  return {
+    ...src,
+    roleChain: [...src.roleChain],
+    entries: src.entries.map((e) => ({ ...e })),
+    stages: src.stages.map((s) => ({
+      ...s,
+      calls: s.calls.map((c) => ({ ...c, touchedPaths: [...c.touchedPaths] })),
+      notes: [...s.notes],
+    })),
+    ...(src.userSteers ? { userSteers: src.userSteers.map((u) => ({ ...u })) } : {}),
+  };
 }

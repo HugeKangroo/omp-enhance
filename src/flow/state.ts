@@ -1,13 +1,12 @@
 import { captureProcessStartToken, isProcessAliveWithToken, LeaseLostError, type EnhanceStore, type PersistedFlowCheckpoint } from "../core/store.ts";
-import { markMachineStateInterrupted } from "../core/store-schema.ts";
 import type {
   FlowGraphSnapshot, FlowLeaseMode, FlowMachineState, FlowRoomStatus, FlowRunResult, FlowStageTrace,
   FlowUserSteer, HandoffEnvelope, ObservedToolCall, RoleSpec, RoomEntry, SupervisorDecision, UsageSummary,
 } from "../core/types.ts";
 import { buildFlowGraphSnapshot } from "./machine.ts";
 import {
-  applyStageEndToRoom, computeMaxIdSeq, drainPendingFlowSteers, isCheckpointResumable,
-  parseDirectedSteer, snapshotFromCheckpoint, syncSteerRecord,
+  applyStageEndToRoom, cloneFlowRoomSnapshot, computeMaxIdSeq, drainPendingFlowSteers, isCheckpointResumable,
+  markInterruptedStagesAndEntries, parseDirectedSteer, recoverInterruptedMachineJson, snapshotFromCheckpoint, syncSteerRecord,
 } from "./state-helpers.ts";
 
 export { isCheckpointResumable, parseDirectedSteer, snapshotFromCheckpoint };
@@ -66,11 +65,27 @@ export class FlowRoomManager {
     this.cwd = cwd; this.hydrateFromStore();
   }
 
-  setGraphState(state: FlowMachineState): void {
+  setGraphState(state: FlowMachineState, opts?: { strictPersist?: boolean }): number {
+    const prev = {
+      snap: this.graphSnapshot, spec: this.graphSpecJson, machine: this.machineStateJson,
+      rr: this.repairRound, lh: this.lastHandoffId, sig: this.lastRejectionSig,
+      seq: this.nextStageSeq, rs: this.roleSnapshots,
+    };
     this.graphSnapshot = buildFlowGraphSnapshot(state); this.graphSpecJson = JSON.stringify(state.spec);
     this.machineStateJson = JSON.stringify(state); this.repairRound = state.repairRound;
     this.lastHandoffId = state.lastHandoffId; this.lastRejectionSig = state.lastRejectionSig;
-    this.nextStageSeq = Math.max(this.nextStageSeq, state.nextStageSeq); this.persist(); this.notify();
+    this.nextStageSeq = Math.max(this.nextStageSeq, state.nextStageSeq);
+    if (state.roleSnapshots) this.roleSnapshots = { ...state.roleSnapshots };
+    try {
+      this.persist({ throwOnError: opts?.strictPersist });
+    } catch (err) {
+      this.graphSnapshot = prev.snap; this.graphSpecJson = prev.spec; this.machineStateJson = prev.machine;
+      this.repairRound = prev.rr; this.lastHandoffId = prev.lh; this.lastRejectionSig = prev.sig;
+      this.nextStageSeq = prev.seq; this.roleSnapshots = prev.rs;
+      throw err;
+    }
+    this.notify();
+    return this.stateVersion;
   }
   getPersistedMachineState(): FlowMachineState | null {
     if (!this.machineStateJson) return null;
@@ -109,7 +124,7 @@ export class FlowRoomManager {
   }
   private stopSteerPoll(): void { if (this.steerPollTimer !== null) { clearInterval(this.steerPollTimer); this.steerPollTimer = null; } }
 
-  private persist(opts?: { allowUnfencedRecovery?: boolean }): void {
+  private persist(opts?: { allowUnfencedRecovery?: boolean; throwOnError?: boolean }): void {
     if (this.disposed || !this.store || this.store.isClosed() || !this.flowId || !this.mandateId) return;
     if (!this.leaseToken && !opts?.allowUnfencedRecovery) return;
     try {
@@ -139,6 +154,7 @@ export class FlowRoomManager {
       }
     } catch (err) {
       if (err instanceof LeaseLostError) { this.leaseToken = null; this.cancelled = true; this.stopSteerPoll(); this.flowAbortController?.abort(); }
+      if (opts?.throwOnError) throw err;
     }
   }
 
@@ -173,36 +189,25 @@ export class FlowRoomManager {
     if (cp.status !== "running") { this.status = cp.status as FlowRoomStatus; return; }
     this.status = "interrupted"; this.activeStageId = null; this.endedAt = new Date().toISOString();
     this.reason = "上次进程中断，可在总秘书 (/coord) 中断点续跑";
-    for (const st of this.stages) if (st.status === "running") { st.status = "aborted"; st.endedAt = this.endedAt; st.activeTool = null; }
-    for (const en of this.entries) if (en.badge?.startsWith("●")) {
-      en.badge = "⏸ 中断"; en.tone = "warning"; en.text = "进程中断，可在总秘书 (/coord) 中从本阶段断点续跑";
-    }
+    markInterruptedStagesAndEntries(this.stages, this.entries, this.endedAt);
     this.recoverInterruptedMachineState(this.endedAt);
     this.persist({ allowUnfencedRecovery: true });
   }
 
   private recoverInterruptedMachineState(ts: string): void {
-    if (!this.machineStateJson) return;
-    try {
-      const parsed = JSON.parse(this.machineStateJson) as FlowMachineState;
-      if (parsed.status === "running") {
-        const rec = markMachineStateInterrupted(parsed, ts);
-        this.machineStateJson = JSON.stringify(rec); this.graphSnapshot = buildFlowGraphSnapshot(rec);
-      }
-    } catch {}
+    const rec = recoverInterruptedMachineJson(this.machineStateJson, ts);
+    if (rec) { this.machineStateJson = rec.machineStateJson; this.graphSnapshot = rec.graphSnapshot; }
   }
 
   getSnapshot(): FlowRoomSnapshot {
-    return {
+    return cloneFlowRoomSnapshot({
       flowId: this.flowId, mandateId: this.mandateId, goal: this.goal, ...(this.cwd ? { cwd: this.cwd } : {}),
-      roleChain: [...this.roleChain], status: this.status, currentIndex: this.currentIndex, repairRound: this.repairRound,
+      roleChain: this.roleChain, status: this.status, currentIndex: this.currentIndex, repairRound: this.repairRound,
       ...(this.reason ? { reason: this.reason } : {}), startedAt: this.startedAt, endedAt: this.endedAt,
-      activeStageId: this.activeStageId, entries: this.entries.map((e) => ({ ...e })),
-      stages: this.stages.map((s) => ({ ...s, calls: s.calls.map((c) => ({ ...c, touchedPaths: [...c.touchedPaths] })), notes: [...s.notes] })),
-      userSteers: this.userSteers.map((u) => ({ ...u })),
+      activeStageId: this.activeStageId, entries: this.entries, stages: this.stages, userSteers: this.userSteers,
       ...(this.graphSnapshot ? { graphSnapshot: this.graphSnapshot } : {}),
       ...(this.roleSnapshots ? { roleSnapshots: this.roleSnapshots } : {}),
-    };
+    });
   }
 
   private insertBeforeRunning(entry: RoomEntry): void {

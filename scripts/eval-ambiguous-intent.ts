@@ -401,21 +401,47 @@ export function scoreIntentCase(
   };
 }
 
+export function sanitizeIntentBlindText(text: string): { sanitized: string; leaksRedacted: string[] } {
+  const leaksRedacted: string[] = [];
+  let sanitized = text;
+  for (const re of BLIND_LEAK_PATTERNS) {
+    const gRe = new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`);
+    sanitized = sanitized.replace(gRe, (match) => {
+      leaksRedacted.push(match);
+      return "[REDACTED_INTERNAL]";
+    });
+  }
+  return { sanitized, leaksRedacted };
+}
+
 export function buildIntentBlindBundle(trials: readonly IntentTrialRecord[]): {
   blindItems: IntentBlindItem[];
-  answerKey: Record<string, { trialId: string; caseId: string; arm: IntentEvalArm; score: IntentRubricScore }>;
+  answerKey: Record<string, {
+    trialId: string; caseId: string; arm: IntentEvalArm; score: IntentRubricScore;
+    rawResponseText: string; leaksRedacted: string[];
+  }>;
 } {
   const sorted = [...trials].sort((a, b) =>
     createHash("sha256").update(`${a.caseId}:${a.trialId}`).digest("hex")
       .localeCompare(createHash("sha256").update(`${b.caseId}:${b.trialId}`).digest("hex")),
   );
   const blindItems: IntentBlindItem[] = [];
-  const answerKey: Record<string, { trialId: string; caseId: string; arm: IntentEvalArm; score: IntentRubricScore }> = {};
+  const answerKey: Record<string, {
+    trialId: string; caseId: string; arm: IntentEvalArm; score: IntentRubricScore;
+    rawResponseText: string; leaksRedacted: string[];
+  }> = {};
   sorted.forEach((t, i) => {
     const candidateId = `intent-${String(i + 1).padStart(2, "0")}-${t.trialId.slice(0, 6)}`;
     const spec = INTENT_CASES.find((c) => c.id === t.caseId)!;
-    blindItems.push({ candidateId, caseId: t.caseId, caseTitle: spec.title, responseText: t.responseText });
-    answerKey[candidateId] = { trialId: t.trialId, caseId: t.caseId, arm: t.arm, score: t.score };
+    const { sanitized, leaksRedacted } = sanitizeIntentBlindText(t.responseText);
+    const item: IntentBlindItem = { candidateId, caseId: t.caseId, caseTitle: spec.title, responseText: sanitized };
+    const remaining = detectIntentBlindLeaks(item);
+    assert(remaining.length === 0, `Intent blind export leak escaped sanitizer: ${remaining.join(", ")}`);
+    blindItems.push(item);
+    answerKey[candidateId] = {
+      trialId: t.trialId, caseId: t.caseId, arm: t.arm, score: t.score,
+      rawResponseText: t.responseText, leaksRedacted,
+    };
   });
   return { blindItems, answerKey };
 }

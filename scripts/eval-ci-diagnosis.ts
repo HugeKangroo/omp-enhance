@@ -23,10 +23,12 @@ export interface CiPilotCaseSpec {
   expectedAbstain: boolean;
   rootCauseFile?: string;
   mechanismKeywords: string[];
+  causalPatterns?: RegExp[];
   contradictionPatterns?: RegExp[];
   nonAnswerPatterns?: RegExp[];
   requiredEvidenceFiles: string[];
   nextStepKeywords: string[];
+  actionableStepPatterns?: RegExp[];
   setup(caseDir: string): { baseCommit: string; headCommit: string };
 }
 
@@ -113,13 +115,19 @@ export const PILOT_CASES: readonly CiPilotCaseSpec[] = [
     expectedAbstain: false,
     rootCauseFile: "src/settlement/window.ts",
     mechanismKeywords: ["utc", "timezone", "时区", "t00:00:00", "los_angeles"],
+    causalPatterns: [
+      /(?:根因|真正原因|主因|原因|导致|引发|偏移|漏掉|遗漏|本地时区|非\s*utc|解析错误|按本地|root\s+cause|caused\s+by|because|local\s+time(?:zone)?|offset|drops?|misses?)/i,
+    ],
     contradictionPatterns: [
-      /(?:已?排除|并非|不是|与.{0,8}无关|not caused by|ruled out|unrelated to).{0,28}(?:时区|timezone|utc|window\.ts|date\b)/i,
-      /(?:时区|timezone|utc|window\.ts).{0,20}(?:已?排除|不是根因|并非根因|无关|ruled out|not the root cause)/i,
-      /(?:根因|真正原因|主因|root cause).{0,12}(?:是|在于|为|is)\s*(?:连接池|数据库|网络|内存泄漏|并发竞争|connection pool|database|oom|race condition)/i,
+      /(?:已?排除|并非|不是|与[^。！？.!?\n;；]{0,8}无关|not caused by|ruled out|unrelated to)[^。！？.!?\n;；]{0,28}(?:时区|timezone|utc|window\.ts|date\b)/i,
+      /(?:时区|timezone|utc|window\.ts)[^。！？.!?\n;；]{0,20}(?:已?排除|不是根因|并非根因|无关|ruled out|not the root cause)/i,
+      /(?:根因|真正原因|主因|root cause)[^。！？.!?\n;；]{0,12}(?:是|在于|为|is)\s*(?:连接池|数据库|网络|内存泄漏|并发竞争|connection pool|database|oom|race condition)/i,
     ],
     requiredEvidenceFiles: ["src/settlement/window.ts", "ci/failing-build-418.log"],
     nextStepKeywords: ["tz=", "utc", "settlement.test", "window.ts"],
+    actionableStepPatterns: [
+      /(?:tz=\S+|bun\s+test|双时区复验|对比[^。！？.!?\n]{0,16}(?:时区|utc|los_angeles)|复验|重跑|验证命令|run\s+[^\n]{0,40}test|reproduce\s+with)/i,
+    ],
     setup(caseDir) {
       runGit(caseDir, ["init", "-q"]);
       writeFiles(caseDir, {
@@ -221,13 +229,19 @@ export const PILOT_CASES: readonly CiPilotCaseSpec[] = [
     expectedAbstain: false,
     rootCauseFile: "src/config/loader.ts",
     mechanismKeywords: ["string", "number", "webhook_max_retries", "01", "字符串", "类型"],
+    causalPatterns: [
+      /(?:根因|原因|导致|未转|覆盖|拼接|引发|强转|coerci|concat|root\s+cause|caused\s+by|because|results?\s+in)/i,
+    ],
     contradictionPatterns: [
-      /(?:已?排除|并非|不是|与.{0,8}无关|not caused by|ruled out|unrelated to).{0,28}(?:字符串|类型|webhook_max_retries|loader\.ts|coercion|string)/i,
-      /(?:字符串|类型|webhook_max_retries|loader\.ts).{0,20}(?:已?排除|不是根因|并非根因|无关|ruled out|not the root cause)/i,
-      /(?:根因|真正原因|主因|root cause).{0,12}(?:是|在于|为|is)\s*(?:连接池|时区|数据库|网络|内存泄漏|connection pool|timezone|database|oom)/i,
+      /(?:已?排除|并非|不是|与[^。！？.!?\n;；]{0,8}无关|not caused by|ruled out|unrelated to)[^。！？.!?\n;；]{0,28}(?:字符串|类型|webhook_max_retries|loader\.ts|coercion|string)/i,
+      /(?:字符串|类型|webhook_max_retries|loader\.ts)[^。！？.!?\n;；]{0,20}(?:已?排除|不是根因|并非根因|无关|ruled out|not the root cause)/i,
+      /(?:根因|真正原因|主因|root cause)[^。！？.!?\n;；]{0,12}(?:是|在于|为|is)\s*(?:连接池|时区|数据库|网络|内存泄漏|connection pool|timezone|database|oom)/i,
     ],
     requiredEvidenceFiles: ["src/config/loader.ts", "ci/failing-build-502.log"],
     nextStepKeywords: ["webhook_max_retries", "loader.ts", "number", "retry"],
+    actionableStepPatterns: [
+      /(?:webhook_max_retries\s*=\s*["']?0|bun\s+test|复验|验证|检查\s*typeof|重跑|run\s+[^\n]{0,40}test|reproduce)/i,
+    ],
     setup(caseDir) {
       runGit(caseDir, ["init", "-q"]);
       writeFiles(caseDir, {
@@ -310,6 +324,9 @@ export const PILOT_CASES: readonly CiPilotCaseSpec[] = [
     mechanismKeywords: ["证据不足", "不足以", "无法确定", "insufficient", "cannot determine", "missing log", "日志缺失", "无法唯一定因"],
     requiredEvidenceFiles: ["ci/failing-build-619.log"],
     nextStepKeywords: ["shard", "137", "oom", "always()", "dmesg", "memory", "内存", "日志"],
+    actionableStepPatterns: [
+      /(?:if:\s*always\(\)|上传|保留[^。！？.!?\n]{0,16}日志|采集[^。！？.!?\n]{0,16}(?:oom|dmesg|内存|memory)|取证动作|inspect|upload|collect|capture|preserve)/i,
+    ],
     setup(caseDir) {
       runGit(caseDir, ["init", "-q"]);
       writeFiles(caseDir, {
@@ -398,6 +415,19 @@ const BLIND_REVIEW_LEAK_PATTERNS: readonly RegExp[] = [
   /\benhance_(?:flow|handoff|mandate|job)\b/i,
 ];
 
+export function sanitizeBlindReviewText(text: string): { sanitized: string; leaksRedacted: string[] } {
+  const leaksRedacted: string[] = [];
+  let sanitized = text;
+  for (const re of BLIND_REVIEW_LEAK_PATTERNS) {
+    const gRe = new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`);
+    sanitized = sanitized.replace(gRe, (match) => {
+      leaksRedacted.push(match);
+      return "[REDACTED_INTERNAL]";
+    });
+  }
+  return { sanitized, leaksRedacted };
+}
+
 export function detectBlindReviewLeaks(item: BlindReviewItem): string[] {
   const leaks: string[] = [];
   if ("arm" in (item as unknown as Record<string, unknown>)) leaks.push("field:arm");
@@ -414,7 +444,9 @@ export function scoreCaseOutput(spec: CiPilotCaseSpec, caseDir: string, response
   const citations = verifyCitations(caseDir, responseText);
   const citationsValid = citations.invalidCitations.length === 0 && citations.validCitations.length > 0;
   const citedRequiredEvidence = spec.requiredEvidenceFiles.every((req) => responseText.includes(req));
-  const actionableStepOk = spec.nextStepKeywords.some((kw) => lower.includes(kw.toLowerCase()));
+  const actionableStepOk = spec.actionableStepPatterns?.length
+    ? spec.actionableStepPatterns.some((re) => re.test(responseText))
+    : spec.nextStepKeywords.some((kw) => lower.includes(kw.toLowerCase()));
   const notes: string[] = [];
 
   const nonAnswerMatchers = [...DEFAULT_NON_ANSWER_PATTERNS, ...(spec.nonAnswerPatterns ?? [])];
@@ -435,10 +467,12 @@ export function scoreCaseOutput(spec: CiPilotCaseSpec, caseDir: string, response
   } else {
     const hitFile = Boolean(spec.rootCauseFile && responseText.includes(spec.rootCauseFile));
     const hitMechanism = spec.mechanismKeywords.some((kw) => lower.includes(kw.toLowerCase()));
+    const hitCausal = !spec.causalPatterns?.length || spec.causalPatterns.some((re) => re.test(responseText));
     const wronglyAbstained = /(?:证据不足以确定|无法定位根因|insufficient evidence to identify)/.test(lower) && !hitFile;
-    rootCauseOrAbstentionOk = hitFile && hitMechanism && !wronglyAbstained && noContradictionOrNonAnswer;
+    rootCauseOrAbstentionOk = hitFile && hitMechanism && hitCausal && !wronglyAbstained && noContradictionOrNonAnswer;
     if (!hitFile) notes.push(`Missing root cause file ${spec.rootCauseFile}.`);
     if (!hitMechanism) notes.push("Missing causal mechanism explanation.");
+    if (!hitCausal) notes.push("Listed files/terms without stating a causal diagnosis.");
   }
   if (!citationsValid) notes.push(`Invalid or missing citations: ${citations.invalidCitations.join(", ") || "none cited"}`);
   if (!citedRequiredEvidence) notes.push(`Did not cite all required files (${spec.requiredEvidenceFiles.join(", ")}).`);
@@ -459,10 +493,16 @@ export function scoreCaseOutput(spec: CiPilotCaseSpec, caseDir: string, response
 
 export function buildBlindReviewBundle(trials: readonly PilotTrialRecord[]): {
   blindItems: BlindReviewItem[];
-  answerKey: Record<string, { trialId: string; caseId: string; arm: EvalArm; objectiveScore: RubricScore }>;
+  answerKey: Record<string, {
+    trialId: string; caseId: string; arm: EvalArm; objectiveScore: RubricScore;
+    rawResponseText: string; leaksRedacted: string[];
+  }>;
 } {
   const blindItems: BlindReviewItem[] = [];
-  const answerKey: Record<string, { trialId: string; caseId: string; arm: EvalArm; objectiveScore: RubricScore }> = {};
+  const answerKey: Record<string, {
+    trialId: string; caseId: string; arm: EvalArm; objectiveScore: RubricScore;
+    rawResponseText: string; leaksRedacted: string[];
+  }> = {};
   const sorted = [...trials].sort((a, b) => {
     const ha = createHash("sha256").update(`${a.caseId}:${a.trialId}`).digest("hex");
     const hb = createHash("sha256").update(`${b.caseId}:${b.trialId}`).digest("hex");
@@ -472,18 +512,24 @@ export function buildBlindReviewBundle(trials: readonly PilotTrialRecord[]): {
   sorted.forEach((trial, idx) => {
     const candidateId = `cand-${String(idx + 1).padStart(2, "0")}-${trial.trialId.slice(0, 6)}`;
     const spec = PILOT_CASES.find((c) => c.id === trial.caseId)!;
-    blindItems.push({
+    const { sanitized, leaksRedacted } = sanitizeBlindReviewText(trial.responseText);
+    const item: BlindReviewItem = {
       candidateId,
       caseId: trial.caseId,
       caseTitle: spec.title,
       logRelPath: spec.logRelPath,
-      responseText: trial.responseText,
-    });
+      responseText: sanitized,
+    };
+    const remainingLeaks = detectBlindReviewLeaks(item);
+    assert(remainingLeaks.length === 0, `Blind review export leak escaped sanitizer: ${remainingLeaks.join(", ")}`);
+    blindItems.push(item);
     answerKey[candidateId] = {
       trialId: trial.trialId,
       caseId: trial.caseId,
       arm: trial.arm,
       objectiveScore: trial.score,
+      rawResponseText: trial.responseText,
+      leaksRedacted,
     };
   });
   return { blindItems, answerKey };
@@ -538,6 +584,28 @@ function runDryRunSelfCheck(sandboxRoot: string): void {
   assert(
     !c1Deferred.passed && !c1Deferred.noContradictionOrNonAnswer,
     `Expected deferred non-answer to fail: ${JSON.stringify(c1Deferred)}`,
+  );
+
+  // 1d) Cross-sentence positive control ("已排除连接池问题。根因是时区...") MUST NOT be falsely flagged
+  const c1CrossSentence = scoreCaseOutput(
+    PILOT_CASES[0]!,
+    c1Dir,
+    "已排除连接池问题。根因是 src/settlement/window.ts:10 在非 UTC 时区解析本地日期导致早间交易被遗漏（见 ci/failing-build-418.log:1），请做双时区复验（TZ=UTC 与 TZ=America/Los_Angeles）。",
+  );
+  assert(
+    c1CrossSentence.passed && c1CrossSentence.noContradictionOrNonAnswer,
+    `Expected cross-sentence ruling-out-unrelated-cause positive sample to pass: ${JSON.stringify(c1CrossSentence)}`,
+  );
+
+  // 1e) File-list-only non-diagnosis negative control MUST FAIL both root-cause and actionable-step
+  const c1MaterialOnly = scoreCaseOutput(
+    PILOT_CASES[0]!,
+    c1Dir,
+    "排查材料包括 src/settlement/window.ts:10 和 ci/failing-build-418.log:1。日志使用 UTC。",
+  );
+  assert(
+    !c1MaterialOnly.passed && !c1MaterialOnly.rootCauseOrAbstentionOk && !c1MaterialOnly.actionableStepOk,
+    `Expected material-only summary without diagnosis/next-step to fail: ${JSON.stringify(c1MaterialOnly)}`,
   );
 
   // 2) Case 2 positive check
@@ -759,7 +827,7 @@ async function runLiveArmTrial(options: {
     const promptMsg = options.arm === "vanilla-omp"
       ? diagnosisPrompt
       : options.arm === "coord-autonomous"
-        ? `无需询问确认，我已授权立即执行（严格只读，严禁修改工作区文件）。请根据任务复杂度自行判断是否直接诊断或委派给合适的只读专员协作，并最终直接给我完整、可核验的结论：\n\n${diagnosisPrompt}`
+        ? `无需询问确认，我已授权立即执行（严格只读，严禁修改工作区文件）。作为纯总控专员，请自主决策最合适的只读专员编排策略（如单专员 ["planner"]、双专员 ["planner","reviewer"] 或定制只读节点图与简报）并通过 enhance_flow(action="start", ..., wait=true) 派发执行，完成后直接将核实后的完整结论与精确行号汇报给我：\n\n${diagnosisPrompt}`
         : `无需询问确认，我已授权立即执行：请直接调用 enhance_flow(action="start", roles=${rolesChain}, goal=${JSON.stringify(diagnosisPrompt)}, wait=true)，完成后将专员核实的根因/证据不足结论、精确文件行号引用与下一步复验/取证动作完整汇报给我。`;
 
     const beforeEnds = agentEnds;

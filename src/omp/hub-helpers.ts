@@ -161,14 +161,29 @@ export function collectResumableFlowCandidates(workspaces: readonly ManagedWorks
     out.push({ ws, cwd: ws.cwd, flowId, status, goal, ...(waitingNodes.length > 0 ? { waitingNodes } : {}) });
   };
   for (const ws of workspaces) {
+    const persistedIds = new Set<string>();
+    const initialSnap = ws.room.getSnapshot();
     if (!ws.store.isClosed()) {
       for (const raw of ws.store.listFlowCheckpoints(50)) {
-        const cp = raw.status === "running" && (!ws.room.hasActiveLeaseOwnership() || ws.room.getSnapshot().flowId !== raw.flowId)
+        persistedIds.add(raw.flowId);
+        const cp = raw.status === "running" && (!ws.room.hasActiveLeaseOwnership() || initialSnap.flowId !== raw.flowId)
           ? (ws.store.reclaimDeadCheckpoint(raw.flowId) ?? raw) : raw;
+        if (initialSnap.flowId === cp.flowId && cp.status !== "running" && initialSnap.status !== cp.status) {
+          ws.room.syncFromCheckpoint(cp);
+        }
         if (isCheckpointResumable(cp)) pushSnap(ws, cp.flowId, cp.status, cp.goal, snapshotFromCheckpoint(cp, ws.cwd));
       }
     }
     const snap = ws.room.getSnapshot();
+    if (snap.flowId && !ws.store.isClosed()) {
+      if (persistedIds.has(snap.flowId)) continue;
+      const persisted = ws.store.getFlowCheckpoint(snap.flowId);
+      if (persisted) {
+        if (persisted.status !== "running" && snap.status !== persisted.status) ws.room.syncFromCheckpoint(persisted);
+        if (isCheckpointResumable(persisted)) pushSnap(ws, persisted.flowId, persisted.status, persisted.goal, snapshotFromCheckpoint(persisted, ws.cwd));
+        continue;
+      }
+    }
     if (ws.room.isResumable() && snap.flowId) pushSnap(ws, snap.flowId, snap.status, snap.goal, snap);
   }
   return out;
@@ -183,12 +198,19 @@ export function collectNonTerminalFlowCandidates(workspaces: readonly ManagedWor
     out.push({ ws, cwd: ws.cwd, flowId, status, goal, roleChain: [...roleChain] });
   };
   for (const ws of workspaces) {
+    const persistedIds = new Set<string>();
     const snap = ws.room.getSnapshot();
-    if (ws.room.hasActiveLeaseOwnership() && snap.flowId) add(ws, snap.flowId, snap.status, snap.goal, snap.roleChain);
     if (!ws.store.isClosed()) {
       for (const c of ws.store.listFlowCheckpoints(50)) {
+        persistedIds.add(c.flowId);
+        if (snap.flowId === c.flowId && c.status !== "running" && snap.status !== c.status) ws.room.syncFromCheckpoint(c);
         if (NON_TERMINAL_FLOW_STATUSES.has(c.status)) add(ws, c.flowId, c.status, c.goal, c.roleChain);
       }
+    }
+    const freshSnap = ws.room.getSnapshot();
+    if (ws.room.hasActiveLeaseOwnership() && freshSnap.flowId) {
+      if (!ws.store.isClosed() && persistedIds.has(freshSnap.flowId)) continue;
+      add(ws, freshSnap.flowId, freshSnap.status, freshSnap.goal, freshSnap.roleChain);
     }
   }
   return out;

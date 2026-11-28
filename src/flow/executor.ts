@@ -48,7 +48,7 @@ export interface ExecuteFlowGraphInput {
   initialHandoff?: HandoffEnvelope | null; userSteers?: readonly FlowUserSteer[];
   observer?: FlowObserver; supervisor?: RoleSupervisorConfig; signal?: AbortSignal;
   sessionPool?: RoleSessionPoolLike; worktreeManager?: WorktreeManagerLike;
-  onStateChange?: (state: FlowMachineState) => void;
+  onStateChange?: (state: FlowMachineState, opts?: { strictPersist?: boolean }) => number | void;
   registerLivePatchHandler?: (handler: LivePatchHandler | null) => void;
 }
 
@@ -337,8 +337,25 @@ export async function executeFlowGraph(
         nowIso: nowIso(),
       });
       if (applied.nextState && applied.commands) {
+        let stateVersion: number | undefined;
+        if (input.onStateChange) {
+          try {
+            const ver = input.onStateChange(applied.nextState, { strictPersist: true });
+            if (typeof ver === "number") stateVersion = ver;
+          } catch (err) {
+            const detail = err instanceof Error ? err.message : String(err);
+            req.resolve({ patched: false, retryable: true, error: `Failed to persist patched Flow checkpoint: ${detail}` });
+            continue;
+          }
+        }
         state = applied.nextState;
-        await executeCommands(applied.commands);
+        const remaining = applied.commands.filter((c) => c.type !== "PERSIST_STATE");
+        await executeCommands(remaining);
+        if (remaining.length > 0) {
+          try { input.onStateChange?.(state); } catch {}
+        }
+        req.resolve({ ...applied.result, ...(stateVersion !== undefined ? { stateVersion } : {}) });
+        continue;
       }
       req.resolve(applied.result);
     }

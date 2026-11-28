@@ -61,6 +61,19 @@ export class ForegroundWorkflowController {
   getActivePhaseContext(sessionId: string, cwd: string, role: RoleSpec, goal?: string, _advanceHumanOnNewTurn = false): ForegroundPhaseContext | null {
     const entry = this.ensureEntry(sessionId, cwd, role, goal);
     if (!entry) return null;
+    if (entry.state.status === "cancelled") {
+      const readOnlyRole: RoleSpec = {
+        ...role,
+        permissions: { ...(role.permissions.tools ? { tools: role.permissions.tools.filter((t) => !MUTATING_SET.has(t)) } : {}), writable: [], protected: ["**"] },
+        exit: { requireToolEvidence: false, criteria: [] },
+      };
+      return {
+        effectiveRole: readOnlyRole, phaseId: "cancelled", phaseIndex: 0, totalPhases: entry.state.nodeOrder.length,
+        badge: "cancelled",
+        promptNote: "[Active Workflow CANCELLED]\nThis foreground workflow was cancelled by the user and has ended. Do not proceed with downstream phases; start a new task or re-select /role to begin fresh.",
+        lockedProtected: ["**"],
+      };
+    }
     const activeId = entry.state.nodeOrder.find((id) => {
       const st = entry.state.nodes[id]!.status;
       return st === "running" || st === "waiting_input" || st === "ready";
@@ -96,9 +109,16 @@ export class ForegroundWorkflowController {
 
   onPhaseHandoff(input: {
     sessionId: string; cwd: string; role: RoleSpec; handoff: HandoffEnvelope; userReplyText?: string; userTurnKey?: string;
-  }): { advanced: boolean; completed?: boolean; nextPhaseId?: string; humanPrompt?: string; userReply?: string; gateError?: string } {
+  }): { advanced: boolean; completed?: boolean; cancelled?: boolean; held?: boolean; nextPhaseId?: string; humanPrompt?: string; userReply?: string; gateError?: string } {
     const entry = this.bySession.get(input.sessionId);
     if (!entry || entry.roleId !== input.role.id || input.handoff.verdict !== "ready") return { advanced: false };
+    if (entry.state.status === "cancelled") {
+      return {
+        advanced: false,
+        cancelled: true,
+        gateError: entry.state.reason ?? "This foreground workflow was cancelled by the user and cannot advance.",
+      };
+    }
     const now = new Date().toISOString();
     const waitingHumanId = entry.state.nodeOrder.find((id) => entry.state.spec.nodes.find((s) => s.id === id)?.kind === "human" && entry.state.nodes[id]!.status === "waiting_input");
     let recordedReply: string | undefined;
@@ -110,15 +130,33 @@ export class ForegroundWorkflowController {
       }
       const humanCfg = entry.state.spec.nodes.find((s) => s.id === waitingHumanId)?.human ?? { prompt: "" };
       const evalRes = evaluateHumanReply(humanCfg, effUserText);
-      if (evalRes.decision !== "proceed") {
+      if (evalRes.decision === "invalid") {
         return {
           advanced: false,
           gateError: evalRes.reason ?? "User's latest message did not satisfy this human gate; phase remains paused.",
         };
       }
+      entry.state = transitionFlow(entry.state, { type: "FLOW_RESUME", targetNodeId: waitingHumanId, replyText: effUserText }, now).state;
+      if (evalRes.decision === "hold") {
+        entry.pausedAtUserTurnKey = effTurnKey;
+        return {
+          advanced: false,
+          held: true,
+          userReply: effUserText,
+          gateError: evalRes.reason ?? "User deferred this human gate; phase remains paused.",
+        };
+      }
+      if (evalRes.decision === "cancel" || entry.state.status === "cancelled") {
+        entry.lastConsumedUserTurnKey = effTurnKey;
+        return {
+          advanced: false,
+          cancelled: true,
+          userReply: effUserText,
+          gateError: evalRes.reason ?? "Foreground workflow cancelled by user.",
+        };
+      }
       entry.lastConsumedUserTurnKey = effTurnKey;
       recordedReply = effUserText;
-      entry.state = transitionFlow(entry.state, { type: "FLOW_RESUME", targetNodeId: waitingHumanId, replyText: effUserText }, now).state;
     } else {
       const activeId = entry.state.nodeOrder.find((id) => entry.state.nodes[id]!.status === "running");
       if (!activeId) return { advanced: false };

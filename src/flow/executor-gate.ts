@@ -36,6 +36,8 @@ export interface WorktreeManagerLike {
 export interface LivePatchResult {
   patched: boolean;
   waves?: string[][];
+  stateVersion?: number;
+  retryable?: boolean;
   invalidGraph?: boolean;
   issues?: GraphValidationIssue[];
   error?: string;
@@ -87,11 +89,24 @@ export function applyLivePatchOnState(input: {
   if (isFlowTerminal(input.state.status)) {
     return { result: { patched: false, error: `Flow "${input.flowId}" is already ${input.state.status} and cannot be patched.` } };
   }
-  // Preserve already-frozen role snapshots while exposing newly installed roles from patchRoles.
-  const mergedRoles = new Map<string, RoleSpec>(input.baseRoles);
-  if (input.patchRoles) {
-    for (const [id, r] of input.patchRoles) mergedRoles.set(id, r);
+  // Unified role policy: newly added nodes may only reference currently available live roles;
+  // already-referenced roles retain their frozen snapshots.
+  const liveRoles = input.patchRoles ?? input.baseRoles;
+  const revokedAdd = (input.patch.addNodes ?? []).find(
+    (n) => (n.kind ?? "role") === "role" && n.role && !liveRoles.has(n.role),
+  );
+  if (revokedAdd) {
+    const msg = `Node "${revokedAdd.id}" references unavailable or removed role "${revokedAdd.role}".`;
+    return {
+      result: {
+        patched: false,
+        invalidGraph: true,
+        issues: [{ code: "unknown_role", nodeId: revokedAdd.id, message: msg }],
+        error: msg,
+      },
+    };
   }
+  const mergedRoles = new Map<string, RoleSpec>(liveRoles);
   for (const [id, r] of Object.entries(input.state.roleSnapshots ?? {})) {
     mergedRoles.set(id, r);
   }

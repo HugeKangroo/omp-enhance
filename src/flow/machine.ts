@@ -168,9 +168,10 @@ export function transitionFlow(
           }
           appendHumanReply(id, rt.questionPrompt, evalRes.decision);
         } else {
-          rt.status = "ready";
+          rt.status = "pending";
           rt.activeStageId = null;
           rt.lastError = null;
+          rt.endedAt = null;
           rt.questionsForUser = [];
           if (trimmedReply) {
             rt.lastReply = trimmedReply;

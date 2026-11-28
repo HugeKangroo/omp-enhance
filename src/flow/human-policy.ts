@@ -18,7 +18,9 @@ const QUESTION_END_RE = /(?:[?？]|(?:吗|呢|么)[？?。!！\s]*)$/;
 const DEFAULT_HOLD_OPTION_RE =
   /^(?:暂缓|暂停|稍后|稍等|等等|延后|搁置|先等等|待定|hold|defer|pause|later|wait)$/i;
 const DEFAULT_CANCEL_OPTION_RE =
-  /^(?:取消|拒绝|终止|中止|停止|不同意|不批准|驳回|否决|放弃|cancel|reject|abort|deny|stop|no)$/i;
+  /^(?:否|不|不行|不要|不执行|不通过|取消|拒绝|终止|中止|停止|不同意|不批准|驳回|否决|放弃|cancel|reject|abort|deny|stop|no|false|n)$/i;
+const DEFAULT_PROCEED_OPTION_RE =
+  /^(?:是|好|好的|行|可以|同意|批准|通过|确认|继续|执行|放行|合并|应用|发布|部署|启动|采用|采纳|接受|yes|y|ok|okay|approve|approved|confirm|confirmed|proceed|continue|agree|accept|go|go\s+ahead|lgtm|true)$/i;
 const PURE_HOLD_RE =
   /(?:暂缓|暂停|稍等|等等|再看看|再看|还没决定|尚未决定|先等等|先别急|等我看看|等我确认|还要看|还需确认|另等通知|hold\s*on|wait\s+a\b|not\s+yet|defer\b|later\b)/i;
 const PURE_CANCEL_RE =
@@ -26,9 +28,11 @@ const PURE_CANCEL_RE =
 const APPROVAL_HOLD_RE =
   /(?:暂缓|暂停|稍等|等等|再看看|再看|还没|尚未|先不(?:要)?(?:批准|同意|确认|通过|放行|继续|执行)?|先别|别(?:再|继续|批准|同意|通过|放行)|等我|还要看|还需|hold\s*on|wait\b|not\s+yet|defer|later)/i;
 const APPROVAL_CANCEL_RE =
-  /^(?:取消|拒绝|不同意|不批准|不通过|驳回|否决|算了|放弃|cancel|reject|deny|abort|no)$|(?:明确|坚决)?(?:拒绝|取消|驳回|否决)(?:本次|此|该|执行|发布|交付|合并|任务|流程)?|不(?:同意|批准|通过|确认|放行)(?:执行|发布|交付|合并)?$/i;
+  /^(?:否|取消|拒绝|不同意|不批准|不通过|驳回|否决|算了|放弃|cancel|reject|deny|abort|no|n)$|(?:明确|坚决)?(?:拒绝|取消|驳回|否决)(?:本次|此|该|执行|发布|交付|合并|任务|流程)?|不(?:同意|批准|通过|确认|放行)(?:执行|发布|交付|合并)?$/i;
 const APPROVAL_NEGATION_RE =
-  /(?:不要(?:批准|同意|确认|通过|放行|继续|执行|合并|发布)?|不批准|不同意|不确认|不通过|别批准|别继续|don'?t\s+(?:approve|proceed|run|execute|merge|deploy)|do\s+not\s+(?:approve|proceed|run|execute|merge|deploy))/i;
+  /(?:不要(?:批准|同意|确认|通过|放行|继续|执行|合并|发布)?|不能(?:批准|同意|确认|通过|放行|继续|执行|合并|发布|启动)?|不可(?:以)?(?:批准|同意|继续|执行|合并|发布)?|不行|不批|没批|未批|不予批准|不批准|不同意|不确认|不通过|别批准|别继续|禁止|反对|cannot\s+(?:approve|proceed|run|execute|merge|deploy)|not\s+approved|don'?t\s+(?:approve|proceed|run|execute|merge|deploy)|do\s+not\s+(?:approve|proceed|run|execute|merge|deploy))/i;
+const APPROVAL_PROCEED_RE =
+  /^(?:是|好|好的|行|可以|ok|okay|yes|y|lgtm|sure|true|go|approved?|confirmed?)$|(?:同意|批准|通过|确认|放行|准予|没问题|继续(?:执行|推进)?|可以(?:执行|继续|发布|合并|启动)?|执行吧|合并吧|发布吧|\b(?:approve|approved|proceed|go\s+ahead|confirm|confirmed|lgtm|looks\s+good)\b)/i;
 
 function normalizeOptionToken(raw: string): string {
   return raw.trim().toLowerCase().replace(/^[（(「【"'\s]+|[）)」】"'\s。.!！?？]+$/g, "");
@@ -36,14 +40,17 @@ function normalizeOptionToken(raw: string): string {
 
 export function inferHumanNodeMode(config: HumanNodeConfig): HumanNodeMode {
   if (config.mode === "approval" || config.mode === "input") return config.mode;
-  if (config.options && config.options.length > 0) return "approval";
   if (INPUT_PROMPT_RE.test(config.prompt) && !/是否(?:批准|同意|发布|执行|清理|删除)/.test(config.prompt)) {
     return "input";
   }
+  if (config.options && config.options.length > 0) return "approval";
   return APPROVAL_PROMPT_RE.test(config.prompt) ? "approval" : "input";
 }
 
-function resolveOptionAction(config: HumanNodeConfig, matchedOption: string): HumanOptionAction {
+export function resolveHumanOptionAction(
+  config: HumanNodeConfig,
+  matchedOption: string,
+): HumanOptionAction | "ambiguous" {
   const actions = config.optionActions;
   if (actions) {
     if (actions[matchedOption]) return actions[matchedOption]!;
@@ -55,7 +62,14 @@ function resolveOptionAction(config: HumanNodeConfig, matchedOption: string): Hu
   const norm = normalizeOptionToken(matchedOption);
   if (DEFAULT_HOLD_OPTION_RE.test(norm)) return "hold";
   if (DEFAULT_CANCEL_OPTION_RE.test(norm)) return "cancel";
-  return "proceed";
+  if (DEFAULT_PROCEED_OPTION_RE.test(norm)) return "proceed";
+  return "ambiguous";
+}
+
+export function findAmbiguousApprovalOptions(config: HumanNodeConfig): string[] {
+  if (inferHumanNodeMode(config) !== "approval") return [];
+  const options = config.options?.map((o) => o.trim()).filter(Boolean) ?? [];
+  return options.filter((opt) => resolveHumanOptionAction(config, opt) === "ambiguous");
 }
 
 export function evaluateHumanReply(config: HumanNodeConfig, rawReply: string): HumanReplyEvaluation {
@@ -70,12 +84,20 @@ export function evaluateHumanReply(config: HumanNodeConfig, rawReply: string): H
     const cleanNorm = normalizeOptionToken(clean);
     const matched = options.find((opt) => normalizeOptionToken(opt) === cleanNorm);
     if (matched) {
-      const action = resolveOptionAction(config, matched);
+      const action = resolveHumanOptionAction(config, matched);
       if (action === "hold") {
         return { decision: "hold", mode, matchedOption: matched, reason: `User selected hold option "${matched}"; node remains waiting_input.` };
       }
       if (action === "cancel") {
         return { decision: "cancel", mode, matchedOption: matched, reason: `User selected cancel option "${matched}"; stopping downstream execution.` };
+      }
+      if (action === "ambiguous" && mode === "approval") {
+        return {
+          decision: "hold",
+          mode,
+          matchedOption: matched,
+          reason: `Approval option "${matched}" has no explicit optionActions mapping; keeping node paused instead of proceeding automatically.`,
+        };
       }
       return { decision: "proceed", mode, matchedOption: matched };
     }
@@ -105,6 +127,13 @@ export function evaluateHumanReply(config: HumanNodeConfig, rawReply: string): H
     }
     if (APPROVAL_NEGATION_RE.test(clean)) {
       return { decision: "hold", mode, reason: `Negative or non-approving reply ("${clean}"); approval gate remains paused.` };
+    }
+    if (!APPROVAL_PROCEED_RE.test(clean)) {
+      return {
+        decision: "hold",
+        mode,
+        reason: `Reply ("${clean}") is not an explicit approval; approval gate remains paused (reply e.g. 同意/批准 to proceed, or 暂缓/取消).`,
+      };
     }
     return { decision: "proceed", mode };
   }

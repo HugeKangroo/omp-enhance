@@ -102,22 +102,95 @@ function normalizeTestCmdKey(cmd: string): string {
   return cmd.trim().replace(/\s+/g, " ");
 }
 
-function stripSegmentWrappers(rawSeg: string): string {
-  return rawSeg
-    .trim()
-    .replace(/^[()]+|[()]+$/g, "")
-    .trim()
-    .replace(SEGMENT_ENV_PREFIX_RE, "")
-    .replace(SEGMENT_WRAPPER_PREFIX_RE, "")
-    .trim();
+const LEADING_ENV_TOKEN_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|([^\s]+))(?:\s+|$)/;
+const WRAPPER_ONLY_RE = /^(?:(?:time|nohup)\s+|timeout\s+(?:-\S+\s+)*\S+\s+)/;
+const CD_STMT_RE = /^cd\s+(.+)$/;
+const EXPORT_STMT_RE = /^export\s+(.+)$/;
+
+function parseEnvAssignments(raw: string): { envs: Record<string, string>; rest: string } {
+  const envs: Record<string, string> = {};
+  let rest = raw.trim();
+  while (rest) {
+    if (rest.startsWith("env ")) {
+      rest = rest.slice(4).trim();
+      continue;
+    }
+    const wrapper = WRAPPER_ONLY_RE.exec(rest);
+    if (wrapper) {
+      rest = rest.slice(wrapper[0].length).trim();
+      continue;
+    }
+    const m = LEADING_ENV_TOKEN_RE.exec(rest);
+    if (!m) break;
+    const key = m[1]!;
+    const rawVal = m[2] ?? m[3] ?? m[4] ?? "";
+    envs[key] = rawVal;
+    rest = rest.slice(m[0].length).trim();
+  }
+  return { envs, rest };
+}
+
+function formatCanonicalEnvPrefix(envs: Record<string, string>): string {
+  const keys = Object.keys(envs).sort();
+  if (keys.length === 0) return "";
+  return keys.map((k) => {
+    const v = envs[k]!;
+    return /\s/.test(v) ? `${k}="${v}"` : `${k}=${v}`;
+  }).join(" ");
+}
+
+function buildCanonicalStageKey(rawStage: string, activeCd: string | null, exportedEnv: Readonly<Record<string, string>>): string {
+  const stripped = rawStage.trim().replace(/^[()]+|[()]+$/g, "").trim();
+  const { envs, rest } = parseEnvAssignments(stripped);
+  const mergedEnv: Record<string, string> = { ...exportedEnv, ...envs };
+  const envPrefix = formatCanonicalEnvPrefix(mergedEnv);
+  const cmdPart = normalizeTestCmdKey(envPrefix ? `${envPrefix} ${rest}` : rest);
+  return activeCd ? `cd ${normalizeTestCmdKey(activeCd)} && ${cmdPart}` : cmdPart;
+}
+
+interface ParsedCommandStage {
+  rawStage: string;
+  canonicalKey: string;
+  isRunner: boolean;
+}
+
+function parseCommandStages(rawCommand: string): ParsedCommandStage[] {
+  const statements = splitShellStatements(rawCommand);
+  let activeCd: string | null = null;
+  const exportedEnv: Record<string, string> = {};
+  const stages: ParsedCommandStage[] = [];
+  for (const { stmt } of statements) {
+    const trimmed = stmt.trim().replace(/^[()]+|[()]+$/g, "").trim();
+    if (!trimmed) continue;
+    if (!trimmed.includes("|")) {
+      const cdMatch = CD_STMT_RE.exec(trimmed);
+      if (cdMatch) { activeCd = cdMatch[1]!.trim(); continue; }
+      const expMatch = EXPORT_STMT_RE.exec(trimmed);
+      if (expMatch) {
+        const parsed = parseEnvAssignments(expMatch[1]!);
+        Object.assign(exportedEnv, parsed.envs);
+        continue;
+      }
+    }
+    for (const rawStage of stmt.split("|")) {
+      const s = rawStage.trim();
+      if (!s) continue;
+      stages.push({
+        rawStage: s,
+        canonicalKey: buildCanonicalStageKey(s, activeCd, exportedEnv),
+        isRunner: isTestRunnerSegment(s),
+      });
+    }
+  }
+  return stages;
 }
 
 export function extractUnderlyingTestCmd(rawCommand: string): string {
-  const segments = rawCommand
-    .split(/(?:&&|\|\||;|\n|\|)/)
-    .map(stripSegmentWrappers)
-    .filter((s) => s.length > 0 && isTestRunnerSegment(s));
-  return segments.length > 0 ? normalizeTestCmdKey(segments.join(" && ")) : normalizeTestCmdKey(rawCommand);
+  const stages = parseCommandStages(rawCommand);
+  const runnerKeys = stages.filter((s) => s.isRunner).map((s) => s.canonicalKey);
+  if (runnerKeys.length > 0) return normalizeTestCmdKey(runnerKeys.join(" && "));
+  const firstStage = stages[0]?.canonicalKey;
+  return firstStage ? normalizeTestCmdKey(firstStage) : normalizeTestCmdKey(rawCommand);
 }
 
 function resolveCallShellInfo(call: ObservedToolCall, store: EnhanceStore): { cmd: string; statusOk: boolean; exitCode: number } | null {
@@ -152,37 +225,44 @@ function classifyTestCall(
   call: ObservedToolCall,
   store: EnhanceStore,
   requiredCheckKeys?: ReadonlySet<string>,
-): { kind: "passed" | "failed" | "unverifiable" | "none"; command?: string; key?: string; exitCode?: number; outputShowedFailure?: boolean } {
+): { kind: "passed" | "failed" | "unverifiable" | "none"; command?: string; keys?: string[]; exitCode?: number; outputShowedFailure?: boolean } {
   const info = resolveCallShellInfo(call, store);
   if (!info) return { kind: "none" };
   const { cmd, statusOk, exitCode } = info;
   const recognized = isRecognizedTestCommand(cmd);
-  const splitSegs = cmd.split(/(?:&&|\|\||;|\n|\|)/).map(stripSegmentWrappers);
-  const mentionsRunner = recognized || splitSegs.some(isTestRunnerSegment);
-  const underlyingKey = mentionsRunner ? extractUnderlyingTestCmd(cmd) : normalizeTestCmdKey(cmd);
+  const stages = parseCommandStages(cmd);
+  const runnerStages = stages.filter((s) => s.isRunner);
+  const mentionsRunner = recognized || runnerStages.length > 0;
+  const matchedReqStages = requiredCheckKeys?.size
+    ? stages.filter((s) => requiredCheckKeys.has(s.canonicalKey))
+    : [];
+  const fullCanonical = extractUnderlyingTestCmd(cmd);
+  const fullMatchesReq = Boolean(requiredCheckKeys?.has(fullCanonical));
 
-  let matchedReqKey: string | undefined;
-  let reqVerifiable = false;
-  if (requiredCheckKeys?.size) {
-    matchedReqKey = requiredCheckKeys.has(underlyingKey)
-      ? underlyingKey
-      : splitSegs.map(normalizeTestCmdKey).find((seg) => requiredCheckKeys.has(seg));
-    if (matchedReqKey) {
-      reqVerifiable =
-        (matchedReqKey === underlyingKey && recognized) ||
-        isVerifiableShellStage(cmd, (s) => normalizeTestCmdKey(stripSegmentWrappers(s)) === matchedReqKey);
-    }
-  }
-  if (!mentionsRunner && !matchedReqKey) return { kind: "none" };
+  if (!mentionsRunner && matchedReqStages.length === 0 && !fullMatchesReq) return { kind: "none" };
   const outputShowedFailure = hasTestFailureOutput(call.outputSnippet);
-  const key = matchedReqKey ?? underlyingKey;
-  if (mentionsRunner ? !recognized : !reqVerifiable) {
-    return { kind: "unverifiable", command: cmd, key, exitCode: outputShowedFailure ? 1 : exitCode, outputShowedFailure };
+
+  const keys = [...new Set([
+    ...runnerStages.map((s) => s.canonicalKey),
+    ...matchedReqStages.map((s) => s.canonicalKey),
+    ...(fullMatchesReq ? [fullCanonical] : []),
+  ])];
+  if (keys.length === 0) keys.push(fullCanonical);
+
+  const reqVerifiable = matchedReqStages.length > 0
+    ? matchedReqStages.every((ms) => isVerifiableShellStage(cmd, (rawSt) => rawSt.trim() === ms.rawStage))
+    : fullMatchesReq
+      ? isVerifiableShellStage(cmd, (rawSt) => rawSt.trim() === (stages[0]?.rawStage ?? cmd.trim()))
+      : false;
+  const isVerifiable = mentionsRunner ? recognized : reqVerifiable;
+
+  if (!isVerifiable) {
+    return { kind: "unverifiable", command: cmd, keys, exitCode: outputShowedFailure ? 1 : exitCode, outputShowedFailure };
   }
   if (!statusOk || outputShowedFailure) {
-    return { kind: "failed", command: cmd, key, exitCode: exitCode !== 0 ? exitCode : 1, outputShowedFailure };
+    return { kind: "failed", command: cmd, keys, exitCode: exitCode !== 0 ? exitCode : 1, outputShowedFailure };
   }
-  return { kind: "passed", command: cmd, key, exitCode: 0 };
+  return { kind: "passed", command: cmd, keys, exitCode: 0 };
 }
 
 export function verifyQaTestExecution(
@@ -228,25 +308,27 @@ export function verifyQaTestExecution(
     if (cls.kind === "none") return;
     const sameStage = !stageId || !c.stageId || c.stageId === stageId;
     const cmd = cls.command!;
-    const key = cls.key ?? normalizeTestCmdKey(cmd);
+    const keys = cls.keys?.length ? cls.keys : [normalizeTestCmdKey(cmd)];
 
     if (cls.kind === "unverifiable") {
       sawUnverifiableTest = true;
       if (sameStage) {
         evidenceRecords.push(toRecord(c, cmd, cls.exitCode ?? 1));
-        latestByCmd.set(key, {
-          status: "unverifiable",
-          command: cmd,
-          exitCode: cls.exitCode ?? 1,
-          outputShowedFailure: cls.outputShowedFailure,
-        });
+        for (const key of keys) {
+          latestByCmd.set(key, {
+            status: "unverifiable",
+            command: cmd,
+            exitCode: cls.exitCode ?? 1,
+            outputShowedFailure: cls.outputShowedFailure,
+          });
+        }
       }
       return;
     }
     if (cls.kind === "failed") {
       if (sameStage) {
         evidenceRecords.push(toRecord(c, cmd, cls.exitCode ?? 1));
-        latestByCmd.set(key, { status: "failed", command: cmd, exitCode: cls.exitCode ?? 1 });
+        for (const key of keys) latestByCmd.set(key, { status: "failed", command: cmd, exitCode: cls.exitCode ?? 1 });
       }
       return;
     }
@@ -259,7 +341,7 @@ export function verifyQaTestExecution(
       return;
     }
     evidenceRecords.push(toRecord(c, cmd, 0));
-    latestByCmd.set(key, { status: "passed", command: cmd, exitCode: 0 });
+    for (const key of keys) latestByCmd.set(key, { status: "passed", command: cmd, exitCode: 0 });
     passedOnCurrentTree += 1;
   });
 

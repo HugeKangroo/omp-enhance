@@ -74,11 +74,21 @@ function expandSingleRoleNode(
     }
 
     const isFinal = ph.id === finalRolePhaseId;
+    const mergedChecks = [
+      ...new Set([
+        ...(isFinal ? (baseRole.exit.requiredChecks ?? []) : []),
+        ...(ph.requiredChecks ?? []),
+        ...(isFinal ? (outerNode.requiredChecks ?? []) : []),
+      ]),
+    ];
     const applied = applyPhasePermissions(scopedBase, ph, cumulativeLocks, isFinal);
     if (!applied.ok) throw new Error(`Node "${outerNode.id}": ${applied.reason}`);
     cumulativeLocks = applied.nextCumulativeProtected;
     lockedById[id] = [...cumulativeLocks];
-    phaseRoles.set(id, { ...applied.role, id: `${baseRole.id}__${ph.id}`, name: ph.title ?? `${baseRole.name} · ${ph.id}` });
+    const effPhaseRole: RoleSpec = mergedChecks.length > 0
+      ? { ...applied.role, exit: { ...applied.role.exit, requiredChecks: mergedChecks } }
+      : applied.role;
+    phaseRoles.set(id, { ...effPhaseRole, id: `${baseRole.id}__${ph.id}`, name: ph.title ?? `${baseRole.name} · ${ph.id}` });
     lastRoleFlatId = id;
 
     const lockHint = cumulativeLocks.length > 0 ? `Locked read-only paths (DO NOT modify): ${cumulativeLocks.join(", ")}` : undefined;
@@ -103,11 +113,7 @@ function expandSingleRoleNode(
       ...(effWritable ? { writableScope: effWritable } : {}),
       ...(cumulativeLocks.length > 0 ? { lockedProtected: [...cumulativeLocks] } : {}),
       ...(ph.exitArtifacts?.length ? { requiredArtifacts: [...ph.exitArtifacts] } : {}),
-      ...(ph.requiredChecks?.length
-        ? { requiredChecks: [...ph.requiredChecks] }
-        : isFinal && outerNode.requiredChecks?.length
-          ? { requiredChecks: [...outerNode.requiredChecks] }
-          : {}),
+      ...(mergedChecks.length > 0 ? { requiredChecks: mergedChecks } : {}),
       isWorkflowPhase: true, ...(isFinal ? { isFinalWorkflowPhase: true } : {}),
       ...(ph.maxAttempts !== undefined ? { maxAttempts: ph.maxAttempts } : outerNode.maxAttempts !== undefined ? { maxAttempts: outerNode.maxAttempts } : {}),
       ...(ph.fallbackModels ? { fallbackModels: [...ph.fallbackModels] } : outerNode.fallbackModels ? { fallbackModels: [...outerNode.fallbackModels] } : {}),
