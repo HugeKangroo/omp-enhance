@@ -131,6 +131,14 @@ export function formatFlowEventReport(settlement: BackgroundFlowSettlement): str
   if (env?.artifacts.length) lines.push(`Artifacts: ${env.artifacts.map((a) => `${a.path} [${a.role}]`).join(", ")}`);
   if (env?.deletedFiles?.length) lines.push(`Deleted files: ${env.deletedFiles.join(", ")}`);
   if (env?.verifiedFacts.length) lines.push("Verified facts:", ...env.verifiedFacts.map((f) => `- ${f.claim} (evidence: ${f.evidenceRef})`));
+  if (env?.verificationScope) {
+    const s = env.verificationScope;
+    const parts = [`checked=[${s.checked.join(", ")}]`];
+    if (s.unchecked?.length) parts.push(`unchecked=[${s.unchecked.join(", ")}]`);
+    if (s.environmentGaps?.length) parts.push(`environmentGaps=[${s.environmentGaps.join(", ")}]`);
+    lines.push(`Verification scope: ${parts.join("; ")}`);
+  }
+  if (env?.reworkCategory) lines.push(`Rework category: ${env.reworkCategory}`);
   if (env?.openRisks.length) lines.push("Open risks:", ...env.openRisks.map((r) => `- ${r}`));
   const waitingNodes = status === "waiting_input" ? collectWaitingNodes(snap) : [];
   if (waitingNodes.length > 0) {

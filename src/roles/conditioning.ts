@@ -92,7 +92,8 @@ export function renderConditioningBlock(input: RenderConditioningBlockInput): st
     `Permissions: tools=${permissions.tools?.join(", ") || (permissions.tools ? "(none)" : "(unrestricted)")}` +
       `; writable=${permissions.writable?.join(", ") || (permissions.writable ? "(none)" : "(unrestricted)")}` +
       `; protected=${permissions.protected?.join(", ") || "(none)"}` +
-      (permissions.dispatch ? "; dispatch=true" : ""),
+      (permissions.dispatch ? "; dispatch=true" : "") +
+      (permissions.mcp ? "; mcp=true" : ""),
     `Exit: require_tool_evidence=${role.exit.requireToolEvidence}`,
     ...bullets("Exit criteria:", role.exit.criteria),
   ];
@@ -198,6 +199,18 @@ export function renderConditioningBlock(input: RenderConditioningBlockInput): st
         upstreamHandoff.verifiedFacts.map((f) => `${f.claim} (evidence: ${f.evidenceRef})`),
       ),
       ...bullets("openRisks:", upstreamHandoff.openRisks),
+      ...(upstreamHandoff.verificationScope
+        ? [
+            ...bullets("verificationScope.checked:", upstreamHandoff.verificationScope.checked),
+            ...(upstreamHandoff.verificationScope.unchecked?.length
+              ? bullets("verificationScope.unchecked:", upstreamHandoff.verificationScope.unchecked)
+              : []),
+            ...(upstreamHandoff.verificationScope.environmentGaps?.length
+              ? bullets("verificationScope.environmentGaps:", upstreamHandoff.verificationScope.environmentGaps)
+              : []),
+          ]
+        : []),
+      ...(upstreamHandoff.reworkCategory ? [`reworkCategory: ${upstreamHandoff.reworkCategory}`] : []),
       ...(upstreamHandoff.questionsForUser && upstreamHandoff.questionsForUser.length > 0
         ? bullets("questionsForUser:", upstreamHandoff.questionsForUser)
         : []),

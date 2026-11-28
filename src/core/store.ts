@@ -183,13 +183,14 @@ export class EnhanceStore {
 
   saveHandoff(envelope: HandoffEnvelope): void {
     this.writeConn(true)!.query(
-      "INSERT OR REPLACE INTO handoffs (id, mandate_id, mandate_rev, parent_handoff_id, from_role, to_target, verdict, summary, artifacts, deleted_files, verified_facts, verification_evidence, open_risks, questions_for_user, feedback_for_upstream, observed_usage, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO handoffs (id, mandate_id, mandate_rev, parent_handoff_id, from_role, to_target, verdict, summary, artifacts, deleted_files, verified_facts, verification_evidence, verification_scope, rework_category, open_risks, questions_for_user, feedback_for_upstream, observed_usage, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     ).run(
       envelope.id, envelope.mandateId, envelope.mandateRev, envelope.parentHandoffId, envelope.fromRole,
       envelope.toTarget, envelope.verdict, envelope.summary, JSON.stringify(envelope.artifacts),
       envelope.deletedFiles !== undefined ? JSON.stringify(envelope.deletedFiles) : null, JSON.stringify(envelope.verifiedFacts),
-      envelope.verificationEvidence !== undefined ? JSON.stringify(envelope.verificationEvidence) : null, JSON.stringify(envelope.openRisks),
-      envelope.questionsForUser !== undefined ? JSON.stringify(envelope.questionsForUser) : null,
+      envelope.verificationEvidence !== undefined ? JSON.stringify(envelope.verificationEvidence) : null,
+      envelope.verificationScope !== undefined ? JSON.stringify(envelope.verificationScope) : null, envelope.reworkCategory ?? null,
+      JSON.stringify(envelope.openRisks), envelope.questionsForUser !== undefined ? JSON.stringify(envelope.questionsForUser) : null,
       envelope.feedbackForUpstream, envelope.observedUsage ? JSON.stringify(envelope.observedUsage) : null, envelope.createdAt,
     );
   }

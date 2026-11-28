@@ -18,7 +18,11 @@ export interface EnhanceSettings {
 }
 
 export interface RolePermissions {
-  tools?: string[]; writable?: string[]; protected?: string[]; dispatch?: boolean;
+  tools?: string[];
+  writable?: string[];
+  protected?: string[];
+  dispatch?: boolean;
+  mcp?: boolean;
 }
 
 export interface RoleExitSpec {
@@ -71,12 +75,22 @@ export interface VerificationEvidenceRecord {
 }
 
 export type HandoffVerdict = "ready" | "needs_input" | "rejected" | "blocked";
+export type ReworkCategory = "goal_revision" | "artifact_fix" | "rubric_revision";
+
+export interface VerificationScope {
+  checked: string[];
+  unchecked?: string[];
+  environmentGaps?: string[];
+}
 
 export interface HandoffEnvelope {
   id: string; mandateId: string; mandateRev: number; parentHandoffId: string | null;
   fromRole: string; toTarget: "user" | string; verdict: HandoffVerdict; summary: string;
   artifacts: ArtifactRecord[]; deletedFiles?: string[]; verifiedFacts: VerifiedFact[];
-  verificationEvidence?: VerificationEvidenceRecord[]; openRisks: string[];
+  verificationEvidence?: VerificationEvidenceRecord[];
+  verificationScope?: VerificationScope;
+  reworkCategory?: ReworkCategory;
+  openRisks: string[];
   questionsForUser?: string[]; feedbackForUpstream: string | null;
   observedUsage: UsageSummary | null; createdAt: string;
 }

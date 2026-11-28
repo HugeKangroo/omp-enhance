@@ -8,8 +8,8 @@ import {
 import { hasWriteBoundary, isRoleReadOnly, isValidExecutionEvidence } from "../core/policy.ts";
 import type { EnhanceStore } from "../core/store.ts";
 import type {
-  ArtifactRecord, HandoffEnvelope, HandoffVerdict, Mandate, ObservedToolCall, RoleSpec,
-  UsageSummary, VerificationEvidenceRecord, VerifiedFact,
+  ArtifactRecord, HandoffEnvelope, HandoffVerdict, Mandate, ObservedToolCall, ReworkCategory, RoleSpec,
+  UsageSummary, VerificationEvidenceRecord, VerificationScope, VerifiedFact,
 } from "../core/types.ts";
 import {
   countFileLines, extractEvidenceLineRange, isRecognizedTestCommand, MAX_LINE_CHECK_BYTES,
@@ -52,6 +52,8 @@ export interface CreateHandoffInput {
   enforceConfigIntegrity?: boolean;
   observedCalls?: readonly ObservedToolCall[];
   verifiedFacts?: readonly VerifiedFact[];
+  verificationScope?: VerificationScope | null;
+  reworkCategory?: ReworkCategory | null;
   openRisks?: readonly string[];
   questionsForUser?: readonly string[];
   feedbackForUpstream?: string | null;
@@ -262,12 +264,25 @@ export function createAndVerifyHandoff(input: CreateHandoffInput): HandoffEnvelo
     ...(input.flowId ? { flowId: input.flowId } : {}),
   });
 
+  const normalizedScope = input.verificationScope
+    ? {
+        checked: input.verificationScope.checked.map((s) => s.trim()).filter(Boolean),
+        ...(input.verificationScope.unchecked?.length
+          ? { unchecked: input.verificationScope.unchecked.map((s) => s.trim()).filter(Boolean) }
+          : {}),
+        ...(input.verificationScope.environmentGaps?.length
+          ? { environmentGaps: input.verificationScope.environmentGaps.map((s) => s.trim()).filter(Boolean) }
+          : {}),
+      }
+    : undefined;
   const envelope: HandoffEnvelope = {
     id: randomUUID(), mandateId: mandate.id, mandateRev: mandate.rev,
     parentHandoffId: input.parentHandoffId ?? null, fromRole: input.role.id,
     toTarget: input.toTarget ?? "user", verdict: input.verdict, summary, artifacts,
     ...(deletedFiles.length > 0 ? { deletedFiles } : {}), verifiedFacts,
     ...(verificationEvidence ? { verificationEvidence } : {}),
+    ...(normalizedScope ? { verificationScope: normalizedScope } : {}),
+    ...(input.reworkCategory ? { reworkCategory: input.reworkCategory } : {}),
     openRisks: [...(input.openRisks ?? [])],
     ...(questionsForUser.length > 0 ? { questionsForUser } : {}),
     feedbackForUpstream, observedUsage: input.observedUsage ?? null, createdAt: new Date().toISOString(),

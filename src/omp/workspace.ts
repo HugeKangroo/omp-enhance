@@ -352,7 +352,7 @@ export function createManagedWorkspace(
     },
     runnerFor: (c) => {
       const scopedCtx = bindCtxToCwd(c, cwd);
-      return options.runnerFactory?.(pi, scopedCtx) ?? createOmpRoleSessionRunner(pi, scopedCtx, ws.settings, ws.roles);
+      return options.runnerFactory?.(pi, scopedCtx) ?? createOmpRoleSessionRunner(pi, scopedCtx, ws.settings, ws.roles, 0, ws.isTrusted);
     },
     supervisorFor: (c) => {
       const sup = ws.settings.supervisorEnabled ? ws.roles.get("supervisor") : undefined;

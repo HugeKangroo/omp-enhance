@@ -34,6 +34,7 @@ const PERMISSION_KEYS: Record<string, true> = {
   writable: true,
   protected: true,
   dispatch: true,
+  mcp: true,
 };
 
 const EXIT_KEYS: Record<string, true> = {
@@ -121,6 +122,7 @@ export function computeRoleContentSha256(
       writable: role.permissions.writable,
       protected: role.permissions.protected,
       dispatch: role.permissions.dispatch ?? false,
+      ...(role.permissions.mcp ? { mcp: true } : {}),
     },
     exit: {
       requireToolEvidence: role.exit.requireToolEvidence,
@@ -209,6 +211,9 @@ export function parseRoleYaml(
     if (permissionYaml.dispatch !== undefined && typeof permissionYaml.dispatch !== "boolean") {
       throw new Error(`permissions.dispatch must be a boolean in ${filePath}`);
     }
+    if (permissionYaml.mcp !== undefined && typeof permissionYaml.mcp !== "boolean") {
+      throw new Error(`permissions.mcp must be a boolean in ${filePath}`);
+    }
     permissions = {
       ...(permissionYaml.tools === undefined
         ? {}
@@ -220,6 +225,7 @@ export function parseRoleYaml(
         ? {}
         : { protected: stringList(permissionYaml.protected, "permissions.protected", filePath) }),
       ...(permissionYaml.dispatch === undefined ? {} : { dispatch: permissionYaml.dispatch }),
+      ...(permissionYaml.mcp === undefined ? {} : { mcp: permissionYaml.mcp }),
     };
   }
 
@@ -328,8 +334,8 @@ export function serializeRoleYaml(
     ...role.method.map((step) => `  - ${JSON.stringify(step)}`),
   ];
 
-  const { tools, writable, protected: prot, dispatch } = role.permissions;
-  if (tools !== undefined || writable !== undefined || prot !== undefined || dispatch !== undefined) {
+  const { tools, writable, protected: prot, dispatch, mcp } = role.permissions;
+  if (tools !== undefined || writable !== undefined || prot !== undefined || dispatch !== undefined || mcp !== undefined) {
     lines.push("permissions:");
     if (tools !== undefined) {
       lines.push(`  tools: [${tools.map((item) => JSON.stringify(item)).join(", ")}]`);
@@ -342,6 +348,9 @@ export function serializeRoleYaml(
     }
     if (dispatch !== undefined) {
       lines.push(`  dispatch: ${dispatch}`);
+    }
+    if (mcp !== undefined) {
+      lines.push(`  mcp: ${mcp}`);
     }
   }
 

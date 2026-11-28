@@ -402,7 +402,11 @@ export function registerFlowTool(
           ? targetWs.store.acquireProjectFlowLease(flowId, process.pid)
           : targetWs.store.acquireScopedFlowLease(flowId, effectiveLeaseMode, process.pid);
         try {
-          const mandate = goal ? targetWs.store.upsertMandate({ goal, flowId }) : existingMandate!;
+          const reqConstraints = asStringArray(params.constraints);
+          const reqAcceptance = asStringArray(params.acceptance);
+          const mandate = goal
+            ? targetWs.store.upsertMandate({ goal, constraints: reqConstraints, acceptance: reqAcceptance, flowId })
+            : existingMandate!;
           const initialHandoffId = asString(params.initialHandoffId);
           let initialHandoff: HandoffEnvelope | null = initialHandoffId
             ? (targetWs.store.getHandoff(initialHandoffId) ?? (originWs !== targetWs ? originWs.store.getHandoff(initialHandoffId) : null))

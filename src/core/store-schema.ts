@@ -80,7 +80,7 @@ export const SCHEMA_TABLES = [
   "CREATE TABLE IF NOT EXISTS mandates (id TEXT PRIMARY KEY, rev INTEGER NOT NULL, goal TEXT NOT NULL, constraints TEXT NOT NULL, acceptance TEXT NOT NULL, status TEXT NOT NULL, session_id TEXT, flow_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
   "CREATE TABLE IF NOT EXISTS epistemic_items (id TEXT PRIMARY KEY, mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE, kind TEXT NOT NULL CHECK (kind IN ('fact', 'hypothesis', 'inquiry', 'decision')), statement TEXT NOT NULL, evidence_ref TEXT, verification_plan TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, CHECK (kind != 'fact' OR (evidence_ref IS NOT NULL AND length(trim(evidence_ref)) > 0)));",
   "CREATE TABLE IF NOT EXISTS artifacts (artifact_id INTEGER PRIMARY KEY AUTOINCREMENT, mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE, path TEXT NOT NULL, sha256 TEXT NOT NULL, byte_size INTEGER NOT NULL, role TEXT NOT NULL, digest_kind TEXT, created_at TEXT NOT NULL, UNIQUE (mandate_id, path, sha256));",
-  "CREATE TABLE IF NOT EXISTS handoffs (id TEXT PRIMARY KEY, mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE, mandate_rev INTEGER NOT NULL, parent_handoff_id TEXT, from_role TEXT NOT NULL, to_target TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL, artifacts TEXT NOT NULL, deleted_files TEXT, verified_facts TEXT NOT NULL, verification_evidence TEXT, open_risks TEXT NOT NULL, questions_for_user TEXT, feedback_for_upstream TEXT, observed_usage TEXT, created_at TEXT NOT NULL);",
+  "CREATE TABLE IF NOT EXISTS handoffs (id TEXT PRIMARY KEY, mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE, mandate_rev INTEGER NOT NULL, parent_handoff_id TEXT, from_role TEXT NOT NULL, to_target TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL, artifacts TEXT NOT NULL, deleted_files TEXT, verified_facts TEXT NOT NULL, verification_evidence TEXT, verification_scope TEXT, rework_category TEXT, open_risks TEXT NOT NULL, questions_for_user TEXT, feedback_for_upstream TEXT, observed_usage TEXT, created_at TEXT NOT NULL);",
   "CREATE TABLE IF NOT EXISTS jobs (job_id TEXT PRIMARY KEY, mandate_id TEXT REFERENCES mandates(id) ON DELETE SET NULL, hypothesis_id TEXT, idempotency_key TEXT, command TEXT NOT NULL, cwd TEXT NOT NULL, pid INTEGER NOT NULL, pgid INTEGER NOT NULL, owner_pid INTEGER, process_start_token TEXT, log_path TEXT NOT NULL, exit_file_path TEXT NOT NULL, status TEXT NOT NULL, exit_code INTEGER, started_at TEXT NOT NULL, ended_at TEXT);",
   "CREATE TABLE IF NOT EXISTS flow_runs (flow_id TEXT PRIMARY KEY, mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE, goal TEXT NOT NULL, cwd TEXT, role_chain TEXT NOT NULL, status TEXT NOT NULL, current_index INTEGER NOT NULL, repair_round INTEGER NOT NULL, last_handoff_id TEXT, max_repair_rounds INTEGER NOT NULL, snapshot_json TEXT NOT NULL, owner_pid INTEGER, owner_start_token TEXT, lease_token TEXT, state_version INTEGER NOT NULL DEFAULT 0, next_stage_seq INTEGER, last_rejection_sig TEXT, user_steers TEXT, updated_at TEXT NOT NULL);",
   "CREATE TABLE IF NOT EXISTS project_leases (lease_key TEXT PRIMARY KEY, flow_id TEXT NOT NULL, owner_pid INTEGER NOT NULL, owner_start_token TEXT, lease_token TEXT, acquired_at TEXT NOT NULL);",
@@ -103,6 +103,7 @@ export const SCHEMA_INDEXES = [
 export const MIGRATIONS: ReadonlyArray<[table: string, column: string, ddl: string]> = [
   ["mandates", "session_id", "TEXT"], ["mandates", "flow_id", "TEXT"], ["artifacts", "digest_kind", "TEXT"],
   ["handoffs", "deleted_files", "TEXT"], ["handoffs", "questions_for_user", "TEXT"], ["handoffs", "verification_evidence", "TEXT"],
+  ["handoffs", "verification_scope", "TEXT"], ["handoffs", "rework_category", "TEXT"],
   ["jobs", "owner_pid", "INTEGER"], ["jobs", "process_start_token", "TEXT"], ["jobs", "idempotency_key", "TEXT"],
   ["flow_runs", "cwd", "TEXT"], ["flow_runs", "owner_pid", "INTEGER"], ["flow_runs", "owner_start_token", "TEXT"],
   ["flow_runs", "lease_token", "TEXT"], ["flow_runs", "state_version", "INTEGER DEFAULT 0"],
@@ -122,8 +123,9 @@ export interface ArtifactRow { path: string; sha256: string; byte_size: number; 
 export interface HandoffRow {
   id: string; mandate_id: string; mandate_rev: number; parent_handoff_id: string | null;
   from_role: string; to_target: string; verdict: HandoffEnvelope["verdict"]; summary: string;
-  artifacts: string; deleted_files: string | null; verified_facts: string; verification_evidence: string | null; open_risks: string;
-  questions_for_user: string | null; feedback_for_upstream: string | null; observed_usage: string | null; created_at: string;
+  artifacts: string; deleted_files: string | null; verified_facts: string; verification_evidence: string | null;
+  verification_scope?: string | null; rework_category?: HandoffEnvelope["reworkCategory"] | null;
+  open_risks: string; questions_for_user: string | null; feedback_for_upstream: string | null; observed_usage: string | null; created_at: string;
 }
 export interface JobRow {
   job_id: string; mandate_id: string | null; hypothesis_id: string | null; idempotency_key: string | null; command: string; cwd: string;
@@ -155,11 +157,13 @@ export const toHandoff = (r: HandoffRow): HandoffEnvelope => {
   const deletedFiles = r.deleted_files != null ? safeParseArray<string>(r.deleted_files) : undefined;
   const questionsForUser = r.questions_for_user != null ? safeParseArray<string>(r.questions_for_user) : undefined;
   const verificationEvidence = r.verification_evidence != null ? safeParseArray<VerificationEvidenceRecord>(r.verification_evidence) : undefined;
+  const verificationScope = r.verification_scope != null ? safeParseObject<NonNullable<HandoffEnvelope["verificationScope"]>>(r.verification_scope) : null;
   return {
     id: r.id, mandateId: r.mandate_id, mandateRev: r.mandate_rev, parentHandoffId: r.parent_handoff_id,
     fromRole: r.from_role, toTarget: r.to_target, verdict: r.verdict, summary: r.summary,
     artifacts: safeParseArray(r.artifacts), ...(deletedFiles !== undefined ? { deletedFiles } : {}),
     verifiedFacts: safeParseArray(r.verified_facts), ...(verificationEvidence !== undefined ? { verificationEvidence } : {}),
+    ...(verificationScope ? { verificationScope } : {}), ...(r.rework_category ? { reworkCategory: r.rework_category } : {}),
     openRisks: safeParseArray(r.open_risks), ...(questionsForUser !== undefined ? { questionsForUser } : {}),
     feedbackForUpstream: r.feedback_for_upstream,
     observedUsage: safeParseObject<NonNullable<HandoffEnvelope["observedUsage"]>>(r.observed_usage), createdAt: r.created_at,

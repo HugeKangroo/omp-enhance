@@ -7,7 +7,7 @@ import { cancelJobsByIds } from "../jobs/runner.ts";
 import { parseSupervisorDecision, renderSupervisorPrompt, runWithSessionSupervisor, type SessionSupervisorControl, type SupervisorInspector } from "../jobs/supervisor.ts";
 import { formatRuntimeVisionHint } from "../roles/conditioning.ts";
 import { type ActiveTurnBindings, FlowSessionPool, formatResolvedModelLabel, isRetryableHostError, startStallWatchdog, type WarmSessionHandle } from "./session-pool.ts";
-import { buildStageCompanionTools, schemaKit } from "./tools.ts";
+import { buildStageCompanionTools, parseReworkCategoryParam, parseVerificationScopeParam, schemaKit } from "./tools.ts";
 
 const MAX_CONSULTATION_DEPTH = 3;
 
@@ -156,7 +156,7 @@ export function createOmpSupervisorInspector(pi: any, hostCtx: any, settings?: E
 }
 
 export function createOmpRoleSessionRunner(
-  pi: any, hostCtx: any, settings?: EnhanceSettings, roles?: ReadonlyMap<string, RoleSpec>, consultationDepth = 0,
+  pi: any, hostCtx: any, settings?: EnhanceSettings, roles?: ReadonlyMap<string, RoleSpec>, consultationDepth = 0, isProjectTrusted = false,
 ): RoleSessionRunner {
   const kit = schemaKit(pi);
   const handoffSchema = kit.obj({
@@ -165,6 +165,12 @@ export function createOmpRoleSessionRunner(
     artifactPaths: kit.arr(kit.str()),
     verifiedFacts: kit.arr(kit.obj({ claim: kit.str(), evidenceRef: kit.str() }, ["claim", "evidenceRef"])),
     openRisks: kit.arr(kit.str()), questionsForUser: kit.arr(kit.str()), feedbackForUpstream: kit.str(),
+    verificationScope: kit.obj({
+      checked: kit.arr(kit.str()),
+      unchecked: kit.arr(kit.str()),
+      environmentGaps: kit.arr(kit.str()),
+    }, []),
+    reworkCategory: kit.en(["goal_revision", "artifact_fix", "rubric_revision"]),
   }, ["verdict", "summary"]);
 
   return {
@@ -246,6 +252,8 @@ export function createOmpRoleSessionRunner(
               baselineConfigSnapshot: cur.baselineConfigSnap, enforceConfigIntegrity: true,
               observedCalls: collectObservedCalls(), verifiedFacts: params.verifiedFacts,
               openRisks: params.openRisks, questionsForUser, feedbackForUpstream: params.feedbackForUpstream,
+              verificationScope: parseVerificationScopeParam(params.verificationScope),
+              reworkCategory: parseReworkCategoryParam(params.reworkCategory),
               observedUsage: extractSessionUsage(childSession), isConsultation: Boolean(consultRole),
             });
             if (consultRole) {
@@ -253,7 +261,7 @@ export function createOmpRoleSessionRunner(
                 cwd: cur.stepCtx.cwd, store: cur.stepCtx.store, role: consultRole, mandate: cur.stepCtx.mandate,
                 upstreamHandoff: envelope, userSteers: cur.stepCtx.userSteers, toTarget: cur.stepCtx.role.id,
                 flowId: cur.stepCtx.flowId, observer: cur.stepCtx.observer, supervisor: cur.stepCtx.supervisor, signal: cur.stepCtx.signal,
-                runner: createOmpRoleSessionRunner(pi, hostCtx, settings, roles, consultationDepth + 1),
+                runner: createOmpRoleSessionRunner(pi, hostCtx, settings, roles, consultationDepth + 1, isProjectTrusted),
               });
               return { content: [{ type: "text", text: JSON.stringify({ handoff: envelope, delegated }, null, 2) }], ...(!delegated.ok ? { isError: true } : {}) };
             }
@@ -323,7 +331,7 @@ export function createOmpRoleSessionRunner(
           ...(model ? { model } : {}), ...(thinkingLevel ? { thinkingLevel } : {}),
           settings: createChildSettingsProxy(pi.pi.settings),
           hasUI: false, autoApprove: true, enableMemory: false, bindProcessState: false, disableExtensionDiscovery: true,
-          noContextFiles: false, enableMCP: false, enableLsp: allowedTools.includes("lsp"),
+          noContextFiles: false, enableMCP: Boolean(isProjectTrusted && stepCtx.role.permissions.mcp === true), enableLsp: allowedTools.includes("lsp"),
           preloadedCustomToolPaths: [], promptTemplates: [], slashCommands: [],
           customSystemPrompt: sysPrompt, customTools: [childHandoffTool, ...extraStageTools],
           preloadedPreparedExtensions: [{ path: "<enhance-guard>", resolvedPath: "<enhance-guard>", factory: childGuardExt, error: null }],

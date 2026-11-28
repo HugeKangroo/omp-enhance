@@ -91,8 +91,10 @@ export function resolveRoleActiveTools(
 ): string[] {
   const readOnly = isRoleReadOnly(role), dispatch = canRoleDispatch(role);
   const explicitTools = role.permissions.tools ? new Set<string>(role.permissions.tools) : null;
+  const allowMcpWildcard = role.permissions.mcp === true && !(role.permissions.tools?.some((t) => t.startsWith("mcp_")) ?? false);
   const hostFiltered = allAvailableToolNames.filter((toolName) => {
     if (isCompanionTool(toolName)) return false;
+    if (allowMcpWildcard && toolName.startsWith("mcp_")) return true;
     if (explicitTools) return explicitTools.has(toolName) && !(readOnly && STRICT_READONLY_BLOCKED_TOOLS.has(toolName));
     return !(readOnly && (MUTATING_HOST_TOOLS as readonly string[]).includes(toolName));
   });
@@ -281,7 +283,8 @@ export function checkToolCallAllowed(
   }
 
   const allowedTools = role.permissions.tools;
-  if (allowedTools && !allowedTools.includes(event.toolName)) {
+  const allowMcpWildcard = role.permissions.mcp === true && !(allowedTools?.some((t) => t.startsWith("mcp_")) ?? false);
+  if (allowedTools && !allowedTools.includes(event.toolName) && !(allowMcpWildcard && event.toolName.startsWith("mcp_"))) {
     const base = `Role "${role.id}" does not permit tool "${event.toolName}".`;
     const isMut = Boolean(WRITE_TOOLS[event.toolName] || COORDINATOR_BLOCKED_DIRECT_TOOLS.has(event.toolName));
     return { block: true, reason: !canRoleDispatch(role) && isMut ? addFgHint(base) : base };

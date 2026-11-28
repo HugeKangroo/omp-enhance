@@ -2,7 +2,8 @@ import { canRoleDelegateTo, canRoleUseCompanionTool } from "../core/policy.ts";
 import { normalizeUsageSummary } from "../core/settings.ts";
 import type { EnhanceStore } from "../core/store.ts";
 import type {
-  EnhanceSettings, EpistemicKind, EpistemicStatus, HandoffVerdict, Mandate, MandateStatus, RoleSpec, UsageSummary, VerifiedFact,
+  EnhanceSettings, EpistemicKind, EpistemicStatus, HandoffVerdict, Mandate, MandateStatus,
+  ReworkCategory, RoleSpec, UsageSummary, VerificationScope, VerifiedFact,
 } from "../core/types.ts";
 import { BoundaryViolationError, createAndVerifyHandoff } from "../flow/handoff.ts";
 import { executeRoleStep, type RoleStepContext, type RoleSupervisorConfig } from "../flow/orchestrator.ts";
@@ -18,6 +19,7 @@ const EPISTEMIC_KINDS: readonly EpistemicKind[] = ["fact", "hypothesis", "inquir
 const EPISTEMIC_STATUSES: readonly EpistemicStatus[] = ["open", "verified", "falsified", "deferred"];
 const MANDATE_STATUSES: readonly MandateStatus[] = ["active", "completed", "archived"];
 const VERDICTS: readonly HandoffVerdict[] = ["ready", "needs_input", "rejected", "blocked"];
+const REWORK_CATEGORIES: readonly ReworkCategory[] = ["goal_revision", "artifact_fix", "rubric_revision"];
 
 const asString = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v.trim() : undefined);
 const asStringArray = (v: unknown): string[] | undefined => {
@@ -34,6 +36,21 @@ const asVerifiedFacts = (v: unknown): VerifiedFact[] | undefined => {
   });
   return facts.length > 0 ? facts : undefined;
 };
+
+export function parseVerificationScopeParam(v: unknown): VerificationScope | undefined {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const r = v as Record<string, unknown>;
+  const checked = asStringArray(r.checked) ?? [];
+  const unchecked = asStringArray(r.unchecked);
+  const environmentGaps = asStringArray(r.environmentGaps);
+  if (checked.length === 0 && !unchecked && !environmentGaps) return undefined;
+  return { checked, ...(unchecked ? { unchecked } : {}), ...(environmentGaps ? { environmentGaps } : {}) };
+}
+
+export function parseReworkCategoryParam(v: unknown): ReworkCategory | undefined {
+  const s = asString(v);
+  return s && REWORK_CATEGORIES.includes(s as ReworkCategory) ? (s as ReworkCategory) : undefined;
+}
 
 export function schemaKit(pi: any) {
   const T = pi?.typebox?.Type;
@@ -276,6 +293,8 @@ export function registerEnhanceTools(pi: any, hub: WorkspaceHub, fgWorkflow?: Fo
     parameters: kit.obj({
       verdict: kit.en(VERDICTS), summary: kit.str(), toTarget: kit.str(), artifactPaths: kit.arr(kit.str()),
       verifiedFacts: kit.arr(kit.obj({ claim: kit.str(), evidenceRef: kit.str() }, ["claim", "evidenceRef"])),
+      verificationScope: kit.obj({ checked: kit.arr(kit.str()), unchecked: kit.arr(kit.str()), environmentGaps: kit.arr(kit.str()) }, ["checked"]),
+      reworkCategory: kit.en(REWORK_CATEGORIES),
       openRisks: kit.arr(kit.str()), questionsForUser: kit.arr(kit.str()),
       feedbackForUpstream: kit.str(), delegateNow: kit.bool(),
     }, ["verdict", "summary"]),
@@ -315,6 +334,8 @@ export function registerEnhanceTools(pi: any, hub: WorkspaceHub, fgWorkflow?: Fo
           verdict: verdict as HandoffVerdict, summary, artifactPaths: asStringArray(params.artifactPaths),
           baselineSnapshot: tracker.getBaselineSnapshot(ws.cwd), baselineConfigSnapshot: tracker.getBaselineConfigSnapshot(ws.cwd),
           observedCalls: tracker.getObservedCalls(), verifiedFacts: asVerifiedFacts(params.verifiedFacts),
+          verificationScope: parseVerificationScopeParam(params.verificationScope),
+          reworkCategory: parseReworkCategoryParam(params.reworkCategory),
           openRisks: asStringArray(params.openRisks), questionsForUser: asStringArray(params.questionsForUser),
           feedbackForUpstream: asString(params.feedbackForUpstream), observedUsage: extractForegroundUsage(ctx),
           isConsultation: Boolean(targetRole),

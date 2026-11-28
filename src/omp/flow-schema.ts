@@ -69,6 +69,7 @@ export function buildFlowToolParameters(kit: SchemaKitLike): unknown {
   return kit.obj({
     action: kit.en(["start", "status", "list", "steer", "cancel", "resume", "patch"]),
     cwd: kit.str(), flowId: kit.str(), nodeId: kit.str(), roles: kit.arr(kit.str()), goal: kit.str(),
+    constraints: kit.arr(kit.str()), acceptance: kit.arr(kit.str()),
     preset: kit.en(["linear", "fan_out_join", "contract_parallel_verify", "experiment_loop", "custom"]),
     nodes: kit.arr(nodeSchema), policies: policiesSchema, patch: patchSchema,
     shards: kit.arr(shardSchema), workers: kit.arr(shardSchema), contract: contractSchema,

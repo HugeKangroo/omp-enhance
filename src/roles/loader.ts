@@ -255,6 +255,9 @@ export function cloneRoleSpec(input: {
         ...(input.sourceRole.permissions.dispatch !== undefined
           ? { dispatch: input.sourceRole.permissions.dispatch }
           : {}),
+        ...(input.sourceRole.permissions.mcp !== undefined
+          ? { mcp: input.sourceRole.permissions.mcp }
+          : {}),
       },
       exit: {
         requireToolEvidence: input.sourceRole.exit.requireToolEvidence,
