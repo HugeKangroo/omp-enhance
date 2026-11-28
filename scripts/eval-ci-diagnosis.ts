@@ -119,8 +119,9 @@ export const PILOT_CASES: readonly CiPilotCaseSpec[] = [
       /(?:根因|真正原因|主因|原因|导致|引发|偏移|漏掉|遗漏|本地时区|非\s*utc|解析错误|按本地|root\s+cause|caused\s+by|because|local\s+time(?:zone)?|offset|drops?|misses?)/i,
     ],
     contradictionPatterns: [
-      /(?:已?排除|并非|不是|与[^。！？.!?\n;；]{0,8}无关|not caused by|ruled out|unrelated to)[^。！？.!?\n;；]{0,28}(?:时区|timezone|utc|window\.ts|date\b)/i,
-      /(?:时区|timezone|utc|window\.ts)[^。！？.!?\n;；]{0,20}(?:已?排除|不是根因|并非根因|无关|ruled out|not the root cause)/i,
+      /(?:已?排除|并非|不是|not caused by|ruled out|unrelated to)[^。！？.!?\n;；，,（(]{0,24}(?:时区|timezone|utc|window\.ts|date\b)/i,
+      /(?:本次|该|此)?(?:失败|回归|故障|问题|报错|bug|根因|原因)[^。！？.!?\n;；]{0,16}(?:与[^。！？.!?\n;；]{0,10}(?:时区|timezone|tz|utc|window\.ts)[^。！？.!?\n;；]{0,6}无关|并非[^。！？.!?\n;；]{0,12}(?:时区|timezone|utc))/i,
+      /(?:时区|timezone|utc|window\.ts)[^。！？.!?\n;；，,）)→]{0,16}(?:已排除|被排除|不是根因|并非根因|不是原因|并非原因|ruled out|not the root cause)/i,
       /(?:根因|真正原因|主因|root cause)[^。！？.!?\n;；]{0,12}(?:是|在于|为|is)\s*(?:连接池|数据库|网络|内存泄漏|并发竞争|connection pool|database|oom|race condition)/i,
     ],
     requiredEvidenceFiles: ["src/settlement/window.ts", "ci/failing-build-418.log"],
@@ -233,8 +234,9 @@ export const PILOT_CASES: readonly CiPilotCaseSpec[] = [
       /(?:根因|原因|导致|未转|覆盖|拼接|引发|强转|coerci|concat|root\s+cause|caused\s+by|because|results?\s+in)/i,
     ],
     contradictionPatterns: [
-      /(?:已?排除|并非|不是|与[^。！？.!?\n;；]{0,8}无关|not caused by|ruled out|unrelated to)[^。！？.!?\n;；]{0,28}(?:字符串|类型|webhook_max_retries|loader\.ts|coercion|string)/i,
-      /(?:字符串|类型|webhook_max_retries|loader\.ts)[^。！？.!?\n;；]{0,20}(?:已?排除|不是根因|并非根因|无关|ruled out|not the root cause)/i,
+      /(?:已?排除|并非|不是|not caused by|ruled out|unrelated to)[^。！？.!?\n;；，,（(]{0,24}(?:字符串|类型|webhook_max_retries|loader\.ts|coercion|string)/i,
+      /(?:本次|该|此)?(?:失败|回归|故障|问题|报错|bug|根因|原因)[^。！？.!?\n;；]{0,16}(?:与[^。！？.!?\n;；]{0,12}(?:字符串|类型|webhook_max_retries|loader\.ts|coercion|string)[^。！？.!?\n;；]{0,6}无关|并非[^。！？.!?\n;；]{0,12}(?:字符串|类型|coercion))/i,
+      /(?:字符串|类型|webhook_max_retries|loader\.ts)[^。！？.!?\n;；，,）)→]{0,16}(?:已排除|被排除|不是根因|并非根因|不是原因|并非原因|ruled out|not the root cause)/i,
       /(?:根因|真正原因|主因|root cause)[^。！？.!?\n;；]{0,12}(?:是|在于|为|is)\s*(?:连接池|时区|数据库|网络|内存泄漏|connection pool|timezone|database|oom)/i,
     ],
     requiredEvidenceFiles: ["src/config/loader.ts", "ci/failing-build-502.log"],
@@ -451,7 +453,12 @@ export function scoreCaseOutput(spec: CiPilotCaseSpec, caseDir: string, response
 
   const nonAnswerMatchers = [...DEFAULT_NON_ANSWER_PATTERNS, ...(spec.nonAnswerPatterns ?? [])];
   const hitNonAnswer = nonAnswerMatchers.some((re) => re.test(responseText));
-  const hitContradiction = (spec.contradictionPatterns ?? []).some((re) => re.test(responseText));
+  const falsificationClauseRe = /(?:^|[\s:：,，])(?:若|如果|假如|假设|if\b)[^。！？.!?\n;；]{0,48}(?:证伪|说明与|推翻|falsif|disprov)/i;
+  const activeClauses = responseText
+    .split(/[。！？!?\n;；]+/)
+    .map((c) => c.trim())
+    .filter((c) => c.length > 0 && !falsificationClauseRe.test(c));
+  const hitContradiction = (spec.contradictionPatterns ?? []).some((re) => activeClauses.some((c) => re.test(c)));
   const noContradictionOrNonAnswer = !hitNonAnswer && !hitContradiction;
   if (hitNonAnswer) notes.push("Response deferred investigation (non-answer) instead of delivering a diagnosis.");
   if (hitContradiction) notes.push("Response contradicted the true root cause or blamed an unrelated culprit.");
@@ -957,9 +964,15 @@ async function main(): Promise<void> {
           .filter((a) => validArmSet.has(a))
       : defaultArms;
     assert(arms.length > 0, "At least one valid --arms value is required.");
+    const casesIdx = argv.indexOf("--cases");
+    const selectedCaseIds = casesIdx >= 0 && argv[casesIdx + 1]
+      ? new Set(argv[casesIdx + 1]!.split(",").map((s) => s.trim()).filter(Boolean))
+      : null;
+    const activeCases = selectedCaseIds ? PILOT_CASES.filter((c) => selectedCaseIds.has(c.id)) : PILOT_CASES;
+    assert(activeCases.length > 0, "At least one valid --cases value is required.");
     const trials: PilotTrialRecord[] = [];
 
-    for (const spec of PILOT_CASES) {
+    for (const spec of activeCases) {
       for (const arm of arms) {
         console.log(`running [${spec.id}] arm=${arm} model=${model}...`);
         const record = await runLiveArmTrial({ spec, arm, model, sandboxRoot });

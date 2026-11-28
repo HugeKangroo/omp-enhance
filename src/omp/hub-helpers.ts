@@ -2,7 +2,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSy
 import { homedir } from "node:os";
 import path from "node:path";
 import { canRoleDispatch, isInternalRole } from "../core/policy.ts";
-import type { FlowMachineState, FlowRoomStatus, PersistedFlowCheckpoint } from "../core/types.ts";
+import type { FlowMachineState, FlowRoomStatus, HandoffEnvelope, PersistedFlowCheckpoint } from "../core/types.ts";
 import { appendBoardEntrySafe } from "../flow/board.ts";
 import { buildFlowGraphSnapshot, transitionFlow } from "../flow/machine.ts";
 import { isCheckpointResumable, snapshotFromCheckpoint, type FlowRoomSnapshot } from "../flow/state.ts";
@@ -20,6 +20,9 @@ export interface HubFlowSummary {
   reason?: string; questionsForUser?: string[]; waitingNodes?: Array<{ nodeId: string; questions: string[] }>;
   mergedRef?: string | null; mergedCommitSha?: string | null; graphProgress?: { done: number; total: number };
   remoteOwnerPid?: number | null; updatedAt?: string;
+  deliveryState?: "verified" | "pending_verification";
+  verificationIncomplete?: boolean;
+  pendingVerification?: string[];
 }
 
 export interface ResumableFlowCandidate {
@@ -97,11 +100,36 @@ export function collectWaitingNodes(snap: FlowRoomSnapshot): Array<{ nodeId: str
   return env?.questionsForUser?.length ? [{ nodeId: env.fromRole, questions: [...env.questionsForUser] }] : [];
 }
 
+export function collectPendingVerification(env: HandoffEnvelope | null | undefined): string[] {
+  const scope = env?.verificationScope;
+  if (!scope) return [];
+  return [...new Set([...(scope.unchecked ?? []), ...(scope.environmentGaps ?? [])].map((s) => s.trim()).filter(Boolean))];
+}
+
+export function decorateFlowDeliveryPayload<T extends object>(payload: T): T {
+  const rec = payload as Record<string, unknown>;
+  const status = rec.status;
+  const finalEnv = (rec.finalEnvelope as HandoffEnvelope | null | undefined)
+    ?? (Array.isArray(rec.stages) ? ([...(rec.stages as Array<{ envelope?: HandoffEnvelope | null }>)].reverse().find((s) => s.envelope)?.envelope ?? null) : null);
+  if (status !== "completed") return payload;
+  const pending = collectPendingVerification(finalEnv);
+  if (pending.length === 0) return payload;
+  return {
+    ...payload,
+    deliveryState: "pending_verification",
+    verificationIncomplete: true,
+    pendingVerification: pending,
+    ...(finalEnv?.verificationScope?.checked?.length ? { checkedVerification: [...finalEnv.verificationScope.checked] } : {}),
+  };
+}
+
 export function toFlowSummary(cwd: string, snap: FlowRoomSnapshot, resumable: boolean): HubFlowSummary {
   const waitingNodes = snap.status === "waiting_input" ? collectWaitingNodes(snap) : [];
   const allQuestions = waitingNodes.flatMap((w) => w.questions.map((q) => (waitingNodes.length > 1 ? `[${w.nodeId}] ${q}` : q)));
   const gNodes = snap.graphSnapshot?.nodes;
   const graphProgress = gNodes?.length ? { done: gNodes.filter((n) => n.status === "succeeded" || n.status === "skipped").length, total: gNodes.length } : undefined;
+  const lastEnv = [...snap.stages].reverse().find((s) => s.envelope)?.envelope ?? null;
+  const pendingVerification = snap.status === "completed" ? collectPendingVerification(lastEnv) : [];
   return {
     cwd, flowId: snap.flowId, status: snap.status, resumable, roleChain: snap.roleChain,
     currentIndex: snap.currentIndex ?? 0, repairRound: snap.repairRound ?? 0, goal: snap.goal,
@@ -110,6 +138,7 @@ export function toFlowSummary(cwd: string, snap: FlowRoomSnapshot, resumable: bo
     ...(snap.graphSnapshot?.mergedCommitSha ? { mergedCommitSha: snap.graphSnapshot.mergedCommitSha } : {}),
     ...(graphProgress ? { graphProgress } : {}), ...(snap.remoteOwnerPid ? { remoteOwnerPid: snap.remoteOwnerPid } : {}),
     ...(snap.updatedAt ? { updatedAt: snap.updatedAt } : {}),
+    ...(pendingVerification.length > 0 ? { deliveryState: "pending_verification" as const, verificationIncomplete: true, pendingVerification } : {}),
   };
 }
 
@@ -119,8 +148,10 @@ export function formatFlowEventReport(settlement: BackgroundFlowSettlement): str
   const status = error ? "failed" : (result?.status ?? "failed"), env = result?.finalEnvelope ?? null;
   const summary = error ? (error instanceof Error ? error.message : String(error)) : (env?.summary ?? result?.reason ?? status);
   const isRejectedAudit = status === "completed" && env?.verdict === "rejected";
+  const pendingVerification = status === "completed" && !isRejectedAudit ? collectPendingVerification(env) : [];
+  const statusTag = isRejectedAudit ? " (audit_rejected)" : pendingVerification.length > 0 ? " (pending_verification)" : "";
   const lines = [
-    `[Flow Event · ${status}${isRejectedAudit ? " (audit_rejected)" : ""}] flowId=${flowId} · cwd=${targetWs.cwd} · chain=${roleChain.join(" → ")}`,
+    `[Flow Event · ${status}${statusTag}] flowId=${flowId} · cwd=${targetWs.cwd} · chain=${roleChain.join(" → ")}`,
     `Goal: ${mandate.goal}`, `Summary: ${summary}`,
   ];
   const mergedRef = result?.mergedRef ?? snap.graphSnapshot?.mergedRef;
@@ -137,6 +168,11 @@ export function formatFlowEventReport(settlement: BackgroundFlowSettlement): str
     if (s.unchecked?.length) parts.push(`unchecked=[${s.unchecked.join(", ")}]`);
     if (s.environmentGaps?.length) parts.push(`environmentGaps=[${s.environmentGaps.join(", ")}]`);
     lines.push(`Verification scope: ${parts.join("; ")}`);
+  }
+  if (pendingVerification.length > 0) {
+    lines.push(
+      `Delivery notice (pending_verification): Pre-checks completed, but end-to-end verification is still pending for [${pendingVerification.join("; ")}]. Tell the user what passed pre-checks AND clearly flag these pending items — do NOT claim full target-side acceptance passed.`,
+    );
   }
   if (env?.reworkCategory) lines.push(`Rework category: ${env.reworkCategory}`);
   if (env?.openRisks.length) lines.push("Open risks:", ...env.openRisks.map((r) => `- ${r}`));

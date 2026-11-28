@@ -11,6 +11,7 @@ import type { WorkspaceHub } from "./hub.ts";
 import {
   collectNonTerminalFlowCandidates,
   collectResumableFlowCandidates,
+  decorateFlowDeliveryPayload,
   persistHeldHumanDecision,
 } from "./hub-helpers.ts";
 import type { ManagedWorkspace } from "./workspace.ts";
@@ -93,11 +94,11 @@ export function registerFlowTool(
             const targetWs = hub.resolveFlowWorkspace(originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx);
             hub.markFlowSnapshotObserved(targetWs, reqFlowId);
             if (targetWs.room.hasActiveLeaseOwnership() && targetWs.room.getSnapshot().flowId === reqFlowId) {
-              return toolResult({ cwd: targetWs.cwd, ...targetWs.room.getSnapshot(), resumable: targetWs.room.isResumable() });
+              return toolResult(decorateFlowDeliveryPayload({ cwd: targetWs.cwd, ...targetWs.room.getSnapshot(), resumable: targetWs.room.isResumable() }));
             }
             const cp = !targetWs.store.isClosed() ? targetWs.store.reclaimDeadCheckpoint(reqFlowId) : null;
-            if (cp) return toolResult({ cwd: targetWs.cwd, ...snapshotFromCheckpoint(cp, targetWs.cwd), resumable: isCheckpointResumable(cp) });
-            if (targetWs.room.getSnapshot().flowId === reqFlowId) return toolResult({ cwd: targetWs.cwd, ...targetWs.room.getSnapshot(), resumable: targetWs.room.isResumable() });
+            if (cp) return toolResult(decorateFlowDeliveryPayload({ cwd: targetWs.cwd, ...snapshotFromCheckpoint(cp, targetWs.cwd), resumable: isCheckpointResumable(cp) }));
+            if (targetWs.room.getSnapshot().flowId === reqFlowId) return toolResult(decorateFlowDeliveryPayload({ cwd: targetWs.cwd, ...targetWs.room.getSnapshot(), resumable: targetWs.room.isResumable() }));
             throw new Error(`Unknown flowId "${reqFlowId}".`);
           }
           if (reqCwd) {
@@ -105,12 +106,12 @@ export function registerFlowTool(
             hub.markFlowSnapshotObserved(targetWs);
             const latest = !targetWs.room.hasActiveLeaseOwnership() && !targetWs.store.isClosed() ? targetWs.store.getLatestFlowCheckpoint() : null;
             const snap = latest ? snapshotFromCheckpoint(latest, targetWs.cwd) : targetWs.room.getSnapshot();
-            return toolResult({ cwd: targetWs.cwd, ...snap, resumable: latest ? isCheckpointResumable(latest) : targetWs.room.isResumable(), ...(targetWs.trustNotice ? { trustNotice: targetWs.trustNotice } : {}) });
+            return toolResult(decorateFlowDeliveryPayload({ cwd: targetWs.cwd, ...snap, resumable: latest ? isCheckpointResumable(latest) : targetWs.room.isResumable(), ...(targetWs.trustNotice ? { trustNotice: targetWs.trustNotice } : {}) }));
           }
           hub.markAllSettledFlowsObserved();
           const latestOrigin = !originWs.room.hasActiveLeaseOwnership() && !originWs.store.isClosed() ? originWs.store.getLatestFlowCheckpoint() : null;
           const baseSnap = latestOrigin ? snapshotFromCheckpoint(latestOrigin, originWs.cwd) : originWs.room.getSnapshot();
-          return toolResult({ cwd: originWs.cwd, ...baseSnap, resumable: latestOrigin ? isCheckpointResumable(latestOrigin) : originWs.room.isResumable(), flows: hub.getAllFlowSummaries(), runningJobs: hub.getAllRunningJobs() });
+          return toolResult(decorateFlowDeliveryPayload({ cwd: originWs.cwd, ...baseSnap, resumable: latestOrigin ? isCheckpointResumable(latestOrigin) : originWs.room.isResumable(), flows: hub.getAllFlowSummaries(), runningJobs: hub.getAllRunningJobs() }));
         }
 
         if (action === "cancel") return toolResult(await executeCancelFlow(hub, originWs, { flowId: reqFlowId, cwd: reqCwd }, ctx));
@@ -304,7 +305,7 @@ export function registerFlowTool(
               { ...(reqNodeId ? { targetNodeId: reqNodeId } : {}), ...(effectiveReplyText ? { replyText: effectiveReplyText } : {}) },
             );
             hub.syncGlobalUi(ctx, originWs);
-            return toolResult({ ...(res as object), ...(targetWs.trustNotice ? { trustNotice: targetWs.trustNotice } : {}) });
+            return toolResult(decorateFlowDeliveryPayload({ ...(res as object), ...(targetWs.trustNotice ? { trustNotice: targetWs.trustNotice } : {}) }));
           } catch (err) {
             if (err instanceof ProjectBusyError) {
               return toolResult({
@@ -422,7 +423,7 @@ export function registerFlowTool(
             ...(isGraphMode ? { graphSpec: spec, graphValidation: validation } : {}),
           });
           hub.syncGlobalUi(ctx, originWs);
-          return toolResult({ ...(started as object), ...(targetWs.trustNotice ? { trustNotice: targetWs.trustNotice } : {}) });
+          return toolResult(decorateFlowDeliveryPayload({ ...(started as object), ...(targetWs.trustNotice ? { trustNotice: targetWs.trustNotice } : {}) }));
         } catch (startErr) {
           if (!targetWs.room.hasActiveLeaseOwnership() || targetWs.room.getSnapshot().flowId !== flowId) {
             try { targetWs.store.releaseProjectFlowLease(flowId, preflightLease.leaseToken); } catch {}

@@ -27,12 +27,14 @@ const PURE_CANCEL_RE =
   /^(?:取消|算了|停止|中止|终止|不做了|放弃|cancel|abort|stop)$|(?:取消(?:任务|流程|执行|本次)|终止(?:任务|流程)|算了不做)/i;
 const APPROVAL_HOLD_RE =
   /(?:暂缓|暂停|稍等|等等|再看看|再看|还没|尚未|先不(?:要)?(?:批准|同意|确认|通过|放行|继续|执行)?|先别|别(?:再|继续|批准|同意|通过|放行)|等我|还要看|还需|hold\s*on|wait\b|not\s+yet|defer|later)/i;
+const APPROVAL_CONDITIONAL_RE =
+  /(?:但是|但|不过|除非|前提是?|条件是?|只有(?:在|当)|仅当|这周别|本周别|今天别|今日别|别(?:发|发布|合并|上线|部署|执行|动|删|跑|提交|推送)|不要(?:发|发布|合并|上线|部署|删)|下周(?:再|才)|明天(?:再|才)|改天|回头再|之后再|晚点再|晚些再|等[^。！？.!?\n]{0,14}(?:再|后|审批|批准|确认|签字|通过|review|ok)|让[^。！？.!?\n]{0,10}(?:审批|批准|确认|签字|看)|换[^。！？.!?\n]{0,8}审|\b(?:but|however|except|unless|provided\s+that|only\s+if|not\s+(?:today|now|this\s+week|yet)|next\s+week|tomorrow|hold\s+off|wait\s+for)\b)/i;
 const APPROVAL_CANCEL_RE =
   /^(?:否|取消|拒绝|不同意|不批准|不通过|驳回|否决|算了|放弃|cancel|reject|deny|abort|no|n)$|(?:明确|坚决)?(?:拒绝|取消|驳回|否决)(?:本次|此|该|执行|发布|交付|合并|任务|流程)?|不(?:同意|批准|通过|确认|放行)(?:执行|发布|交付|合并)?$/i;
 const APPROVAL_NEGATION_RE =
   /(?:不要(?:批准|同意|确认|通过|放行|继续|执行|合并|发布)?|不能(?:批准|同意|确认|通过|放行|继续|执行|合并|发布|启动)?|不可(?:以)?(?:批准|同意|继续|执行|合并|发布)?|不行|不批|没批|未批|不予批准|不批准|不同意|不确认|不通过|别批准|别继续|禁止|反对|cannot\s+(?:approve|proceed|run|execute|merge|deploy)|not\s+approved|don'?t\s+(?:approve|proceed|run|execute|merge|deploy)|do\s+not\s+(?:approve|proceed|run|execute|merge|deploy))/i;
 const APPROVAL_PROCEED_RE =
-  /^(?:是|好|好的|行|可以|ok|okay|yes|y|lgtm|sure|true|go|approved?|confirmed?)$|(?:同意|批准|通过|确认|放行|准予|没问题|继续(?:执行|推进)?|可以(?:执行|继续|发布|合并|启动)?|执行吧|合并吧|发布吧|\b(?:approve|approved|proceed|go\s+ahead|confirm|confirmed|lgtm|looks\s+good)\b)/i;
+  /^(?:是|好|好的|行|可以|ok|okay|yes|y|lgtm|sure|true|go|approved?|confirmed?)$|(?:同意|批准|通过|确认|放行|准予|没问题|继续(?:执行|推进)?|可以(?:执行|继续|发布|合并|启动|推进)|执行吧|合并吧|发布吧|\b(?:approve|approved|proceed|go\s+ahead|confirm|confirmed|lgtm|looks\s+good)\b)/i;
 
 function normalizeOptionToken(raw: string): string {
   return raw.trim().toLowerCase().replace(/^[（(「【"'\s]+|[）)」】"'\s。.!！?？]+$/g, "");
@@ -127,6 +129,13 @@ export function evaluateHumanReply(config: HumanNodeConfig, rawReply: string): H
     }
     if (APPROVAL_NEGATION_RE.test(clean)) {
       return { decision: "hold", mode, reason: `Negative or non-approving reply ("${clean}"); approval gate remains paused.` };
+    }
+    if (APPROVAL_CONDITIONAL_RE.test(clean)) {
+      return {
+        decision: "hold",
+        mode,
+        reason: `Conditional, deferred, or delegated approval reply ("${clean}") retained as constraint; approval gate remains paused until unconditional confirmation.`,
+      };
     }
     if (!APPROVAL_PROCEED_RE.test(clean)) {
       return {
